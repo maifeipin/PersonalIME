@@ -74,9 +74,8 @@ flowchart LR
 PersonalIME/
 ├── CMakeLists.txt              # CMake 顶层构建配置 (C++20, /MT 静态编译)
 ├── README.md                   # 项目说明文档
-├── docs/                       # 设计与技术复核文档
-│   ├── design.md               # 产品架构与功能设计方案
-│   └── stage1-review*.md       # Stage 1 各轮技术复核与质量验收报告
+├── docs/                       # 设计与技术文档
+│   └── design.md               # 产品架构与功能设计方案
 ├── scripts/                    # 自动化脚本工具
 │   ├── build.ps1               # 编译 Release x64 二进制文件
 │   ├── run_test.ps1            # 执行五阶段端到端与故障测试套件

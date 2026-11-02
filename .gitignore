@@ -33,3 +33,9 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Intermediate development review docs (only keep design.md in docs)
+docs/*
+!docs/design.md
+
+
