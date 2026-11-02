@@ -72,9 +72,9 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
                 existing.is_pinned = true;
                 existing.order_rank = c.order_rank;
             }
-            // Combine stats
-            existing.selected_count += c.selected_count;
-            existing.effective_count += c.effective_count;
+            // Retain maximum stats without duplicating across code aliases
+            existing.selected_count = (std::max)(existing.selected_count, c.selected_count);
+            existing.effective_count = (std::max)(existing.effective_count, c.effective_count);
             existing.last_selected_at = (std::max)(existing.last_selected_at, c.last_selected_at);
             // Better match quality takes precedence
             if (static_cast<int>(c.quality) < static_cast<int>(existing.quality)) {

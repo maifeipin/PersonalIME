@@ -408,6 +408,155 @@ int TestConcurrentQueriesAndUpdates(ImeEngine& engine) {
     return 0;
 }
 
+// 12. Review Round 1 Negative Probe Suite
+int TestReviewRound1NegativeCases() {
+    std::cout << "[TEST] Running Review Round 1 Negative & Integrity Probe Suite..." << std::endl;
+
+    // 1. Failed learning must not consume event or report success
+    {
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", ""), "Init in-memory engine");
+        auto id = e.AddUserEntry(L"word", {{InputScheme::Custom, ";good"}});
+        bool invalid = e.CommitCandidate("same-event", InputScheme::Custom, ";good", "missing-entry");
+        TEST_ASSERT(!invalid, "Commit on missing entry must fail");
+        bool retry = e.CommitCandidate("same-event", InputScheme::Custom, ";good", id);
+        TEST_ASSERT(retry, "Valid retry of same event must succeed");
+        int count = e.Query(InputScheme::Custom, ";good").candidates.at(0).selected_count;
+        TEST_ASSERT(count == 1, "Selected count must be 1 after valid retry");
+        bool unrelated = e.CommitCandidate("unrelated-event", InputScheme::Pinyin, "not-the-code", id);
+        TEST_ASSERT(!unrelated, "Commit with unrelated scheme/code must be rejected");
+    }
+
+    // 2. Multi-code aliases for same entry must not multiply stats or match wildcards
+    {
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", ""), "Init in-memory engine");
+        auto id = e.AddUserEntry(L"same-word", {{InputScheme::Custom, ";abc"}, {InputScheme::Custom, ";abd"}});
+        e.CommitCandidate("one-event", InputScheme::Custom, ";a", id);
+        auto q = e.Query(InputScheme::Custom, ";a");
+        TEST_ASSERT(!q.candidates.empty(), "Candidate found under prefix ;a");
+        TEST_ASSERT(q.candidates.at(0).selected_count == 1, "Count must be exactly 1, not multiplied by alias count");
+
+        auto wildcard = e.Query(InputScheme::Custom, ";%");
+        TEST_ASSERT(wildcard.candidates.empty(), "Literal '% 'must not act as SQL wildcard");
+    }
+
+    // 3. High-fidelity decay preservation and idempotent merge import
+    {
+        auto clock = std::make_shared<MockClock>();
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", "", clock), "Init mock clock engine");
+        auto id = e.AddUserEntry(L"decay", {{InputScheme::Custom, ";decay"}});
+        for (int i = 0; i < 10; ++i) {
+            e.CommitCandidate("decay-" + std::to_string(i), InputScheme::Custom, ";decay", id);
+        }
+        clock->Advance(30LL * 86400);
+        double before = e.Query(InputScheme::Custom, ";decay").candidates.at(0).effective_count;
+        TEST_ASSERT(std::abs(before - 5.0) < 0.1, "Effective count decayed to 5.0 before export");
+
+        std::string jsonPath = "test_review_decay.json";
+        TEST_ASSERT(e.ExportData(jsonPath), "Export decay test data");
+
+        ImeEngine restored;
+        TEST_ASSERT(restored.Initialize(":memory:", "", clock), "Init restored engine");
+        TEST_ASSERT(restored.ImportData(jsonPath, false), "Import decay test data");
+        double after = restored.Query(InputScheme::Custom, ";decay").candidates.at(0).effective_count;
+        TEST_ASSERT(std::abs(after - 5.0) < 0.1, "Effective count must faithfully remain 5.0 after import");
+
+        // Second import (merge) must NOT double count to 20
+        TEST_ASSERT(restored.ImportData(jsonPath, false), "Second merge import");
+        int merged = restored.Query(InputScheme::Custom, ";decay").candidates.at(0).selected_count;
+        TEST_ASSERT(merged == 10, "Merge mode must be idempotent (count stays 10, not 20)");
+
+        std::filesystem::remove(jsonPath);
+    }
+
+    // 4. Existing ID code replacement and invalid replace rollback
+    {
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", ""), "Init engine");
+        auto id = e.AddUserEntry(L"old", {{InputScheme::Custom, ";old"}});
+
+        std::string mergeJson = "test_merge_codes.json";
+        {
+            std::ofstream f(mergeJson);
+            f << "{\n"
+                 "  \"version\": \"1.0\",\n"
+                 "  \"entries\": [\n"
+                 "    {\n"
+                 "      \"id\": \"" << id << "\",\n"
+                 "      \"text\": \"new\",\n"
+                 "      \"codes\": [{\"scheme\": \"custom\", \"code\": \";new\"}]\n"
+                 "    }\n"
+                 "  ]\n"
+                 "}";
+        }
+        TEST_ASSERT(e.ImportData(mergeJson, false), "Import merge codes");
+        auto nq = e.Query(InputScheme::Custom, ";new");
+        TEST_ASSERT(!nq.candidates.empty(), "Query for new code must find entry");
+        TEST_ASSERT(nq.candidates[0].text == L"new", "Updated text matches");
+
+        std::string invalidJson = "test_invalid_replace.json";
+        {
+            std::ofstream f(invalidJson);
+            f << "{\n"
+                 "  \"version\": \"1.0\",\n"
+                 "  \"entries\": [\n"
+                 "    {\n"
+                 "      \"id\": \"invalid-entry\",\n"
+                 "      \"text\": \"fail\",\n"
+                 "      \"codes\": [{\"scheme\": \"typo-scheme\", \"code\": \"???\"}]\n"
+                 "    }\n"
+                 "  ]\n"
+                 "}";
+        }
+        std::string err;
+        bool invalidImport = e.ImportData(invalidJson, true, &err);
+        TEST_ASSERT(!invalidImport, "Invalid scheme/code replace import must fail");
+        TEST_ASSERT(e.GetUserEntry(id).has_value(), "Original entry must be 100% intact after failed replace import rollback");
+
+        std::filesystem::remove(mergeJson);
+        std::filesystem::remove(invalidJson);
+    }
+
+    // 5. Builtin word pin & learning stats survive backup
+    {
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", "data/dictionaries"), "Init engine with dicts");
+        auto q = e.Query(InputScheme::Pinyin, "zhongwen");
+        TEST_ASSERT(!q.candidates.empty(), "Builtin word found");
+        auto id = q.candidates[0].entry_id;
+
+        TEST_ASSERT(e.PinCandidate(InputScheme::Pinyin, "zhongwen", id, 1), "Pin builtin candidate");
+        TEST_ASSERT(e.CommitCandidate("builtin-event", InputScheme::Pinyin, "zhongwen", id), "Commit builtin candidate");
+
+        std::string builtinJson = "test_builtin_backup.json";
+        TEST_ASSERT(e.ExportData(builtinJson), "Export builtin backup");
+
+        ImeEngine restored;
+        TEST_ASSERT(restored.Initialize(":memory:", "data/dictionaries"), "Init restored engine");
+        TEST_ASSERT(restored.ImportData(builtinJson, false), "Import builtin backup");
+
+        auto rq = restored.Query(InputScheme::Pinyin, "zhongwen");
+        bool pinned = false;
+        int count = 0;
+        for (const auto& c : rq.candidates) {
+            if (c.entry_id == id) {
+                pinned = c.is_pinned;
+                count = c.selected_count;
+                break;
+            }
+        }
+        TEST_ASSERT(pinned, "Builtin word pinned status must be preserved");
+        TEST_ASSERT(count == 1, "Builtin word commit count must be preserved");
+
+        std::filesystem::remove(builtinJson);
+    }
+
+    std::cout << "[PASS] All Review Round 1 negative & data integrity probes PASSED cleanly!\n";
+    return 0;
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::cout << "=== Running PersonalIME Stage 2 (ime-core) Test Suite ===" << std::endl;
@@ -442,7 +591,9 @@ int main() {
     if (TestPersistenceAndImportRollback() != 0) return 1;
     std::cout << "Step 11: Starting TestConcurrentQueriesAndUpdates..." << std::endl;
     if (TestConcurrentQueriesAndUpdates(engine) != 0) return 1;
+    std::cout << "Step 12: Starting TestReviewRound1NegativeCases..." << std::endl;
+    if (TestReviewRound1NegativeCases() != 0) return 1;
 
-    std::cout << "=== ALL 10 Stage 2 Test Suites PASSED WITH ZERO ERRORS! ===" << std::endl;
+    std::cout << "=== ALL Stage 2 Test Suites (12/12) PASSED WITH ZERO ERRORS! ===" << std::endl;
     return 0;
 }

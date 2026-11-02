@@ -26,7 +26,9 @@ bool ImeEngine::Initialize(const std::string& dbPath,
     m_repo = std::make_unique<EntryRepository>(m_db, m_clock);
 
     if (!dictDir.empty()) {
-        m_builtinDict.Load(dictDir);
+        if (!m_builtinDict.Load(dictDir)) {
+            return false;
+        }
     }
 
     m_initialized = true;
@@ -37,7 +39,7 @@ QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
     QueryResult qr;
     qr.scheme = scheme;
     qr.query_code = code;
-    if (!m_initialized || code.empty()) return qr;
+    if (!m_initialized || code.empty() || scheme == InputScheme::Unknown) return qr;
 
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -95,20 +97,24 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
                                 InputScheme scheme,
                                 const std::string& code,
                                 const std::string& entryId) {
-    if (!m_initialized || code.empty() || entryId.empty()) return false;
+    if (!m_initialized || code.empty() || entryId.empty() || scheme == InputScheme::Unknown) return false;
 
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
 
     // If this is a builtin entry, ensure an entry row exists in SQLite for foreign key integrity
     if (entryId.rfind("b_", 0) == 0) {
-        // Find text from query
+        bool found = false;
         auto qr = Query(scheme, clean);
         for (const auto& c : qr.candidates) {
             if (c.entry_id == entryId) {
                 m_repo->EnsureBuiltinEntryExists(entryId, c.text);
+                found = true;
                 break;
             }
+        }
+        if (!found) {
+            return false;
         }
     }
 
@@ -142,17 +148,24 @@ std::vector<Entry> ImeEngine::GetAllUserEntries() {
 }
 
 bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const std::string& entryId, int rank) {
-    if (!m_initialized) return false;
+    if (!m_initialized || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
 
     if (entryId.rfind("b_", 0) == 0) {
+        bool found = false;
         auto qr = Query(scheme, clean);
         for (const auto& c : qr.candidates) {
             if (c.entry_id == entryId) {
                 m_repo->EnsureBuiltinEntryExists(entryId, c.text);
+                found = true;
                 break;
             }
+        }
+        if (!found) return false;
+    } else {
+        if (!m_repo->VerifyCandidateAffiliation(scheme, clean, entryId)) {
+            return false;
         }
     }
 
@@ -160,7 +173,7 @@ bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const 
 }
 
 bool ImeEngine::UnpinCandidate(InputScheme scheme, const std::string& code, const std::string& entryId) {
-    if (!m_initialized) return false;
+    if (!m_initialized || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
     return m_repo->UnpinPreference(scheme, clean, entryId);

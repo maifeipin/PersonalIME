@@ -9,6 +9,7 @@
 namespace ime {
 
 enum class InputScheme : int {
+    Unknown = 0,
     Pinyin = 1,
     Wubi86 = 2,
     Custom = 3
@@ -19,16 +20,72 @@ inline std::string SchemeToString(InputScheme s) {
         case InputScheme::Pinyin: return "pinyin";
         case InputScheme::Wubi86: return "wubi";
         case InputScheme::Custom: return "custom";
+        default: return "unknown";
     }
-    return "pinyin";
 }
 
 inline InputScheme SchemeFromString(const std::string& str) {
     std::string lower = str;
     std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (lower == "pinyin" || lower == "py") return InputScheme::Pinyin;
     if (lower == "wubi" || lower == "wubi86" || lower == "wb") return InputScheme::Wubi86;
     if (lower == "custom" || lower == "phrase") return InputScheme::Custom;
-    return InputScheme::Pinyin;
+    return InputScheme::Unknown;
+}
+
+inline bool IsValidCode(InputScheme scheme, const std::string& code) {
+    if (code.empty() || code.length() > 64) return false;
+    switch (scheme) {
+        case InputScheme::Wubi86: {
+            if (code.length() > 4) return false;
+            for (char c : code) {
+                char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (lower < 'a' || lower > 'y') return false;
+            }
+            return true;
+        }
+        case InputScheme::Pinyin: {
+            if (code.front() == '\'' || code.back() == '\'') return false;
+            bool prevApos = false;
+            for (char c : code) {
+                if (c == '\'') {
+                    if (prevApos) return false; // no consecutive ''
+                    prevApos = true;
+                } else {
+                    char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (lower < 'a' || lower > 'z') return false;
+                    prevApos = false;
+                }
+            }
+            return true;
+        }
+        case InputScheme::Custom: {
+            for (char c : code) {
+                unsigned char uc = static_cast<unsigned char>(c);
+                if (uc < 33 || uc > 126) return false; // printable ASCII, no whitespace
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+inline bool IsValidText(const std::wstring& text) {
+    if (text.empty() || text.length() > 512) return false;
+    return true;
+}
+
+inline std::string EscapeLike(const std::string& input) {
+    std::string escaped;
+    escaped.reserve(input.size() * 2);
+    for (char c : input) {
+        if (c == '\\' || c == '%' || c == '_') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(c);
+    }
+    return escaped;
 }
 
 enum class MatchQuality : int {

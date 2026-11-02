@@ -6,12 +6,14 @@
 
 ## 1. 86 版五笔基础词典 (`data/dictionaries/wubi86.dict`)
 
-- **资源名称**：Rime 86 五笔词库 (rime-wubi 86)
-- **原始项目**：[https://github.com/rime/rime-wubi](https://github.com/rime/rime-wubi)
-- **开源许可证**：GPL v3 / LGPL
+- **资源名称**：Rime 86 五笔词库 (`wubi86.dict.yaml`)
+- **原始仓库**：[rime/rime-wubi](https://github.com/rime/rime-wubi)
+- **直接下载源**：`https://raw.githubusercontent.com/rime/rime-wubi/master/wubi86.dict.yaml`
+- **开源许可证**：LGPL v2.1
 - **词典版本**：v0.7
 - **条目数量**：**136,916** 条有效单字与词组映射
-- **编码范围**：规范化小写字母 `a-z`（1~4 码），包含一级简码、二级简码及全码。
+- **输出 SHA256**：`A420ADDA6A5E36DEB7DA052C2FC43512F28DD4AFC698757CA0CCE4386932FA6F`
+- **编码范围**：规范化小写字母 `a-y`（1~4 码），包含一级简码、二级简码及全码。
 - **字段规范 (TSV)**：
   ```text
   词条文本 \t 五笔编码 \t 基础权重
@@ -24,11 +26,13 @@
 
 ## 2. 全拼基础词典 (`data/dictionaries/pinyin.dict`)
 
-- **资源名称**：Rime 简化字拼音词库 (rime-pinyin-simp)
-- **原始项目**：[https://github.com/rime/rime-pinyin-simp](https://github.com/rime/rime-pinyin-simp)
-- **开源许可证**：LGPL v3
+- **资源名称**：Rime 简化字拼音词库 (`pinyin_simp.dict.yaml`)
+- **原始仓库**：[rime/rime-pinyin-simp](https://github.com/rime/rime-pinyin-simp)
+- **直接下载源**：`https://raw.githubusercontent.com/rime/rime-pinyin-simp/master/pinyin_simp.dict.yaml`
+- **开源许可证**：Apache 2.0 / LGPL
 - **词典版本**：v0.1
 - **条目数量**：**65,125** 条有效单字与词组映射
+- **输出 SHA256**：`30B139BB7B3CA1F39BF05052820B4C6B2D124ACC4C9BB67047A03170ED2B5F97`
 - **编码范围**：现代汉语全拼规范音节（支持多音字、多音节词组）
 - **字段规范 (TSV)**：
   ```text

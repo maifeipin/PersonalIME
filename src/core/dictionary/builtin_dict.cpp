@@ -128,8 +128,9 @@ std::vector<Candidate> BuiltinDictionary::QueryWubi(const std::string& code) con
             return pair.first < val;
         });
 
+    static constexpr int MAX_PREFIX_CANDIDATE_POOL = 512;
     int prefixMatches = 0;
-    while (itLower != m_wubiSortedAll.end() && prefixMatches < 64) {
+    while (itLower != m_wubiSortedAll.end() && prefixMatches < MAX_PREFIX_CANDIDATE_POOL) {
         if (itLower->first.rfind(lowerCode, 0) != 0) {
             break; // No longer starts with lowerCode
         }
@@ -233,8 +234,9 @@ std::vector<Candidate> BuiltinDictionary::QueryPinyin(const std::string& code, c
             return pair.first < val;
         });
 
+    static constexpr int MAX_PREFIX_CANDIDATE_POOL = 512;
     int prefixMatches = 0;
-    while (itLower != m_pinyinSortedContinuous.end() && prefixMatches < 64) {
+    while (itLower != m_pinyinSortedContinuous.end() && prefixMatches < MAX_PREFIX_CANDIDATE_POOL) {
         if (itLower->first.rfind(lowerCode, 0) != 0) {
             break;
         }

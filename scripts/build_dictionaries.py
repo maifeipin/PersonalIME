@@ -4,9 +4,20 @@ Convert Rime raw YAML dictionaries into clean TSV format for PersonalIME.
 """
 import os
 import re
+import urllib.request
+
+WUBI_URL = "https://raw.githubusercontent.com/rime/rime-wubi/master/wubi86.dict.yaml"
+PINYIN_URL = "https://raw.githubusercontent.com/rime/rime-pinyin-simp/master/pinyin_simp.dict.yaml"
+
+def ensure_file(path, url):
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"Downloading {url} to {path}...")
+        urllib.request.urlretrieve(url, path)
 
 def process_wubi():
     in_path = os.path.join("data", "dictionaries", "wubi86.raw.yaml")
+    ensure_file(in_path, WUBI_URL)
     out_path = os.path.join("data", "dictionaries", "wubi86.dict")
     count = 0
     with open(in_path, "r", encoding="utf-8") as f_in, open(out_path, "w", encoding="utf-8") as f_out:
@@ -35,6 +46,7 @@ def process_wubi():
 
 def process_pinyin():
     in_path = os.path.join("data", "dictionaries", "pinyin_simp.raw.yaml")
+    ensure_file(in_path, PINYIN_URL)
     out_path = os.path.join("data", "dictionaries", "pinyin.dict")
     count = 0
     with open(in_path, "r", encoding="utf-8") as f_in, open(out_path, "w", encoding="utf-8") as f_out:

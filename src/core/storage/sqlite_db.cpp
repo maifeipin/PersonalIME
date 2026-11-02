@@ -90,41 +90,48 @@ std::unique_ptr<Statement> SqliteDb::Prepare(const std::string& sql) {
 SqliteDb::Transaction::Transaction(SqliteDb& db)
     : m_db(db), m_lock(db.m_mutex) {
     if (m_db.m_transactionDepth == 0) {
-        m_db.Execute("BEGIN IMMEDIATE TRANSACTION;");
+        m_started = m_db.Execute("BEGIN IMMEDIATE TRANSACTION;");
     } else {
-        m_db.Execute("SAVEPOINT sp_" + std::to_string(m_db.m_transactionDepth) + ";");
+        m_started = m_db.Execute("SAVEPOINT sp_" + std::to_string(m_db.m_transactionDepth) + ";");
     }
-    m_depth = ++m_db.m_transactionDepth;
+    if (m_started) {
+        m_depth = ++m_db.m_transactionDepth;
+    }
 }
 
 SqliteDb::Transaction::~Transaction() {
-    if (!m_committed && !m_rolledBack) {
+    if (m_started && !m_committed && !m_rolledBack) {
         Rollback();
     }
 }
 
 bool SqliteDb::Transaction::Commit() {
-    if (m_committed || m_rolledBack) return false;
-    bool ok = true;
-    if (m_db.m_transactionDepth == 1) {
+    if (!m_started || m_committed || m_rolledBack) return false;
+    bool ok = false;
+    if (m_depth == 1) {
         ok = m_db.Execute("COMMIT TRANSACTION;");
-    } else if (m_db.m_transactionDepth > 1) {
-        ok = m_db.Execute("RELEASE SAVEPOINT sp_" + std::to_string(m_db.m_transactionDepth - 1) + ";");
+    } else if (m_depth > 1) {
+        ok = m_db.Execute("RELEASE SAVEPOINT sp_" + std::to_string(m_depth - 1) + ";");
     }
-    if (m_db.m_transactionDepth > 0) {
-        m_db.m_transactionDepth--;
+    if (ok) {
+        if (m_db.m_transactionDepth > 0) {
+            m_db.m_transactionDepth--;
+        }
+        m_committed = true;
+        return true;
     }
-    m_committed = true;
-    return ok;
+    // Commit failed: do not mark committed, rollback to clean up
+    Rollback();
+    return false;
 }
 
 void SqliteDb::Transaction::Rollback() {
-    if (m_committed || m_rolledBack) return;
-    if (m_db.m_transactionDepth == 1) {
+    if (!m_started || m_committed || m_rolledBack) return;
+    if (m_depth == 1) {
         m_db.Execute("ROLLBACK TRANSACTION;");
-    } else if (m_db.m_transactionDepth > 1) {
-        m_db.Execute("ROLLBACK TO SAVEPOINT sp_" + std::to_string(m_db.m_transactionDepth - 1) + ";");
-        m_db.Execute("RELEASE SAVEPOINT sp_" + std::to_string(m_db.m_transactionDepth - 1) + ";");
+    } else if (m_depth > 1) {
+        m_db.Execute("ROLLBACK TO SAVEPOINT sp_" + std::to_string(m_depth - 1) + ";");
+        m_db.Execute("RELEASE SAVEPOINT sp_" + std::to_string(m_depth - 1) + ";");
     }
     if (m_db.m_transactionDepth > 0) {
         m_db.m_transactionDepth--;
@@ -148,7 +155,32 @@ bool Statement::Step() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_stmt) return false;
     int rc = sqlite3_step(m_stmt);
-    return (rc == SQLITE_ROW);
+    m_lastRc = rc;
+    if (rc == SQLITE_ROW) {
+        m_hasError = false;
+        return true;
+    }
+    if (rc == SQLITE_DONE) {
+        m_hasError = false;
+        return false;
+    }
+    m_hasError = true;
+    m_lastErrorMsg = sqlite3_errmsg(sqlite3_db_handle(m_stmt));
+    return false;
+}
+
+bool Statement::Execute() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_stmt) return false;
+    int rc = sqlite3_step(m_stmt);
+    m_lastRc = rc;
+    if (rc == SQLITE_DONE) {
+        m_hasError = false;
+        return true;
+    }
+    m_hasError = true;
+    m_lastErrorMsg = sqlite3_errmsg(sqlite3_db_handle(m_stmt));
+    return false;
 }
 
 void Statement::Reset() {
@@ -156,6 +188,9 @@ void Statement::Reset() {
     if (m_stmt) {
         sqlite3_reset(m_stmt);
         sqlite3_clear_bindings(m_stmt);
+        m_hasError = false;
+        m_lastRc = 0;
+        m_lastErrorMsg.clear();
     }
 }
 

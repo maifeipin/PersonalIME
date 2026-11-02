@@ -39,10 +39,12 @@ public:
         ~Transaction();
         bool Commit();
         void Rollback();
+        bool IsStarted() const { return m_started; }
     private:
         SqliteDb& m_db;
         std::unique_lock<std::recursive_mutex> m_lock;
         int m_depth = 0;
+        bool m_started = false;
         bool m_committed = false;
         bool m_rolledBack = false;
     };
@@ -61,8 +63,13 @@ public:
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
 
-    bool Step(); // returns true if SQLITE_ROW, false if SQLITE_DONE
+    bool Step(); // returns true if SQLITE_ROW, false if SQLITE_DONE or error
+    bool Execute(); // returns true if SQLITE_DONE (for INSERT/UPDATE/DELETE)
     void Reset();
+
+    bool HasError() const { return m_hasError; }
+    int LastErrorCode() const { return m_lastRc; }
+    const std::string& LastErrorMessage() const { return m_lastErrorMsg; }
 
     void BindNull(int index);
     void BindInt(int index, int value);
@@ -79,6 +86,9 @@ public:
 private:
     sqlite3_stmt* m_stmt = nullptr;
     std::recursive_mutex& m_mutex;
+    bool m_hasError = false;
+    int m_lastRc = 0;
+    std::string m_lastErrorMsg;
 };
 
 } // namespace ime

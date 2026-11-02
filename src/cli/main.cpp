@@ -43,26 +43,35 @@ static std::vector<std::string> SplitArgs(const std::string& line) {
     return args;
 }
 
-static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& args) {
-    if (args.empty()) return true;
+struct CommandResult {
+    bool shouldQuit = false;
+    bool success = true;
+};
+
+static CommandResult ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& args) {
+    if (args.empty()) return {false, true};
 
     const std::string& cmd = args[0];
 
     if (cmd == "exit" || cmd == "quit") {
-        return false;
+        return {true, true};
     }
 
     if (cmd == "help") {
         PrintHelp();
-        return true;
+        return {false, true};
     }
 
     if (cmd == "query" || cmd == "q") {
         if (args.size() < 3) {
             std::cout << "Usage: query <pinyin|wubi|custom> <code>\n";
-            return true;
+            return {false, false};
         }
         InputScheme sch = SchemeFromString(args[1]);
+        if (sch == InputScheme::Unknown) {
+            std::cout << "[ERROR] Unknown input scheme: " << args[1] << "\n";
+            return {false, false};
+        }
         std::string code = args[2];
         auto res = engine.Query(sch, code);
         std::cout << "Candidates for [" << SchemeToString(sch) << "] '" << code << "' (" << res.candidates.size() << " found):\n";
@@ -73,28 +82,32 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
             if (c.selected_count > 0) std::cout << " [Used: " << c.selected_count << " times]";
             std::cout << " (ID: " << c.entry_id << ", " << MatchQualityToString(c.quality) << ", Score: " << std::fixed << std::setprecision(1) << c.score << ")\n";
         }
-        return true;
+        return {false, true};
     }
 
     if (cmd == "explain") {
         if (args.size() < 3) {
             std::cout << "Usage: explain <pinyin|wubi|custom> <code>\n";
-            return true;
+            return {false, false};
         }
         InputScheme sch = SchemeFromString(args[1]);
+        if (sch == InputScheme::Unknown) {
+            std::cout << "[ERROR] Unknown input scheme: " << args[1] << "\n";
+            return {false, false};
+        }
         std::string code = args[2];
         auto explanations = engine.ExplainCandidates(sch, code);
         std::cout << "Explain ranking for [" << SchemeToString(sch) << "] '" << code << "':\n";
         for (const auto& line : explanations) {
             std::cout << "  " << line << "\n";
         }
-        return true;
+        return {false, true};
     }
 
     if (cmd == "add") {
         if (args.size() < 3) {
             std::cout << "Usage: add <text> <scheme:code> [scheme:code...]\n";
-            return true;
+            return {false, false};
         }
         std::wstring text = Utf8ToWide(args[1]);
         std::vector<std::pair<InputScheme, std::string>> codes;
@@ -111,39 +124,42 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
         std::string id = engine.AddUserEntry(text, codes);
         if (!id.empty()) {
             std::cout << "[SUCCESS] Added user entry ID: " << id << "\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to add user entry.\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "edit") {
         if (args.size() < 3) {
             std::cout << "Usage: edit <id> <new_text>\n";
-            return true;
+            return {false, false};
         }
         std::string id = args[1];
         std::wstring text = Utf8ToWide(args[2]);
         if (engine.EditUserEntry(id, text)) {
             std::cout << "[SUCCESS] Entry " << id << " updated successfully.\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to update entry " << id << ".\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "del") {
         if (args.size() < 2) {
             std::cout << "Usage: del <id>\n";
-            return true;
+            return {false, false};
         }
         std::string id = args[1];
         if (engine.DeleteUserEntry(id)) {
             std::cout << "[SUCCESS] Entry " << id << " deleted.\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to delete entry " << id << ".\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "list") {
@@ -156,13 +172,13 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
             }
             std::cout << "\n";
         }
-        return true;
+        return {false, true};
     }
 
     if (cmd == "pin") {
         if (args.size() < 4) {
             std::cout << "Usage: pin <scheme> <code> <id> [rank]\n";
-            return true;
+            return {false, false};
         }
         InputScheme sch = SchemeFromString(args[1]);
         std::string code = args[2];
@@ -170,32 +186,34 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
         int rank = (args.size() >= 5) ? std::stoi(args[4]) : 1;
         if (engine.PinCandidate(sch, code, id, rank)) {
             std::cout << "[SUCCESS] Pinned candidate " << id << " to rank " << rank << " under " << code << ".\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to pin candidate.\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "unpin") {
         if (args.size() < 4) {
             std::cout << "Usage: unpin <scheme> <code> <id>\n";
-            return true;
+            return {false, false};
         }
         InputScheme sch = SchemeFromString(args[1]);
         std::string code = args[2];
         std::string id = args[3];
         if (engine.UnpinCandidate(sch, code, id)) {
             std::cout << "[SUCCESS] Unpinned candidate " << id << " under " << code << ".\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to unpin candidate.\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "commit") {
         if (args.size() < 4) {
             std::cout << "Usage: commit <scheme> <code> <id> [event_id]\n";
-            return true;
+            return {false, false};
         }
         InputScheme sch = SchemeFromString(args[1]);
         std::string code = args[2];
@@ -203,51 +221,55 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
         std::string eventId = (args.size() >= 5) ? args[4] : "";
         if (engine.CommitCandidate(eventId, sch, code, id)) {
             std::cout << "[SUCCESS] Commit recorded for " << id << " under " << code << ".\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to record commit.\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "reset-stats") {
         std::string id = (args.size() >= 2) ? args[1] : "";
         if (engine.ResetStats(id)) {
             std::cout << "[SUCCESS] Stats reset " << (id.empty() ? "for all entries." : ("for entry " + id + ".")) << "\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Failed to reset stats.\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "export") {
         if (args.size() < 2) {
             std::cout << "Usage: export <file.json>\n";
-            return true;
+            return {false, false};
         }
         std::string path = args[1];
         std::string err;
         if (engine.ExportData(path, &err)) {
             std::cout << "[SUCCESS] Exported user data to " << path << "\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Export failed: " << err << "\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "import") {
         if (args.size() < 2) {
             std::cout << "Usage: import <file.json> [merge|replace]\n";
-            return true;
+            return {false, false};
         }
         std::string path = args[1];
         bool replace = (args.size() >= 3 && args[2] == "replace");
         std::string err;
         if (engine.ImportData(path, replace, &err)) {
             std::cout << "[SUCCESS] Imported user data (" << (replace ? "Replace" : "Merge") << " mode) from " << path << "\n";
+            return {false, true};
         } else {
             std::cout << "[ERROR] Import failed: " << err << "\n";
+            return {false, false};
         }
-        return true;
     }
 
     if (cmd == "bench") {
@@ -265,11 +287,11 @@ static bool ExecuteCommand(ImeEngine& engine, const std::vector<std::string>& ar
         double totalMs = (end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
         double avgUs = (totalMs * 1000.0) / 1000.0;
         std::cout << "1,000 queries completed in " << totalMs << " ms (Average: " << avgUs << " us per query!)\n";
-        return true;
+        return {false, true};
     }
 
     std::cout << "Unknown command: " << cmd << ". Type 'help' for usage.\n";
-    return true;
+    return {false, false};
 }
 
 int main(int argc, char* argv[]) {
@@ -317,8 +339,8 @@ int main(int argc, char* argv[]) {
 
     if (!cmdArgs.empty()) {
         // Direct command mode
-        bool cont = ExecuteCommand(engine, cmdArgs);
-        return cont ? 0 : 0;
+        CommandResult res = ExecuteCommand(engine, cmdArgs);
+        return res.success ? 0 : 1;
     }
 
     // Interactive REPL Mode
@@ -335,7 +357,8 @@ int main(int argc, char* argv[]) {
             break;
         }
         auto args = SplitArgs(line);
-        if (!ExecuteCommand(engine, args)) {
+        CommandResult res = ExecuteCommand(engine, args);
+        if (res.shouldQuit) {
             break;
         }
     }

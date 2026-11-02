@@ -39,5 +39,6 @@ data/dictionaries/*.raw.yaml
 docs/*
 !docs/design.md
 !docs/dictionary-info.md
+!docs/stage2-design.md
 
 

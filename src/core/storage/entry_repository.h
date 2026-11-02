@@ -11,11 +11,17 @@
 namespace ime {
 
 struct SortPreference {
+    InputScheme scheme = InputScheme::Pinyin;
+    std::string code;
+    std::string entry_id;
     bool is_pinned = false;
     int order_rank = 0;
 };
 
 struct EntryStat {
+    InputScheme scheme = InputScheme::Pinyin;
+    std::string code;
+    std::string entry_id;
     int selected_count = 0;
     int64_t last_selected_at = 0;
     double effective_count = 0.0;
@@ -32,21 +38,30 @@ public:
                          EntrySource source = EntrySource::User,
                          const std::string& customId = "");
     bool UpdateEntryText(const std::string& entryId, const std::wstring& newText);
+    bool AddEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes);
     bool DeleteEntry(const std::string& entryId);
     std::optional<Entry> GetEntry(const std::string& entryId);
     std::vector<Entry> GetAllUserEntries();
+    std::vector<Entry> GetAllEntries();
 
     // Query User Entries by scheme + code (exact or prefix)
     std::vector<Candidate> QueryUserCandidates(InputScheme scheme, const std::string& code);
+
+    // Verification
+    bool VerifyCandidateAffiliation(InputScheme scheme, const std::string& code, const std::string& entryId);
 
     // Sort Preferences (Pin / Rank)
     bool SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank = 1);
     bool UnpinPreference(InputScheme scheme, const std::string& code, const std::string& entryId);
     std::optional<SortPreference> GetSortPreference(InputScheme scheme, const std::string& code, const std::string& entryId);
+    std::vector<SortPreference> GetAllSortPreferences();
 
     // Stats & Learning
     bool RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId);
+    bool SetStatDirect(InputScheme scheme, const std::string& code, const std::string& entryId,
+                       int count, int64_t lastUsed, double effCount, int64_t lastDecayAt, bool mergeMode = false);
     std::optional<EntryStat> GetStat(InputScheme scheme, const std::string& code, const std::string& entryId);
+    std::vector<EntryStat> GetAllEntryStats();
     bool ResetStats(const std::string& entryId = "");
 
     // Utility: ensure a builtin entry has a row in entries if needed for stats/pinning

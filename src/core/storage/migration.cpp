@@ -66,6 +66,9 @@ bool Migration::ApplyVersion1(SqliteDb& db) {
 
         CREATE TABLE IF NOT EXISTS commit_events (
             event_id TEXT PRIMARY KEY,
+            scheme INTEGER NOT NULL DEFAULT 0,
+            code TEXT NOT NULL DEFAULT '',
+            entry_id TEXT NOT NULL DEFAULT '',
             committed_at INTEGER NOT NULL
         );
 
