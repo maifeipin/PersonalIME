@@ -4,15 +4,24 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $files = @(
     "build\Release\PersonalIME.dll",
     "build\Release\ime-service.exe",
+    "build\Release\ime-cli.exe",
+    "build\Release\test_ime_core.exe",
     "build\Release\test_composition_lifecycle.exe",
     "build\Release\test_ipc_runner.exe",
     "build\Release\test_candidate_window.exe",
     "build\Release\test_com_lifecycle.exe",
-    "src\tsf_client\edit_session.h",
-    "src\tsf_client\ipc_client.cpp",
-    "src\tsf_client\ipc_client.h",
-    "src\tsf_client\text_input_processor.cpp",
-    "src\tsf_client\text_input_processor.h"
+    "src\core\engine\ime_engine.h",
+    "src\core\engine\ime_engine.cpp",
+    "src\core\storage\sqlite_db.h",
+    "src\core\storage\sqlite_db.cpp",
+    "src\core\storage\entry_repository.h",
+    "src\core\storage\entry_repository.cpp",
+    "src\core\ranking\ranker.h",
+    "src\core\ranking\ranker.cpp",
+    "src\core\encoding\pinyin_segmenter.h",
+    "src\core\encoding\pinyin_segmenter.cpp",
+    "data\dictionaries\wubi86.dict",
+    "data\dictionaries\pinyin.dict"
 )
 
 $results = foreach ($f in $files) {

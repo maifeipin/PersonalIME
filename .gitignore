@@ -34,8 +34,10 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
-# Intermediate development review docs (only keep design.md in docs)
+# Raw dictionary intermediate downloads
+data/dictionaries/*.raw.yaml
 docs/*
 !docs/design.md
+!docs/dictionary-info.md
 
 

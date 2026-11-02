@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(PersonalIME LANGUAGES CXX)
+project(PersonalIME LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,59 @@ endif()
 add_definitions(-DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# --- Third Party Dependencies ---
+# SQLite 3 Amalgamation
+add_library(sqlite3 STATIC
+    src/third_party/sqlite/sqlite3.c
+)
+target_include_directories(sqlite3 PUBLIC
+    src/third_party/sqlite
+)
+target_compile_definitions(sqlite3 PRIVATE
+    SQLITE_THREADSAFE=1
+    SQLITE_ENABLE_FTS5
+    SQLITE_ENABLE_RTREE
+)
+
+# --- Stage 2: Core IME Engine Library ---
+add_library(ime-core STATIC
+    src/core/storage/sqlite_db.cpp
+    src/core/storage/migration.cpp
+    src/core/storage/entry_repository.cpp
+    src/core/storage/json_backup.cpp
+    src/core/encoding/pinyin_segmenter.cpp
+    src/core/dictionary/builtin_dict.cpp
+    src/core/ranking/ranker.cpp
+    src/core/engine/ime_engine.cpp
+)
+
+target_include_directories(ime-core PUBLIC
+    src
+    src/third_party
+)
+
+target_link_libraries(ime-core PUBLIC
+    sqlite3
+)
+
+# --- Stage 2: CLI Debugger & REPL Tool ---
+add_executable(ime-cli
+    src/cli/main.cpp
+)
+target_link_libraries(ime-cli PRIVATE
+    ime-core
+)
+
+# --- Stage 2: ime-core Test Suite ---
+add_executable(test_ime_core
+    tests/test_ime_core.cpp
+)
+target_link_libraries(test_ime_core PRIVATE
+    ime-core
+)
+
+# --- Stage 1 Targets ---
 
 # 1. Thin TSF In-process DLL
 add_library(PersonalIME SHARED
