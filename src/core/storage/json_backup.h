@@ -5,10 +5,12 @@
 
 namespace ime {
 
+class BuiltinDictionary;
+
 class JsonBackup {
 public:
     static bool ExportToFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, std::string* errorOut = nullptr);
-    static bool ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, bool replaceMode = false, std::string* errorOut = nullptr);
+    static bool ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, bool replaceMode = false, std::string* errorOut = nullptr, const BuiltinDictionary* builtinDict = nullptr);
 };
 
 } // namespace ime

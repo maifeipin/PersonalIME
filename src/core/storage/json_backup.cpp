@@ -1,7 +1,10 @@
 #include "json_backup.h"
+#include "../dictionary/builtin_dict.h"
 #include "../../third_party/nlohmann/json.hpp"
 #include <fstream>
 #include <chrono>
+#include <cmath>
+#include <unordered_set>
 
 using json = nlohmann::json;
 
@@ -108,7 +111,7 @@ bool JsonBackup::ExportToFile(EntryRepository& repo, SqliteDb& db, const std::st
     }
 }
 
-bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, bool replaceMode, std::string* errorOut) {
+bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, bool replaceMode, std::string* errorOut, const BuiltinDictionary* builtinDict) {
     std::ifstream f(filePath);
     if (!f.is_open()) {
         if (errorOut) *errorOut = "Cannot open import file: " + filePath;
@@ -133,6 +136,16 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
         return false;
     }
 
+    if (root.contains("preferences") && !root["preferences"].is_array()) {
+        if (errorOut) *errorOut = "Field 'preferences' must be an array";
+        return false;
+    }
+
+    if (root.contains("stats") && !root["stats"].is_array()) {
+        if (errorOut) *errorOut = "Field 'stats' must be an array";
+        return false;
+    }
+
     // ==========================================
     // Phase 1: STRICT PRE-VALIDATION
     // Ensure entire JSON file is valid BEFORE touching database!
@@ -146,9 +159,14 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
     };
 
     std::vector<ParsedEntry> validatedEntries;
+    std::unordered_set<std::string> knownEntryIds;
 
     try {
+        // 1. Validate entries
         for (const auto& item : root["entries"]) {
+            if (!item.is_object()) {
+                throw std::runtime_error("Entry item must be an object");
+            }
             if (!item.contains("text") || !item["text"].is_string()) {
                 throw std::runtime_error("Entry missing valid text string");
             }
@@ -159,6 +177,12 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
             }
 
             std::string id = item.value("id", "");
+            if (!id.empty()) {
+                if (knownEntryIds.count(id) > 0) {
+                    throw std::runtime_error("Duplicate entry id in backup: " + id);
+                }
+                knownEntryIds.insert(id);
+            }
 
             if (!item.contains("codes") || !item["codes"].is_array()) {
                 throw std::runtime_error("Entry missing codes array");
@@ -166,7 +190,7 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
 
             std::vector<std::pair<InputScheme, std::string>> codes;
             for (const auto& cItem : item["codes"]) {
-                if (!cItem.contains("scheme") || !cItem.contains("code")) {
+                if (!cItem.is_object() || !cItem.contains("scheme") || !cItem.contains("code")) {
                     throw std::runtime_error("Code mapping missing scheme or code");
                 }
                 std::string schStr = cItem["scheme"].get<std::string>();
@@ -190,36 +214,150 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
             std::vector<std::tuple<InputScheme, std::string, int>> pinned;
             if (item.contains("pinned") && item["pinned"].is_array()) {
                 for (const auto& pItem : item["pinned"]) {
-                    if (pItem.contains("scheme") && pItem.contains("code")) {
-                        InputScheme sch = SchemeFromString(pItem["scheme"].get<std::string>());
-                        if (sch != InputScheme::Unknown) {
-                            std::string code = pItem["code"].get<std::string>();
-                            int rank = pItem.value("rank", 1);
-                            pinned.emplace_back(sch, code, rank);
-                        }
+                    if (!pItem.is_object() || !pItem.contains("scheme") || !pItem.contains("code")) {
+                        throw std::runtime_error("Entry pinned item must be an object with scheme and code");
                     }
+                    InputScheme sch = SchemeFromString(pItem["scheme"].get<std::string>());
+                    if (sch == InputScheme::Unknown) {
+                        throw std::runtime_error("Invalid scheme in entry pinned preference");
+                    }
+                    std::string code = pItem["code"].get<std::string>();
+                    std::transform(code.begin(), code.end(), code.begin(), [](unsigned char c) { return std::tolower(c); });
+                    if (!IsValidCode(sch, code)) {
+                        throw std::runtime_error("Invalid code in entry pinned preference: " + code);
+                    }
+                    int rank = pItem.value("rank", 1);
+                    if (rank < 1 || rank > 1000000) {
+                        throw std::runtime_error("Rank out of bounds in entry pinned preference");
+                    }
+                    pinned.emplace_back(sch, code, rank);
                 }
             }
 
             std::vector<std::tuple<InputScheme, std::string, int, int64_t, double, int64_t>> stats;
             if (item.contains("stats") && item["stats"].is_array()) {
                 for (const auto& sItem : item["stats"]) {
-                    if (sItem.contains("scheme") && sItem.contains("code") && sItem.contains("count")) {
-                        InputScheme sch = SchemeFromString(sItem["scheme"].get<std::string>());
-                        if (sch != InputScheme::Unknown) {
-                            std::string code = sItem["code"].get<std::string>();
-                            int count = sItem["count"].get<int>();
-                            int64_t lastUsed = sItem.value("last_used", 0);
-                            double effCount = sItem.value("effective_count", static_cast<double>(count));
-                            int64_t lastDecayAt = sItem.value("last_decay_at", lastUsed);
-                            stats.emplace_back(sch, code, count, lastUsed, effCount, lastDecayAt);
-                        }
+                    if (!sItem.is_object() || !sItem.contains("scheme") || !sItem.contains("code") || !sItem.contains("count")) {
+                        throw std::runtime_error("Entry stat must contain scheme, code, and count");
                     }
+                    InputScheme sch = SchemeFromString(sItem["scheme"].get<std::string>());
+                    if (sch == InputScheme::Unknown) {
+                        throw std::runtime_error("Invalid scheme in entry stat");
+                    }
+                    std::string code = sItem["code"].get<std::string>();
+                    std::transform(code.begin(), code.end(), code.begin(), [](unsigned char c) { return std::tolower(c); });
+                    if (!IsValidCode(sch, code)) {
+                        throw std::runtime_error("Invalid code in entry stat: " + code);
+                    }
+                    int count = sItem["count"].get<int>();
+                    if (count < 0 || count > 1000000000) {
+                        throw std::runtime_error("Selected count out of bounds in entry stat");
+                    }
+                    int64_t lastUsed = sItem.value("last_used", 0LL);
+                    if (lastUsed < 0 || lastUsed > 253402300799LL) {
+                        throw std::runtime_error("last_used timestamp out of bounds in entry stat");
+                    }
+                    double effCount = sItem.value("effective_count", static_cast<double>(count));
+                    if (!std::isfinite(effCount) || effCount < 0.0 || effCount > 1000000000.0) {
+                        throw std::runtime_error("effective_count invalid or out of bounds in entry stat");
+                    }
+                    int64_t lastDecayAt = sItem.value("last_decay_at", lastUsed);
+                    if (lastDecayAt < 0 || lastDecayAt > 253402300799LL) {
+                        throw std::runtime_error("last_decay_at timestamp out of bounds in entry stat");
+                    }
+                    stats.emplace_back(sch, code, count, lastUsed, effCount, lastDecayAt);
                 }
             }
 
             validatedEntries.push_back({id, text, std::move(codes), std::move(pinned), std::move(stats)});
         }
+
+        // If not replace mode, existing entries in database are also recognized
+        if (!replaceMode) {
+            for (const auto& e : repo.GetAllEntries()) {
+                knownEntryIds.insert(e.id);
+            }
+        }
+
+        auto isEntryIdValid = [&](const std::string& eid) -> bool {
+            if (eid.empty()) return false;
+            if (knownEntryIds.count(eid) > 0) return true;
+            if (eid.rfind("b_", 0) == 0) {
+                if (builtinDict && builtinDict->IsLoaded()) {
+                    return builtinDict->HasItem(eid);
+                }
+                // When builtinDict is not loaded, validate builtin id structure
+                if (eid.rfind("b_py_", 0) == 0 || eid.rfind("b_wb_", 0) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // 2. Validate global preferences
+        if (root.contains("preferences") && root["preferences"].is_array()) {
+            for (const auto& pItem : root["preferences"]) {
+                if (!pItem.is_object() || !pItem.contains("scheme") || !pItem.contains("code") || !pItem.contains("entry_id")) {
+                    throw std::runtime_error("Preference item missing scheme, code, or entry_id");
+                }
+                InputScheme sch = SchemeFromString(pItem["scheme"].get<std::string>());
+                if (sch == InputScheme::Unknown) {
+                    throw std::runtime_error("Unknown scheme in global preference");
+                }
+                std::string code = pItem["code"].get<std::string>();
+                std::transform(code.begin(), code.end(), code.begin(), [](unsigned char c) { return std::tolower(c); });
+                if (!IsValidCode(sch, code)) {
+                    throw std::runtime_error("Invalid code in global preference: " + code);
+                }
+                std::string entryId = pItem["entry_id"].get<std::string>();
+                if (!isEntryIdValid(entryId)) {
+                    throw std::runtime_error("Global preference references dangling or unknown entry_id: " + entryId);
+                }
+                int rank = pItem.value("rank", 1);
+                if (rank < 1 || rank > 1000000) {
+                    throw std::runtime_error("Rank out of bounds in global preference");
+                }
+            }
+        }
+
+        // 3. Validate global stats
+        if (root.contains("stats") && root["stats"].is_array()) {
+            for (const auto& sItem : root["stats"]) {
+                if (!sItem.is_object() || !sItem.contains("scheme") || !sItem.contains("code") || !sItem.contains("entry_id")) {
+                    throw std::runtime_error("Stat item missing scheme, code, or entry_id");
+                }
+                InputScheme sch = SchemeFromString(sItem["scheme"].get<std::string>());
+                if (sch == InputScheme::Unknown) {
+                    throw std::runtime_error("Unknown scheme in global stat");
+                }
+                std::string code = sItem["code"].get<std::string>();
+                std::transform(code.begin(), code.end(), code.begin(), [](unsigned char c) { return std::tolower(c); });
+                if (!IsValidCode(sch, code)) {
+                    throw std::runtime_error("Invalid code in global stat: " + code);
+                }
+                std::string entryId = sItem["entry_id"].get<std::string>();
+                if (!isEntryIdValid(entryId)) {
+                    throw std::runtime_error("Global stat references dangling or unknown entry_id: " + entryId);
+                }
+                int count = sItem.value("count", 0);
+                if (count < 0 || count > 1000000000) {
+                    throw std::runtime_error("Count out of bounds in global stat");
+                }
+                int64_t lastUsed = sItem.value("last_used", 0LL);
+                if (lastUsed < 0 || lastUsed > 253402300799LL) {
+                    throw std::runtime_error("last_used timestamp out of bounds in global stat");
+                }
+                double effCount = sItem.value("effective_count", static_cast<double>(count));
+                if (!std::isfinite(effCount) || effCount < 0.0 || effCount > 1000000000.0) {
+                    throw std::runtime_error("effective_count invalid or out of bounds in global stat");
+                }
+                int64_t lastDecayAt = sItem.value("last_decay_at", lastUsed);
+                if (lastDecayAt < 0 || lastDecayAt > 253402300799LL) {
+                    throw std::runtime_error("last_decay_at timestamp out of bounds in global stat");
+                }
+            }
+        }
+
     } catch (const std::exception& ex) {
         if (errorOut) *errorOut = std::string("Validation failed: ") + ex.what();
         return false;
@@ -232,23 +370,33 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
 
     try {
         if (replaceMode) {
-            // Clear all user entries and associated data
-            db.Execute("DELETE FROM entries WHERE source = 1;");
-            db.Execute("DELETE FROM entry_codes WHERE entry_id NOT IN (SELECT id FROM entries);");
-            db.Execute("DELETE FROM sort_preferences WHERE entry_id NOT IN (SELECT id FROM entries);");
-            db.Execute("DELETE FROM entry_stats WHERE entry_id NOT IN (SELECT id FROM entries);");
+            // Clear all user entries, preferences, stats, and commit events
+            if (!db.Execute("DELETE FROM sort_preferences;") ||
+                !db.Execute("DELETE FROM entry_stats;") ||
+                !db.Execute("DELETE FROM commit_events;") ||
+                !db.Execute("DELETE FROM entries WHERE source = 1;") ||
+                !db.Execute("DELETE FROM entry_codes WHERE entry_id NOT IN (SELECT id FROM entries);") ||
+                !db.Execute("DELETE FROM entries WHERE source = 0;")) {
+                throw std::runtime_error("Failed to clear database state in replace mode");
+            }
         }
 
         for (const auto& entry : validatedEntries) {
             std::string actualId;
             if (entry.id.rfind("b_", 0) == 0) {
-                repo.EnsureBuiltinEntryExists(entry.id, entry.text);
+                if (!repo.EnsureBuiltinEntryExists(entry.id, entry.text)) {
+                    throw std::runtime_error("Failed to ensure builtin entry: " + entry.id);
+                }
                 actualId = entry.id;
             } else if (!entry.id.empty()) {
                 auto existing = repo.GetEntry(entry.id);
                 if (existing) {
-                    repo.UpdateEntryText(entry.id, entry.text);
-                    repo.AddEntryCodes(entry.id, entry.codes);
+                    if (!repo.UpdateEntryText(entry.id, entry.text)) {
+                        throw std::runtime_error("Failed to update entry text: " + entry.id);
+                    }
+                    if (!repo.AddEntryCodes(entry.id, entry.codes)) {
+                        throw std::runtime_error("Failed to add entry codes: " + entry.id);
+                    }
                     actualId = entry.id;
                 }
             }
@@ -262,12 +410,16 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
 
             // Restore entry-level pinned preferences
             for (const auto& [sch, code, rank] : entry.pinned) {
-                repo.SetPinPreference(sch, code, actualId, true, rank);
+                if (!repo.SetPinPreference(sch, code, actualId, true, rank)) {
+                    throw std::runtime_error("Failed to set pin preference: " + actualId);
+                }
             }
 
             // Restore entry-level stats with high fidelity (no looping)
             for (const auto& [sch, code, count, lastUsed, effCount, lastDecayAt] : entry.stats) {
-                repo.SetStatDirect(sch, code, actualId, count, lastUsed, effCount, lastDecayAt, !replaceMode);
+                if (!repo.SetStatDirect(sch, code, actualId, count, lastUsed, effCount, lastDecayAt, !replaceMode)) {
+                    throw std::runtime_error("Failed to set stat: " + actualId);
+                }
             }
         }
 
@@ -282,9 +434,13 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
                         bool isPinned = pItem.value("is_pinned", true);
                         int rank = pItem.value("rank", 1);
                         if (entryId.rfind("b_", 0) == 0) {
-                            repo.EnsureBuiltinEntryExists(entryId, L"");
+                            if (!repo.EnsureBuiltinEntryExists(entryId, L"")) {
+                                throw std::runtime_error("Failed to ensure builtin entry for preference: " + entryId);
+                            }
                         }
-                        repo.SetPinPreference(sch, code, entryId, isPinned, rank);
+                        if (!repo.SetPinPreference(sch, code, entryId, isPinned, rank)) {
+                            throw std::runtime_error("Failed to set preference: " + entryId);
+                        }
                     }
                 }
             }
@@ -303,9 +459,13 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
                         double effCount = sItem.value("effective_count", static_cast<double>(count));
                         int64_t lastDecayAt = sItem.value("last_decay_at", lastUsed);
                         if (entryId.rfind("b_", 0) == 0) {
-                            repo.EnsureBuiltinEntryExists(entryId, L"");
+                            if (!repo.EnsureBuiltinEntryExists(entryId, L"")) {
+                                throw std::runtime_error("Failed to ensure builtin entry for stat: " + entryId);
+                            }
                         }
-                        repo.SetStatDirect(sch, code, entryId, count, lastUsed, effCount, lastDecayAt, !replaceMode);
+                        if (!repo.SetStatDirect(sch, code, entryId, count, lastUsed, effCount, lastDecayAt, !replaceMode)) {
+                            throw std::runtime_error("Failed to set stat: " + entryId);
+                        }
                     }
                 }
             }

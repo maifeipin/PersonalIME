@@ -76,7 +76,10 @@ std::string EntryRepository::AddEntry(const std::wstring& text,
         stmtCode->BindInt(2, static_cast<int>(scheme));
         stmtCode->BindText(3, lowerCode);
         stmtCode->BindInt64(4, now);
-        stmtCode->Execute();
+        if (!stmtCode->Execute()) {
+            tx.Rollback();
+            return "";
+        }
     }
 
     if (!tx.Commit()) {
@@ -104,7 +107,103 @@ bool EntryRepository::AddEntryCodes(const std::string& entryId, const std::vecto
         stmtCode->BindInt(2, static_cast<int>(scheme));
         stmtCode->BindText(3, lowerCode);
         stmtCode->BindInt64(4, now);
-        stmtCode->Execute();
+        if (!stmtCode->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    return tx.Commit();
+}
+
+bool EntryRepository::SetEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes) {
+    if (entryId.empty() || codes.empty()) return false;
+    int64_t now = m_clock->Now();
+    SqliteDb::Transaction tx(m_db);
+
+    auto stmtDel = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
+    if (!stmtDel) return false;
+    stmtDel->BindText(1, entryId);
+    if (!stmtDel->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    auto stmtCode = m_db.Prepare("INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at) VALUES (?, ?, ?, ?);");
+    if (!stmtCode) {
+        tx.Rollback();
+        return false;
+    }
+
+    for (const auto& [scheme, code] : codes) {
+        if (scheme == InputScheme::Unknown) continue;
+        std::string lowerCode = code;
+        std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (!IsValidCode(scheme, lowerCode)) continue;
+
+        stmtCode->Reset();
+        stmtCode->BindText(1, entryId);
+        stmtCode->BindInt(2, static_cast<int>(scheme));
+        stmtCode->BindText(3, lowerCode);
+        stmtCode->BindInt64(4, now);
+        if (!stmtCode->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    return tx.Commit();
+}
+
+bool EntryRepository::UpdateEntry(const std::string& entryId, const std::wstring& newText, const std::vector<std::pair<InputScheme, std::string>>& newCodes) {
+    if (entryId.empty() || newText.empty()) return false;
+    int64_t now = m_clock->Now();
+    SqliteDb::Transaction tx(m_db);
+
+    auto stmt = m_db.Prepare("UPDATE entries SET text = ?, updated_at = ? WHERE id = ?;");
+    if (!stmt) return false;
+    stmt->BindText(1, WideToUtf8(newText));
+    stmt->BindInt64(2, now);
+    stmt->BindText(3, entryId);
+    if (!stmt->Execute() || m_db.Changes() == 0) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!newCodes.empty()) {
+        auto stmtDel = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
+        if (!stmtDel) {
+            tx.Rollback();
+            return false;
+        }
+        stmtDel->BindText(1, entryId);
+        if (!stmtDel->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+
+        auto stmtCode = m_db.Prepare("INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at) VALUES (?, ?, ?, ?);");
+        if (!stmtCode) {
+            tx.Rollback();
+            return false;
+        }
+
+        for (const auto& [scheme, code] : newCodes) {
+            if (scheme == InputScheme::Unknown) continue;
+            std::string lowerCode = code;
+            std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (!IsValidCode(scheme, lowerCode)) continue;
+
+            stmtCode->Reset();
+            stmtCode->BindText(1, entryId);
+            stmtCode->BindInt(2, static_cast<int>(scheme));
+            stmtCode->BindText(3, lowerCode);
+            stmtCode->BindInt64(4, now);
+            if (!stmtCode->Execute()) {
+                tx.Rollback();
+                return false;
+            }
+        }
     }
 
     return tx.Commit();
@@ -120,8 +219,8 @@ bool EntryRepository::UpdateEntryText(const std::string& entryId, const std::wst
     stmt->BindText(1, textUtf8);
     stmt->BindInt64(2, now);
     stmt->BindText(3, entryId);
-    stmt->Step();
-    return (m_db.Changes() > 0);
+    if (!stmt->Execute() || m_db.Changes() == 0) return false;
+    return true;
 }
 
 bool EntryRepository::DeleteEntry(const std::string& entryId) {
@@ -131,22 +230,20 @@ bool EntryRepository::DeleteEntry(const std::string& entryId) {
     auto stmt = m_db.Prepare("DELETE FROM entries WHERE id = ?;");
     if (!stmt) return false;
     stmt->BindText(1, entryId);
-    stmt->Step();
-    bool ok = (m_db.Changes() > 0);
-
-    if (ok) {
-        // Cascade manually if foreign keys are disabled
-        auto s1 = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
-        if (s1) { s1->BindText(1, entryId); s1->Step(); }
-        auto s2 = m_db.Prepare("DELETE FROM sort_preferences WHERE entry_id = ?;");
-        if (s2) { s2->BindText(1, entryId); s2->Step(); }
-        auto s3 = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
-        if (s3) { s3->BindText(1, entryId); s3->Step(); }
-        tx.Commit();
-    } else {
+    if (!stmt->Execute() || m_db.Changes() == 0) {
         tx.Rollback();
+        return false;
     }
-    return ok;
+
+    // Cascade manually if foreign keys are disabled
+    auto s1 = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
+    if (s1) { s1->BindText(1, entryId); if (!s1->Execute()) { tx.Rollback(); return false; } }
+    auto s2 = m_db.Prepare("DELETE FROM sort_preferences WHERE entry_id = ?;");
+    if (s2) { s2->BindText(1, entryId); if (!s2->Execute()) { tx.Rollback(); return false; } }
+    auto s3 = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
+    if (s3) { s3->BindText(1, entryId); if (!s3->Execute()) { tx.Rollback(); return false; } }
+
+    return tx.Commit();
 }
 
 std::optional<Entry> EntryRepository::GetEntry(const std::string& entryId) {
@@ -418,6 +515,27 @@ std::vector<SortPreference> EntryRepository::GetAllSortPreferences() {
     return list;
 }
 
+std::vector<SortPreference> EntryRepository::GetPinnedPreferences(InputScheme scheme, const std::string& code) {
+    std::vector<SortPreference> list;
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    auto stmt = m_db.Prepare("SELECT scheme, code, entry_id, is_pinned, order_rank FROM sort_preferences WHERE scheme = ? AND code = ? AND is_pinned = 1 ORDER BY order_rank ASC;");
+    if (!stmt) return list;
+    stmt->BindInt(1, static_cast<int>(scheme));
+    stmt->BindText(2, lowerCode);
+    while (stmt->Step()) {
+        SortPreference p;
+        p.scheme = scheme;
+        p.code = lowerCode;
+        p.entry_id = stmt->ColumnText(2);
+        p.is_pinned = (stmt->ColumnInt(3) == 1);
+        p.order_rank = stmt->ColumnInt(4);
+        list.push_back(std::move(p));
+    }
+    return list;
+}
+
 bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId) {
     if (code.empty() || entryId.empty()) return false;
     int64_t now = m_clock->Now();
@@ -432,7 +550,7 @@ bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme schem
 
     SqliteDb::Transaction tx(m_db);
 
-    // 1. Idempotency Check with exact payload verification
+    // 1. Idempotency Check with exact payload verification (and legacy v1 compatibility)
     if (!eventId.empty()) {
         auto stmtEventCheck = m_db.Prepare("SELECT scheme, code, entry_id FROM commit_events WHERE event_id = ?;");
         if (stmtEventCheck) {
@@ -441,8 +559,9 @@ bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme schem
                 int prevScheme = stmtEventCheck->ColumnInt(0);
                 std::string prevCode = stmtEventCheck->ColumnText(1);
                 std::string prevEntryId = stmtEventCheck->ColumnText(2);
-                if (prevScheme == static_cast<int>(scheme) && prevCode == lowerCode && prevEntryId == entryId) {
-                    return true; // idempotent retry of identical commit
+                if (prevEntryId.empty() ||
+                    (prevScheme == static_cast<int>(scheme) && prevCode == lowerCode && prevEntryId == entryId)) {
+                    return true; // idempotent retry of identical commit (or migrated v1 event)
                 }
                 return false; // event_id reused with conflicting payload
             }
@@ -525,8 +644,13 @@ bool EntryRepository::SetStatDirect(InputScheme scheme, const std::string& code,
         if (existing) {
             finalCount = (std::max)(existing->selected_count, count);
             finalLastUsed = (std::max)(existing->last_selected_at, lastUsed);
-            finalEff = (std::max)(existing->effective_count, effCount);
-            finalDecayAt = (std::max)(existing->last_decay_at, lastDecayAt);
+
+            // Compare both effective counts on a unified timeline:
+            int64_t T = (std::max)(existing->last_decay_at, lastDecayAt);
+            double effExisting = CalculateDecayedCount(existing->effective_count, existing->last_decay_at, T);
+            double effIncoming = CalculateDecayedCount(effCount, lastDecayAt, T);
+            finalEff = (std::max)(effExisting, effIncoming);
+            finalDecayAt = T;
         }
     }
 
@@ -576,6 +700,29 @@ std::vector<EntryStat> EntryRepository::GetAllEntryStats() {
     return list;
 }
 
+std::vector<EntryStat> EntryRepository::GetActiveStats(InputScheme scheme, const std::string& code) {
+    std::vector<EntryStat> list;
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    auto stmt = m_db.Prepare("SELECT scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at FROM entry_stats WHERE scheme = ? AND code = ? AND selected_count > 0;");
+    if (!stmt) return list;
+    stmt->BindInt(1, static_cast<int>(scheme));
+    stmt->BindText(2, lowerCode);
+    while (stmt->Step()) {
+        EntryStat s;
+        s.scheme = scheme;
+        s.code = lowerCode;
+        s.entry_id = stmt->ColumnText(2);
+        s.selected_count = stmt->ColumnInt(3);
+        s.last_selected_at = stmt->ColumnInt64(4);
+        s.effective_count = stmt->ColumnDouble(5);
+        s.last_decay_at = stmt->ColumnInt64(6);
+        list.push_back(std::move(s));
+    }
+    return list;
+}
+
 std::optional<EntryStat> EntryRepository::GetStat(InputScheme scheme, const std::string& code, const std::string& entryId) {
     std::string lowerCode = code;
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -602,21 +749,20 @@ bool EntryRepository::ResetStats(const std::string& entryId) {
         auto stmt = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
         if (!stmt) return false;
         stmt->BindText(1, entryId);
-        stmt->Step();
-        return true;
+        return stmt->Execute();
     }
 }
 
-void EntryRepository::EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text) {
+bool EntryRepository::EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text) {
+    if (entryId.empty()) return false;
     auto stmt = m_db.Prepare("INSERT OR IGNORE INTO entries (id, text, source, created_at, updated_at) VALUES (?, ?, 0, ?, ?);");
-    if (stmt) {
-        int64_t now = m_clock->Now();
-        stmt->BindText(1, entryId);
-        stmt->BindText(2, WideToUtf8(text));
-        stmt->BindInt64(3, now);
-        stmt->BindInt64(4, now);
-        stmt->Step();
-    }
+    if (!stmt) return false;
+    int64_t now = m_clock->Now();
+    stmt->BindText(1, entryId);
+    stmt->BindText(2, WideToUtf8(text));
+    stmt->BindInt64(3, now);
+    stmt->BindInt64(4, now);
+    return stmt->Execute();
 }
 
 } // namespace ime

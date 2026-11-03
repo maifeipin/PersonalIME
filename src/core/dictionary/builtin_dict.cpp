@@ -3,6 +3,7 @@
 #include <sstream>
 #include <algorithm>
 #include <iostream>
+#include <optional>
 
 namespace ime {
 
@@ -24,6 +25,7 @@ bool BuiltinDictionary::LoadWubi(const std::string& filePath) {
 
     m_wubiExact.clear();
     m_wubiSortedAll.clear();
+    m_wubiById.clear();
     m_wubiCount = 0;
 
     std::string line;
@@ -44,6 +46,7 @@ bool BuiltinDictionary::LoadWubi(const std::string& filePath) {
             item.id = "b_wb_" + code + "_" + textStr;
 
             m_wubiExact[code].push_back(item);
+            m_wubiById[item.id] = item;
             m_wubiSortedAll.emplace_back(code, std::move(item));
             m_wubiCount++;
         }
@@ -63,6 +66,7 @@ bool BuiltinDictionary::LoadPinyin(const std::string& filePath) {
     m_pinyinExactContinuous.clear();
     m_pinyinExactSpaced.clear();
     m_pinyinSortedContinuous.clear();
+    m_pinyinById.clear();
     m_pinyinCount = 0;
 
     std::string line;
@@ -87,6 +91,7 @@ bool BuiltinDictionary::LoadPinyin(const std::string& filePath) {
 
             m_pinyinExactContinuous[contCode].push_back(item);
             m_pinyinExactSpaced[spacedSyl].push_back(item);
+            m_pinyinById[item.id] = item;
             m_pinyinSortedContinuous.emplace_back(contCode, std::move(item));
             m_pinyinCount++;
         }
@@ -97,6 +102,49 @@ bool BuiltinDictionary::LoadPinyin(const std::string& filePath) {
     });
 
     return (m_pinyinCount > 0);
+}
+
+bool BuiltinDictionary::HasItem(const std::string& id) const {
+    if (m_wubiById.find(id) != m_wubiById.end()) return true;
+    if (m_pinyinById.find(id) != m_pinyinById.end()) return true;
+    return false;
+}
+
+std::optional<Candidate> BuiltinDictionary::GetCandidateById(InputScheme scheme, const std::string& code, const std::string& id) const {
+    if (scheme == InputScheme::Wubi86) {
+        auto it = m_wubiById.find(id);
+        if (it == m_wubiById.end()) return std::nullopt;
+        const auto& item = it->second;
+        if (item.code.rfind(code, 0) != 0) return std::nullopt;
+
+        Candidate c;
+        c.entry_id = item.id;
+        c.text = item.text;
+        c.scheme = InputScheme::Wubi86;
+        c.matched_code = item.code;
+        c.quality = (item.code == code) ? MatchQuality::ExactFull : MatchQuality::PrefixCompletion;
+        c.base_weight = item.weight;
+        c.source = EntrySource::Builtin;
+        return c;
+    } else if (scheme == InputScheme::Pinyin) {
+        auto it = m_pinyinById.find(id);
+        if (it == m_pinyinById.end()) return std::nullopt;
+        const auto& item = it->second;
+        bool matchCont = (item.continuous_code.rfind(code, 0) == 0);
+        bool matchSpaced = (item.spaced_syllables.rfind(code, 0) == 0);
+        if (!matchCont && !matchSpaced) return std::nullopt;
+
+        Candidate c;
+        c.entry_id = item.id;
+        c.text = item.text;
+        c.scheme = InputScheme::Pinyin;
+        c.matched_code = matchCont ? item.continuous_code : item.spaced_syllables;
+        c.quality = (c.matched_code == code) ? MatchQuality::ExactFull : MatchQuality::PrefixCompletion;
+        c.base_weight = item.weight;
+        c.source = EntrySource::Builtin;
+        return c;
+    }
+    return std::nullopt;
 }
 
 std::vector<Candidate> BuiltinDictionary::QueryWubi(const std::string& code) const {

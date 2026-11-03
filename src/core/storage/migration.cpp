@@ -18,6 +18,30 @@ bool Migration::Migrate(SqliteDb& db) {
             return false;
         }
     }
+
+    bool needsV2 = (currentVer < 2);
+    if (!needsV2) {
+        // Verify commit_events table structure in case of v1 table recreation
+        auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
+        if (stmt) {
+            bool hasScheme = false;
+            while (stmt->Step()) {
+                if (stmt->ColumnText(1) == "scheme") {
+                    hasScheme = true;
+                    break;
+                }
+            }
+            if (!hasScheme) {
+                needsV2 = true;
+            }
+        }
+    }
+
+    if (needsV2) {
+        if (!ApplyVersion2(db)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -91,6 +115,51 @@ bool Migration::ApplyVersion1(SqliteDb& db) {
     }
 
     return db.Execute("PRAGMA user_version = 1;");
+}
+
+bool Migration::ApplyVersion2(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+
+    // Inspect commit_events columns to see if scheme/code/entry_id need to be added
+    bool hasScheme = false;
+    {
+        auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
+        if (stmt) {
+            while (stmt->Step()) {
+                std::string colName = stmt->ColumnText(1);
+                if (colName == "scheme") {
+                    hasScheme = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!hasScheme) {
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN scheme INTEGER NOT NULL DEFAULT 0;")) {
+            tx.Rollback();
+            return false;
+        }
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN code TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN entry_id TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '2');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!tx.Commit()) {
+        return false;
+    }
+
+    return db.Execute("PRAGMA user_version = 2;");
 }
 
 } // namespace ime

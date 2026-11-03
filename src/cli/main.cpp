@@ -18,7 +18,7 @@ static void PrintHelp() {
     std::cout << "  query | q <scheme> <code>               Query candidates (e.g. q pinyin zhongwen)\n";
     std::cout << "  explain <scheme> <code>                 Explain ranking scores for candidates\n";
     std::cout << "  add <text> <scheme:code>...             Add user entry (e.g. add 我的地址 custom:;dz)\n";
-    std::cout << "  edit <id> <new_text>                    Update text of an existing user entry\n";
+    std::cout << "  edit <id> <new_text> [scheme:code...]   Update text and optionally replace codes of entry\n";
     std::cout << "  del <id>                                Delete an existing user entry\n";
     std::cout << "  list                                    List all user custom entries\n";
     std::cout << "  pin <scheme> <code> <id> [rank]         Pin candidate to top (e.g. pin pinyin zhongwen u_1 1)\n";
@@ -133,12 +133,23 @@ static CommandResult ExecuteCommand(ImeEngine& engine, const std::vector<std::st
 
     if (cmd == "edit") {
         if (args.size() < 3) {
-            std::cout << "Usage: edit <id> <new_text>\n";
+            std::cout << "Usage: edit <id> <new_text> [scheme:code ...]\n";
             return {false, false};
         }
         std::string id = args[1];
         std::wstring text = Utf8ToWide(args[2]);
-        if (engine.EditUserEntry(id, text)) {
+        std::vector<std::pair<InputScheme, std::string>> newCodes;
+        for (size_t i = 3; i < args.size(); ++i) {
+            auto pos = args[i].find(':');
+            if (pos != std::string::npos) {
+                std::string schStr = args[i].substr(0, pos);
+                std::string codeStr = args[i].substr(pos + 1);
+                newCodes.emplace_back(SchemeFromString(schStr), codeStr);
+            } else {
+                newCodes.emplace_back(InputScheme::Pinyin, args[i]);
+            }
+        }
+        if (engine.EditUserEntry(id, text, newCodes)) {
             std::cout << "[SUCCESS] Entry " << id << " updated successfully.\n";
             return {false, true};
         } else {

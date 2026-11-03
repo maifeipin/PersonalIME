@@ -35,7 +35,11 @@ public:
     // User Dictionary Management
     std::string AddUserEntry(const std::wstring& text,
                             const std::vector<std::pair<InputScheme, std::string>>& codes);
-    bool EditUserEntry(const std::string& entryId, const std::wstring& newText);
+    bool EditUserEntry(const std::string& entryId,
+                       const std::wstring& newText,
+                       const std::vector<std::pair<InputScheme, std::string>>& newCodes = {});
+    bool SetUserEntryCodes(const std::string& entryId,
+                           const std::vector<std::pair<InputScheme, std::string>>& newCodes);
     bool DeleteUserEntry(const std::string& entryId);
     std::optional<Entry> GetUserEntry(const std::string& entryId);
     std::vector<Entry> GetAllUserEntries();

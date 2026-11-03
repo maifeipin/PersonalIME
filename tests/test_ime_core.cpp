@@ -7,8 +7,10 @@
 #include <atomic>
 #include <filesystem>
 #include "../src/core/engine/ime_engine.h"
+#include "../src/core/storage/migration.h"
 #include "../src/core/clock.h"
 #include "../src/core/types.h"
+#include "../src/third_party/nlohmann/json.hpp"
 
 using namespace ime;
 
@@ -557,6 +559,229 @@ int TestReviewRound1NegativeCases() {
     return 0;
 }
 
+static int TestReviewRound2Probes() {
+    std::cout << "[TEST] Running Review Round 2 Data Integrity & Architecture Suite..." << std::endl;
+
+    // 1. Write Failure Aborts Replace & Rolls Back Atomically
+    {
+        std::cout << "  Subtest 1: Write failure rollback..." << std::endl;
+        SqliteDb db;
+        TEST_ASSERT(db.Open(":memory:"), "Open in-memory db for write failure test");
+        TEST_ASSERT(Migration::Migrate(db), "Migrate db");
+        auto clock = std::make_shared<MockClock>();
+        EntryRepository repo(db, clock);
+
+        auto oldId = repo.AddEntry(L"old_data", {{InputScheme::Custom, ";old"}});
+        TEST_ASSERT(!oldId.empty(), "Old entry created");
+
+        // Install a trigger that simulates SQL execution failure on specific code insert
+        TEST_ASSERT(db.Execute("CREATE TRIGGER fail_blocked BEFORE INSERT ON entry_codes WHEN NEW.code=';blocked' BEGIN SELECT RAISE(ABORT,'injected-code-failure'); END;"), "Create failure trigger");
+
+        nlohmann::json j = {
+            {"version", "1.0"},
+            {"entries", nlohmann::json::array({
+                {
+                    {"id", "incoming"},
+                    {"text", "incoming"},
+                    {"codes", nlohmann::json::array({
+                        {{"scheme", "custom"}, {"code", ";blocked"}}
+                    })}
+                }
+            })}
+        };
+        std::ofstream f("test_r2_write_failure.json");
+        f << j.dump(2);
+        f.close();
+
+        std::string err;
+        bool ok = JsonBackup::ImportFromFile(repo, db, "test_r2_write_failure.json", true, &err);
+        TEST_ASSERT(!ok, "Import must report failure on statement error");
+        TEST_ASSERT(repo.GetEntry(oldId).has_value(), "Old entry must be preserved on rollback");
+        TEST_ASSERT(!repo.GetEntry("incoming").has_value(), "Partial incoming entry must not exist");
+
+        std::filesystem::remove("test_r2_write_failure.json");
+    }
+
+    // 2. Global Metadata Pre-Validation Rejects Orphans Before DB Mutation
+    {
+        std::cout << "  Subtest 2: Pre-validation..." << std::endl;
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", ""), "Init engine");
+        auto oldId = e.AddUserEntry(L"preval_old", {{InputScheme::Custom, ";preval"}});
+        TEST_ASSERT(!oldId.empty(), "Old entry created");
+
+        nlohmann::json j = {
+            {"version", "1.0"},
+            {"entries", nlohmann::json::array()},
+            {"stats", nlohmann::json::array({
+                {{"scheme", "custom"}, {"code", ";missing"}, {"entry_id", "dangling_orphan_id"}, {"count", 1}}
+            })}
+        };
+        std::ofstream f("test_r2_orphan.json");
+        f << j.dump(2);
+        f.close();
+
+        std::string err;
+        bool ok = e.ImportData("test_r2_orphan.json", true, &err);
+        TEST_ASSERT(!ok, "Import must be rejected by pre-validation");
+        TEST_ASSERT(e.GetUserEntry(oldId).has_value(), "Existing database must not be touched on validation failure");
+
+        std::filesystem::remove("test_r2_orphan.json");
+    }
+
+    // 3. Replace Discards Builtin Preferences Absent from Replacement Backup
+    {
+        std::cout << "  Subtest 3: Replace discards builtin habits..." << std::endl;
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", "data/dictionaries"), "Init engine with dicts");
+        auto q = e.Query(InputScheme::Pinyin, "zhongwen");
+        TEST_ASSERT(!q.candidates.empty(), "Query builtin word");
+        auto id = q.candidates[0].entry_id;
+
+        TEST_ASSERT(e.PinCandidate(InputScheme::Pinyin, "zhongwen", id, 1), "Pin builtin candidate");
+        TEST_ASSERT(e.CommitCandidate("r2-replace-commit", InputScheme::Pinyin, "zhongwen", id), "Commit builtin candidate");
+
+        nlohmann::json emptyBackup = {
+            {"version", "1.0"},
+            {"entries", nlohmann::json::array()},
+            {"preferences", nlohmann::json::array()},
+            {"stats", nlohmann::json::array()}
+        };
+        std::ofstream f("test_r2_empty.json");
+        f << emptyBackup.dump(2);
+        f.close();
+
+        std::string err;
+        TEST_ASSERT(e.ImportData("test_r2_empty.json", true, &err), "Empty replace import succeeds");
+
+        auto rq = e.Query(InputScheme::Pinyin, "zhongwen");
+        for (const auto& c : rq.candidates) {
+            if (c.entry_id == id) {
+                TEST_ASSERT(!c.is_pinned, "Builtin word pin must be cleared in replace mode");
+                TEST_ASSERT(c.selected_count == 0, "Builtin word count must be cleared in replace mode");
+            }
+        }
+
+        std::filesystem::remove("test_r2_empty.json");
+    }
+
+    // 4. Unified Timeline Decay Merge Prevents Stale Habits from Overwriting Recent Usage
+    {
+        std::cout << "  Subtest 4: Decay merge..." << std::endl;
+        auto clock = std::make_shared<MockClock>();
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", "", clock), "Init engine with mock clock");
+        auto id = e.AddUserEntry(L"decay_entry", {{InputScheme::Custom, ";decay"}});
+
+        for (int i = 0; i < 10; ++i) {
+            e.CommitCandidate("old-commit-" + std::to_string(i), InputScheme::Custom, ";decay", id);
+        }
+        std::string oldJson = "test_r2_decay_old.json";
+        TEST_ASSERT(e.ExportData(oldJson), "Export old backup at t=0");
+
+        // Advance 30 days (1 half-life), then commit once more
+        clock->Advance(30LL * 86400);
+        TEST_ASSERT(e.CommitCandidate("new-commit", InputScheme::Custom, ";decay", id), "Commit after 30 days");
+        double effBefore = e.Query(InputScheme::Custom, ";decay").candidates.at(0).effective_count;
+        TEST_ASSERT(std::abs(effBefore - 6.0) < 0.01, "Effective count before merge should be 10*0.5 + 1 = 6.0");
+
+        // Merge old backup: should evaluate both on common timeline and NOT bump effective_count to 10
+        TEST_ASSERT(e.ImportData(oldJson, false), "Merge old backup");
+        auto candAfter = e.Query(InputScheme::Custom, ";decay").candidates.at(0);
+        TEST_ASSERT(std::abs(candAfter.effective_count - 6.0) < 0.01, "Effective count after merge must remain 6.0, not stale 10.0");
+        TEST_ASSERT(candAfter.selected_count == 11, "Selected count is max(10, 11) = 11");
+
+        std::filesystem::remove(oldJson);
+    }
+
+    // 5. Schema Migration Upgrades V1 Commit Events Table Smoothly
+    {
+        std::cout << "  Subtest 5: Schema migration..." << std::endl;
+        const char* dbFile = "test_r2_migrated.db";
+        std::error_code ec;
+        std::filesystem::remove(dbFile, ec);
+        {
+            SqliteDb db;
+            TEST_ASSERT(db.Open(dbFile), "Open db for v1 setup");
+            TEST_ASSERT(Migration::Migrate(db), "Migrate initial schema");
+            // Emulate v1 commit_events structure lacking scheme/code/entry_id
+            TEST_ASSERT(db.Execute("DROP TABLE commit_events; CREATE TABLE commit_events(event_id TEXT PRIMARY KEY, committed_at INTEGER NOT NULL);"), "Create v1 schema state");
+        }
+
+        {
+            ImeEngine e;
+            TEST_ASSERT(e.Initialize(dbFile, ""), "Initialize engine triggers automatic migration");
+            auto id = e.AddUserEntry(L"migrated_word", {{InputScheme::Custom, ";migrated"}});
+            TEST_ASSERT(e.CommitCandidate("event_after_migration", InputScheme::Custom, ";migrated", id), "Commit candidate succeeds on migrated database");
+            auto q = e.Query(InputScheme::Custom, ";migrated");
+            TEST_ASSERT(!q.candidates.empty() && q.candidates[0].selected_count == 1, "Candidate count recorded after migration");
+        }
+
+        std::filesystem::remove(dbFile, ec);
+    }
+
+    // 6. Pinned Candidates Recall Beyond Prefix Pool Bounds
+    {
+        std::cout << "  Subtest 6: Pinned recall beyond pool..." << std::endl;
+        std::filesystem::create_directory("test_r2_dicts");
+        std::ofstream f("test_r2_dicts/wubi86.dict");
+        std::string targetCode, targetText;
+        for (int i = 0; i < 600; ++i) {
+            std::string code = "aaaa";
+            code[1] = 'a' + i / 625;
+            code[2] = 'a' + (i / 25) % 25;
+            code[3] = 'a' + i % 25;
+            std::string text = "word" + std::to_string(i);
+            f << text << '\t' << code << "\t10\n";
+            targetCode = code;
+            targetText = text;
+        }
+        f.close();
+
+        {
+            ImeEngine e;
+            TEST_ASSERT(e.Initialize(":memory:", "test_r2_dicts"), "Init engine with 600-word dict");
+            auto qTarget = e.Query(InputScheme::Wubi86, targetCode);
+            TEST_ASSERT(!qTarget.candidates.empty(), "Query last entry in dict");
+            auto targetId = qTarget.candidates[0].entry_id;
+
+            TEST_ASSERT(e.PinCandidate(InputScheme::Wubi86, "a", targetId, 1), "Pin candidate beyond pool bounds");
+            auto qPrefix = e.Query(InputScheme::Wubi86, "a");
+            TEST_ASSERT(!qPrefix.candidates.empty(), "Query prefix 'a'");
+            TEST_ASSERT(qPrefix.candidates[0].entry_id == targetId, "Pinned candidate beyond pool must be recalled as top candidate");
+            TEST_ASSERT(qPrefix.candidates[0].is_pinned, "Pinned candidate must have is_pinned = true");
+        }
+
+        std::error_code ec;
+        std::filesystem::remove_all("test_r2_dicts", ec);
+    }
+
+    // 7. User Entry Text & Codes Editing Contract
+    {
+        std::cout << "  Subtest 7: Entry text & codes editing..." << std::endl;
+        ImeEngine e;
+        TEST_ASSERT(e.Initialize(":memory:", ""), "Init engine");
+        auto id = e.AddUserEntry(L"initial", {{InputScheme::Custom, ";init"}});
+        TEST_ASSERT(!id.empty(), "Add entry");
+
+        // Edit text and update codes
+        TEST_ASSERT(e.EditUserEntry(id, L"updated", {{InputScheme::Custom, ";newcode"}, {InputScheme::Pinyin, "xinde"}}), "Edit entry text and codes");
+        auto entryOpt = e.GetUserEntry(id);
+        TEST_ASSERT(entryOpt.has_value(), "Entry exists");
+        TEST_ASSERT(entryOpt->text == L"updated", "Text updated");
+        TEST_ASSERT(entryOpt->codes.size() == 2, "Codes updated to 2");
+
+        auto qOld = e.Query(InputScheme::Custom, ";init");
+        TEST_ASSERT(qOld.candidates.empty(), "Old code query empty");
+
+        auto qNew = e.Query(InputScheme::Custom, ";newcode");
+        TEST_ASSERT(!qNew.candidates.empty() && qNew.candidates[0].entry_id == id, "New code query returns updated entry");
+    }
+
+    std::cout << "[PASS] All Review Round 2 probes and regressions PASSED cleanly!\n";
+    return 0;
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::cout << "=== Running PersonalIME Stage 2 (ime-core) Test Suite ===" << std::endl;
@@ -593,7 +818,9 @@ int main() {
     if (TestConcurrentQueriesAndUpdates(engine) != 0) return 1;
     std::cout << "Step 12: Starting TestReviewRound1NegativeCases..." << std::endl;
     if (TestReviewRound1NegativeCases() != 0) return 1;
+    std::cout << "Step 13: Starting TestReviewRound2Probes..." << std::endl;
+    if (TestReviewRound2Probes() != 0) return 1;
 
-    std::cout << "=== ALL Stage 2 Test Suites (12/12) PASSED WITH ZERO ERRORS! ===" << std::endl;
+    std::cout << "=== ALL Stage 2 Test Suites (13/13) PASSED WITH ZERO ERRORS! ===" << std::endl;
     return 0;
 }

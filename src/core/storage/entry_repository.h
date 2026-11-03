@@ -39,6 +39,8 @@ public:
                          const std::string& customId = "");
     bool UpdateEntryText(const std::string& entryId, const std::wstring& newText);
     bool AddEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes);
+    bool SetEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes);
+    bool UpdateEntry(const std::string& entryId, const std::wstring& newText, const std::vector<std::pair<InputScheme, std::string>>& newCodes);
     bool DeleteEntry(const std::string& entryId);
     std::optional<Entry> GetEntry(const std::string& entryId);
     std::vector<Entry> GetAllUserEntries();
@@ -55,6 +57,7 @@ public:
     bool UnpinPreference(InputScheme scheme, const std::string& code, const std::string& entryId);
     std::optional<SortPreference> GetSortPreference(InputScheme scheme, const std::string& code, const std::string& entryId);
     std::vector<SortPreference> GetAllSortPreferences();
+    std::vector<SortPreference> GetPinnedPreferences(InputScheme scheme, const std::string& code);
 
     // Stats & Learning
     bool RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId);
@@ -62,10 +65,11 @@ public:
                        int count, int64_t lastUsed, double effCount, int64_t lastDecayAt, bool mergeMode = false);
     std::optional<EntryStat> GetStat(InputScheme scheme, const std::string& code, const std::string& entryId);
     std::vector<EntryStat> GetAllEntryStats();
+    std::vector<EntryStat> GetActiveStats(InputScheme scheme, const std::string& code);
     bool ResetStats(const std::string& entryId = "");
 
     // Utility: ensure a builtin entry has a row in entries if needed for stats/pinning
-    void EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text);
+    bool EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text);
 
 private:
     SqliteDb& m_db;
