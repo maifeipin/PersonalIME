@@ -108,7 +108,7 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
         }
 
         // Level 3: Score (DESC)
-        if (std::abs(a.score - b.score) > 1e-6) {
+        if (a.score != b.score) {
             return a.score > b.score;
         }
 

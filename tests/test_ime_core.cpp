@@ -782,6 +782,8 @@ static int TestReviewRound2Probes() {
     return 0;
 }
 
+#include "stage2_finalization_tests.h"
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::cout << "=== Running PersonalIME Stage 2 (ime-core) Test Suite ===" << std::endl;
@@ -821,6 +823,7 @@ int main() {
     std::cout << "Step 13: Starting TestReviewRound2Probes..." << std::endl;
     if (TestReviewRound2Probes() != 0) return 1;
 
-    std::cout << "=== ALL Stage 2 Test Suites (13/13) PASSED WITH ZERO ERRORS! ===" << std::endl;
+    if (TestStage2Finalization() != 0) return 1;
+    std::cout << "=== ALL Stage 2 Test Suites (14/14) PASSED WITH ZERO ERRORS! ===" << std::endl;
     return 0;
 }

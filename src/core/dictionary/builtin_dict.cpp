@@ -130,6 +130,23 @@ std::optional<Candidate> BuiltinDictionary::GetCandidateById(InputScheme scheme,
         auto it = m_pinyinById.find(id);
         if (it == m_pinyinById.end()) return std::nullopt;
         const auto& item = it->second;
+        if (code.find('\'') != std::string::npos) {
+            PinyinSegmenter segmenter;
+            for (const auto& segmentation : segmenter.Segment(code)) {
+                if (segmentation.spaced_syllables == item.spaced_syllables) {
+                    Candidate c;
+                    c.entry_id = item.id;
+                    c.text = item.text;
+                    c.scheme = scheme;
+                    c.matched_code = item.spaced_syllables;
+                    c.quality = MatchQuality::ExactFull;
+                    c.base_weight = item.weight;
+                    c.source = EntrySource::Builtin;
+                    return c;
+                }
+            }
+            return std::nullopt;
+        }
         bool matchCont = (item.continuous_code.rfind(code, 0) == 0);
         bool matchSpaced = (item.spaced_syllables.rfind(code, 0) == 0);
         if (!matchCont && !matchSpaced) return std::nullopt;

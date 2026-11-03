@@ -12,6 +12,8 @@ ImeEngine::~ImeEngine() {}
 bool ImeEngine::Initialize(const std::string& dbPath,
                            const std::string& dictDir,
                            std::shared_ptr<IClock> clock) {
+    m_initialized = false;
+    m_builtinDict = BuiltinDictionary();
     m_clock = clock ? clock : std::make_shared<SystemClock>();
     m_ranker = std::make_unique<Ranker>(m_clock);
 
@@ -178,7 +180,7 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
         if (!builtinCand.has_value()) {
             return false;
         }
-        m_repo->EnsureBuiltinEntryExists(entryId, builtinCand->text);
+        if (!m_repo->EnsureBuiltinEntryExists(entryId, builtinCand->text)) return false;
     }
 
     return m_repo->RecordCommit(eventId, scheme, clean, entryId);
@@ -231,7 +233,7 @@ bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const 
         if (!builtinCand.has_value()) {
             return false;
         }
-        m_repo->EnsureBuiltinEntryExists(entryId, builtinCand->text);
+        if (!m_repo->EnsureBuiltinEntryExists(entryId, builtinCand->text)) return false;
     } else {
         if (!m_repo->VerifyCandidateAffiliation(scheme, clean, entryId)) {
             return false;

@@ -9,6 +9,15 @@ namespace ime {
 
 static constexpr double HALF_LIFE_SECONDS = 30.0 * 86400.0; // 30 days
 
+// Validate the whole replacement before deleting any existing mappings.
+static bool ValidateCodes(const std::vector<std::pair<InputScheme, std::string>>& codes) {
+    if (codes.empty()) return false;
+    for (const auto& [scheme, code] : codes) {
+        if (!IsValidCode(scheme, code)) return false;
+    }
+    return true;
+}
+
 EntryRepository::EntryRepository(SqliteDb& db, std::shared_ptr<IClock> clock)
     : m_db(db), m_clock(clock) {}
 
@@ -34,7 +43,7 @@ std::string EntryRepository::AddEntry(const std::wstring& text,
                                      const std::vector<std::pair<InputScheme, std::string>>& codes,
                                      EntrySource source,
                                      const std::string& customId) {
-    if (!IsValidText(text)) return "";
+    if (!IsValidText(text) || !ValidateCodes(codes)) return "";
 
     std::vector<std::pair<InputScheme, std::string>> validCodes;
     for (const auto& [scheme, code] : codes) {
@@ -51,6 +60,7 @@ std::string EntryRepository::AddEntry(const std::wstring& text,
     std::string textUtf8 = WideToUtf8(text);
 
     SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return "";
 
     auto stmtEntry = m_db.Prepare("INSERT INTO entries (id, text, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?);");
     if (!stmtEntry) return "";
@@ -59,7 +69,7 @@ std::string EntryRepository::AddEntry(const std::wstring& text,
     stmtEntry->BindInt(3, static_cast<int>(source));
     stmtEntry->BindInt64(4, now);
     stmtEntry->BindInt64(5, now);
-    if (!stmtEntry->Execute() && m_db.Changes() == 0) {
+    if (!stmtEntry->Execute()) {
         tx.Rollback();
         return "";
     }
@@ -89,9 +99,10 @@ std::string EntryRepository::AddEntry(const std::wstring& text,
 }
 
 bool EntryRepository::AddEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes) {
-    if (entryId.empty() || codes.empty()) return false;
+    if (entryId.empty() || !ValidateCodes(codes)) return false;
     int64_t now = m_clock->Now();
     SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
 
     auto stmtCode = m_db.Prepare("INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at) VALUES (?, ?, ?, ?);");
     if (!stmtCode) return false;
@@ -117,9 +128,11 @@ bool EntryRepository::AddEntryCodes(const std::string& entryId, const std::vecto
 }
 
 bool EntryRepository::SetEntryCodes(const std::string& entryId, const std::vector<std::pair<InputScheme, std::string>>& codes) {
-    if (entryId.empty() || codes.empty()) return false;
+    if (entryId.empty() || !ValidateCodes(codes)) return false;
     int64_t now = m_clock->Now();
     SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+    if (!GetEntry(entryId)) return false;
 
     auto stmtDel = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
     if (!stmtDel) return false;
@@ -156,9 +169,11 @@ bool EntryRepository::SetEntryCodes(const std::string& entryId, const std::vecto
 }
 
 bool EntryRepository::UpdateEntry(const std::string& entryId, const std::wstring& newText, const std::vector<std::pair<InputScheme, std::string>>& newCodes) {
-    if (entryId.empty() || newText.empty()) return false;
+    if (entryId.empty() || !IsValidText(newText) ||
+        (!newCodes.empty() && !ValidateCodes(newCodes))) return false;
     int64_t now = m_clock->Now();
     SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
 
     auto stmt = m_db.Prepare("UPDATE entries SET text = ?, updated_at = ? WHERE id = ?;");
     if (!stmt) return false;
@@ -210,7 +225,7 @@ bool EntryRepository::UpdateEntry(const std::string& entryId, const std::wstring
 }
 
 bool EntryRepository::UpdateEntryText(const std::string& entryId, const std::wstring& newText) {
-    if (entryId.empty() || newText.empty()) return false;
+    if (entryId.empty() || !IsValidText(newText)) return false;
     int64_t now = m_clock->Now();
     std::string textUtf8 = WideToUtf8(newText);
 
@@ -226,6 +241,7 @@ bool EntryRepository::UpdateEntryText(const std::string& entryId, const std::wst
 bool EntryRepository::DeleteEntry(const std::string& entryId) {
     if (entryId.empty()) return false;
     SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
 
     auto stmt = m_db.Prepare("DELETE FROM entries WHERE id = ?;");
     if (!stmt) return false;
@@ -304,7 +320,7 @@ std::vector<Entry> EntryRepository::GetAllUserEntries() {
 std::vector<Entry> EntryRepository::GetAllEntries() {
     std::vector<Entry> list;
     auto stmt = m_db.Prepare("SELECT id, text, source, created_at, updated_at FROM entries;");
-    if (!stmt) return list;
+    if (!stmt) throw std::runtime_error("Cannot read backup entries");
 
     while (stmt->Step()) {
         Entry e;
@@ -322,6 +338,7 @@ std::vector<Entry> EntryRepository::GetAllEntries() {
         "UNION "
         "SELECT scheme, code FROM entry_stats WHERE entry_id = ?;"
     );
+    if (stmt->HasError() || !stmtCodes || !stmtMetaCodes) throw std::runtime_error("Cannot read backup codes");
 
     for (auto& e : list) {
         if (stmtCodes) {
@@ -332,6 +349,7 @@ std::vector<Entry> EntryRepository::GetAllEntries() {
                 std::string code = stmtCodes->ColumnText(1);
                 e.codes.emplace_back(sch, code);
             }
+            if (stmtCodes->HasError()) throw std::runtime_error("Cannot read entry codes");
         }
         if (e.codes.empty() && stmtMetaCodes) {
             stmtMetaCodes->Reset();
@@ -342,6 +360,7 @@ std::vector<Entry> EntryRepository::GetAllEntries() {
                 std::string code = stmtMetaCodes->ColumnText(1);
                 e.codes.emplace_back(sch, code);
             }
+            if (stmtMetaCodes->HasError()) throw std::runtime_error("Cannot read builtin metadata codes");
         }
     }
     return list;
@@ -502,7 +521,7 @@ std::vector<SortPreference> EntryRepository::GetAllSortPreferences() {
     std::vector<SortPreference> list;
     const char* sql = "SELECT scheme, code, entry_id, is_pinned, order_rank FROM sort_preferences WHERE is_pinned = 1;";
     auto stmt = m_db.Prepare(sql);
-    if (!stmt) return list;
+    if (!stmt) throw std::runtime_error("Cannot read backup preferences");
     while (stmt->Step()) {
         SortPreference p;
         p.scheme = static_cast<InputScheme>(stmt->ColumnInt(0));
@@ -512,6 +531,7 @@ std::vector<SortPreference> EntryRepository::GetAllSortPreferences() {
         p.order_rank = stmt->ColumnInt(4);
         list.push_back(std::move(p));
     }
+    if (stmt->HasError()) throw std::runtime_error("Backup preference read failed");
     return list;
 }
 
@@ -551,6 +571,7 @@ bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme schem
     SqliteDb::Transaction tx(m_db);
 
     // 1. Idempotency Check with exact payload verification (and legacy v1 compatibility)
+    if (!tx.IsStarted()) return false;
     if (!eventId.empty()) {
         auto stmtEventCheck = m_db.Prepare("SELECT scheme, code, entry_id FROM commit_events WHERE event_id = ?;");
         if (stmtEventCheck) {
@@ -635,6 +656,7 @@ bool EntryRepository::SetStatDirect(InputScheme scheme, const std::string& code,
     SqliteDb::Transaction tx(m_db);
 
     int finalCount = count;
+    if (!tx.IsStarted()) return false;
     int64_t finalLastUsed = lastUsed;
     double finalEff = effCount;
     int64_t finalDecayAt = lastDecayAt;
@@ -685,7 +707,7 @@ std::vector<EntryStat> EntryRepository::GetAllEntryStats() {
     std::vector<EntryStat> list;
     const char* sql = "SELECT scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at FROM entry_stats WHERE selected_count > 0;";
     auto stmt = m_db.Prepare(sql);
-    if (!stmt) return list;
+    if (!stmt) throw std::runtime_error("Cannot read backup statistics");
     while (stmt->Step()) {
         EntryStat s;
         s.scheme = static_cast<InputScheme>(stmt->ColumnInt(0));
@@ -697,6 +719,7 @@ std::vector<EntryStat> EntryRepository::GetAllEntryStats() {
         s.last_decay_at = stmt->ColumnInt64(6);
         list.push_back(std::move(s));
     }
+    if (stmt->HasError()) throw std::runtime_error("Backup statistic read failed");
     return list;
 }
 
@@ -743,19 +766,22 @@ std::optional<EntryStat> EntryRepository::GetStat(InputScheme scheme, const std:
 }
 
 bool EntryRepository::ResetStats(const std::string& entryId) {
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
     if (entryId.empty()) {
-        return m_db.Execute("DELETE FROM entry_stats; DELETE FROM commit_events;");
+        if (!m_db.Execute("DELETE FROM entry_stats; DELETE FROM commit_events;")) return false;
     } else {
         auto stmt = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
         if (!stmt) return false;
         stmt->BindText(1, entryId);
-        return stmt->Execute();
+        if (!stmt->Execute()) return false;
     }
+    return tx.Commit();
 }
 
 bool EntryRepository::EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text) {
     if (entryId.empty()) return false;
-    auto stmt = m_db.Prepare("INSERT OR IGNORE INTO entries (id, text, source, created_at, updated_at) VALUES (?, ?, 0, ?, ?);");
+    auto stmt = m_db.Prepare("INSERT INTO entries (id, text, source, created_at, updated_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(id) DO UPDATE SET text = CASE WHEN entries.text = '' THEN excluded.text ELSE entries.text END;");
     if (!stmt) return false;
     int64_t now = m_clock->Now();
     stmt->BindText(1, entryId);

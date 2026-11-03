@@ -82,6 +82,15 @@ inline bool IsValidCode(InputScheme scheme, const std::string& code) {
 
 inline bool IsValidText(const std::wstring& text) {
     if (text.empty() || text.length() > 512) return false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        auto c = static_cast<uint16_t>(text[i]);
+        if (c == 0) return false;
+        if (c >= 0xd800 && c <= 0xdbff) {
+            if (++i == text.size()) return false;
+            auto low = static_cast<uint16_t>(text[i]);
+            if (low < 0xdc00 || low > 0xdfff) return false;
+        } else if (c >= 0xdc00 && c <= 0xdfff) return false;
+    }
     return true;
 }
 
@@ -152,19 +161,19 @@ struct QueryResult {
 // UTF-8 / UTF-16 Conversion Helpers
 inline std::wstring Utf8ToWide(const std::string& str) {
     if (str.empty()) return L"";
-    int req = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.length()), nullptr, 0);
+    int req = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(), static_cast<int>(str.length()), nullptr, 0);
     if (req <= 0) return L"";
     std::wstring wstr(req, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.length()), &wstr[0], req);
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(), static_cast<int>(str.length()), &wstr[0], req);
     return wstr;
 }
 
 inline std::string WideToUtf8(const std::wstring& wstr) {
     if (wstr.empty()) return "";
-    int req = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()), nullptr, 0, nullptr, nullptr);
+    int req = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wstr.c_str(), static_cast<int>(wstr.length()), nullptr, 0, nullptr, nullptr);
     if (req <= 0) return "";
     std::string str(req, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), static_cast<int>(wstr.length()), &str[0], req, nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wstr.c_str(), static_cast<int>(wstr.length()), &str[0], req, nullptr, nullptr);
     return str;
 }
 

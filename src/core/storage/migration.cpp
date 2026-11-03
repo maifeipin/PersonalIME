@@ -6,13 +6,14 @@ namespace ime {
 int Migration::GetSchemaVersion(SqliteDb& db) {
     auto stmt = db.Prepare("PRAGMA user_version;");
     if (!stmt || !stmt->Step()) {
-        return 0;
+        return -1;
     }
     return stmt->ColumnInt(0);
 }
 
 bool Migration::Migrate(SqliteDb& db) {
     int currentVer = GetSchemaVersion(db);
+    if (currentVer < 0 || currentVer > CURRENT_SCHEMA_VERSION) return false;
     if (currentVer < 1) {
         if (!ApplyVersion1(db)) {
             return false;
@@ -47,6 +48,7 @@ bool Migration::Migrate(SqliteDb& db) {
 
 bool Migration::ApplyVersion1(SqliteDb& db) {
     SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
 
     const char* schemaV1 = R"SQL(
         CREATE TABLE IF NOT EXISTS entries (
@@ -110,28 +112,29 @@ bool Migration::ApplyVersion1(SqliteDb& db) {
         return false;
     }
 
-    if (!tx.Commit()) {
-        return false;
-    }
-
-    return db.Execute("PRAGMA user_version = 1;");
+    if (!db.Execute("PRAGMA user_version = 1;")) return false;
+    return tx.Commit();
 }
 
 bool Migration::ApplyVersion2(SqliteDb& db) {
     SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
 
     // Inspect commit_events columns to see if scheme/code/entry_id need to be added
-    bool hasScheme = false;
+    bool hasScheme = false, hasCode = false, hasEntryId = false;
     {
         auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
-        if (stmt) {
+        if (!stmt) return false;
+        {
             while (stmt->Step()) {
                 std::string colName = stmt->ColumnText(1);
                 if (colName == "scheme") {
                     hasScheme = true;
-                    break;
                 }
+                if (colName == "code") hasCode = true;
+                if (colName == "entry_id") hasEntryId = true;
             }
+            if (stmt->HasError()) return false;
         }
     }
 
@@ -140,10 +143,14 @@ bool Migration::ApplyVersion2(SqliteDb& db) {
             tx.Rollback();
             return false;
         }
+    }
+    if (!hasCode) {
         if (!db.Execute("ALTER TABLE commit_events ADD COLUMN code TEXT NOT NULL DEFAULT '';")) {
             tx.Rollback();
             return false;
         }
+    }
+    if (!hasEntryId) {
         if (!db.Execute("ALTER TABLE commit_events ADD COLUMN entry_id TEXT NOT NULL DEFAULT '';")) {
             tx.Rollback();
             return false;
@@ -155,11 +162,8 @@ bool Migration::ApplyVersion2(SqliteDb& db) {
         return false;
     }
 
-    if (!tx.Commit()) {
-        return false;
-    }
-
-    return db.Execute("PRAGMA user_version = 2;");
+    if (!db.Execute("PRAGMA user_version = 2;")) return false;
+    return tx.Commit();
 }
 
 } // namespace ime

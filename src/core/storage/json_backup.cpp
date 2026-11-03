@@ -12,6 +12,8 @@ namespace ime {
 
 bool JsonBackup::ExportToFile(EntryRepository& repo, SqliteDb& db, const std::string& filePath, std::string* errorOut) {
     try {
+        SqliteDb::Transaction snapshot(db);
+        if (!snapshot.IsStarted()) throw std::runtime_error("Failed to start backup snapshot");
         json root;
         root["version"] = "1.0";
         root["app"] = "PersonalIME";
@@ -24,6 +26,9 @@ bool JsonBackup::ExportToFile(EntryRepository& repo, SqliteDb& db, const std::st
         json entriesJson = json::array();
 
         for (const auto& e : entries) {
+            // A builtin skeleton left after resetting habits contains no user data.
+            if (e.source == EntrySource::Builtin && e.codes.empty()) continue;
+            if (!IsValidText(e.text) || e.codes.empty()) throw std::runtime_error("Invalid stored entry in backup: " + e.id);
             json item;
             item["id"] = e.id;
             item["text"] = WideToUtf8(e.text);
@@ -97,6 +102,7 @@ bool JsonBackup::ExportToFile(EntryRepository& repo, SqliteDb& db, const std::st
             });
         }
         root["stats"] = statsJson;
+        if (!snapshot.Commit()) throw std::runtime_error("Failed to complete backup snapshot");
 
         std::ofstream f(filePath, std::ios::out | std::ios::trunc);
         if (!f.is_open()) {
@@ -104,6 +110,8 @@ bool JsonBackup::ExportToFile(EntryRepository& repo, SqliteDb& db, const std::st
             return false;
         }
         f << root.dump(2);
+        f.flush();
+        if (!f) throw std::runtime_error("Failed while writing backup file");
         return true;
     } catch (const std::exception& ex) {
         if (errorOut) *errorOut = std::string("Export error: ") + ex.what();
@@ -160,6 +168,7 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
 
     std::vector<ParsedEntry> validatedEntries;
     std::unordered_set<std::string> knownEntryIds;
+    std::lock_guard<std::recursive_mutex> importLock(db.GetMutex());
 
     try {
         // 1. Validate entries
@@ -177,6 +186,9 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
             }
 
             std::string id = item.value("id", "");
+            if (id.rfind("b_", 0) == 0 && builtinDict && builtinDict->IsLoaded() && !builtinDict->HasItem(id)) {
+                throw std::runtime_error("Unknown builtin entry id: " + id);
+            }
             if (!id.empty()) {
                 if (knownEntryIds.count(id) > 0) {
                     throw std::runtime_error("Duplicate entry id in backup: " + id);
@@ -212,6 +224,7 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
             }
 
             std::vector<std::tuple<InputScheme, std::string, int>> pinned;
+            if (item.contains("pinned") && !item["pinned"].is_array()) throw std::runtime_error("Entry pinned must be an array");
             if (item.contains("pinned") && item["pinned"].is_array()) {
                 for (const auto& pItem : item["pinned"]) {
                     if (!pItem.is_object() || !pItem.contains("scheme") || !pItem.contains("code")) {
@@ -235,6 +248,7 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
             }
 
             std::vector<std::tuple<InputScheme, std::string, int, int64_t, double, int64_t>> stats;
+            if (item.contains("stats") && !item["stats"].is_array()) throw std::runtime_error("Entry stats must be an array");
             if (item.contains("stats") && item["stats"].is_array()) {
                 for (const auto& sItem : item["stats"]) {
                     if (!sItem.is_object() || !sItem.contains("scheme") || !sItem.contains("code") || !sItem.contains("count")) {
@@ -367,6 +381,10 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
     // Phase 2: DATABASE PERSISTENCE IN TRANSACTION
     // ==========================================
     SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) {
+        if (errorOut) *errorOut = "Failed to start import transaction";
+        return false;
+    }
 
     try {
         if (replaceMode) {
@@ -434,7 +452,12 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
                         bool isPinned = pItem.value("is_pinned", true);
                         int rank = pItem.value("rank", 1);
                         if (entryId.rfind("b_", 0) == 0) {
-                            if (!repo.EnsureBuiltinEntryExists(entryId, L"")) {
+                            auto candidate = builtinDict ? builtinDict->GetCandidateById(sch, code, entryId) : std::nullopt;
+                            auto existing = repo.GetEntry(entryId);
+                            if (!candidate && (!existing || existing->text.empty())) {
+                                throw std::runtime_error("Builtin preference needs dictionary text: " + entryId);
+                            }
+                            if (!repo.EnsureBuiltinEntryExists(entryId, candidate ? candidate->text : existing->text)) {
                                 throw std::runtime_error("Failed to ensure builtin entry for preference: " + entryId);
                             }
                         }
@@ -459,7 +482,12 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
                         double effCount = sItem.value("effective_count", static_cast<double>(count));
                         int64_t lastDecayAt = sItem.value("last_decay_at", lastUsed);
                         if (entryId.rfind("b_", 0) == 0) {
-                            if (!repo.EnsureBuiltinEntryExists(entryId, L"")) {
+                            auto candidate = builtinDict ? builtinDict->GetCandidateById(sch, code, entryId) : std::nullopt;
+                            auto existing = repo.GetEntry(entryId);
+                            if (!candidate && (!existing || existing->text.empty())) {
+                                throw std::runtime_error("Builtin stat needs dictionary text: " + entryId);
+                            }
+                            if (!repo.EnsureBuiltinEntryExists(entryId, candidate ? candidate->text : existing->text)) {
                                 throw std::runtime_error("Failed to ensure builtin entry for stat: " + entryId);
                             }
                         }
