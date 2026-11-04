@@ -15,7 +15,10 @@ public:
 
     bool SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs = 50);
     void ResetContext(uint64_t sessionId, uint64_t contextId);
-    void Rollback(uint64_t sessionId, uint64_t contextId);
+    bool Rollback(uint64_t sessionId, uint64_t contextId, IpcKeyResponse* outResp = nullptr);
+    bool NotifyCommitSuccess(uint64_t sessionId, uint64_t contextId, uint64_t eventId);
+    bool NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint64_t eventId, IpcKeyResponse* outResp = nullptr);
+    bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags);
     void Disconnect();
 
     struct AsyncIoOperation {

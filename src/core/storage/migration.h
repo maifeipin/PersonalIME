@@ -6,7 +6,7 @@ namespace ime {
 
 class Migration {
 public:
-    static constexpr int CURRENT_SCHEMA_VERSION = 2;
+    static constexpr int CURRENT_SCHEMA_VERSION = 3;
 
     static bool Migrate(SqliteDb& db);
     static int GetSchemaVersion(SqliteDb& db);
@@ -14,6 +14,7 @@ public:
 private:
     static bool ApplyVersion1(SqliteDb& db);
     static bool ApplyVersion2(SqliteDb& db);
+    static bool ApplyVersion3(SqliteDb& db);
 };
 
 } // namespace ime

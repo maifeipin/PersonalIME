@@ -3,6 +3,8 @@
 #include <msctf.h>
 #include <string>
 #include <vector>
+#include <map>
+#include <chrono>
 #include "candidate_window.h"
 #include "ipc_client.h"
 
@@ -136,6 +138,34 @@ public:
 
     static void ResetBranchCounters();
 
+    // Receipt and drain helpers
+    void DrainUnconfirmedCommits(bool forceNow = false);
+
+    // Retained unconfirmed commits for bounded recovery
+    enum class UnconfirmedAction {
+        Success,
+        Cancel
+    };
+
+    struct UnconfirmedCommit {
+        uint64_t context_id = 0;
+        uint64_t event_id = 0;
+        UnconfirmedAction action = UnconfirmedAction::Success;
+        int retry_count = 0;
+        std::chrono::steady_clock::time_point next_retry{};
+        uint64_t session_id = 0;
+        bool persisted = false;
+    };
+    std::vector<UnconfirmedCommit> m_unconfirmedCommits;
+    bool EnqueueUnconfirmedCommit(uint64_t contextId, uint64_t eventId, UnconfirmedAction action);
+    bool SpillUnconfirmedCommitsToFile(const std::vector<UnconfirmedCommit>& commits);
+    void LoadSpilloverCommitsFromFile();
+    bool RemoveConfirmedSpilloverRecord(uint64_t eventId);
+    bool HasPendingSpilloverRecords();
+    UINT_PTR m_drainTimerId = 0;
+    void StartDrainTimer();
+    void StopDrainTimer();
+
 private:
     LONG m_cRef = 1;
     uint64_t m_sessionId = 0;
@@ -158,6 +188,9 @@ private:
 
     // Per-instance IPC Client (dedicated pipe connection per TIP thread)
     IpcClient m_ipcClient;
+
+    // Context-isolated candidate snapshot versions
+    std::map<uint64_t, uint32_t> m_contextCandidateVersions;
 
     bool InitKeyEventSink();
     void UninitKeyEventSink();

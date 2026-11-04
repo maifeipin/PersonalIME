@@ -253,20 +253,65 @@ void IpcClient::ResetContext(uint64_t sessionId, uint64_t contextId) {
         req.msg_type = static_cast<uint32_t>(IpcMsgType::Reset);
         req.session_id = sessionId;
         req.context_id = contextId;
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
         IpcKeyResponse resp{};
         SendRequest(req, resp, 25);
     }
 }
 
-void IpcClient::Rollback(uint64_t sessionId, uint64_t contextId) {
+bool IpcClient::Rollback(uint64_t sessionId, uint64_t contextId, IpcKeyResponse* outResp) {
     if (m_hPipe != INVALID_HANDLE_VALUE) {
         IpcKeyRequest req{};
         req.msg_type = static_cast<uint32_t>(IpcMsgType::Rollback);
         req.session_id = sessionId;
         req.context_id = contextId;
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
         IpcKeyResponse resp{};
-        SendRequest(req, resp, 25);
+        bool ok = SendRequest(req, resp, 25);
+        if (outResp) *outResp = resp;
+        return ok && (resp.handled == 1);
     }
+    return false;
+}
+
+bool IpcClient::NotifyCommitSuccess(uint64_t sessionId, uint64_t contextId, uint64_t eventId) {
+    if (eventId == 0) return false;
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::CommitSuccess);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.event_id = eventId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    IpcKeyResponse resp{};
+    return SendRequest(req, resp, 50) && (resp.handled == 1);
+}
+
+bool IpcClient::NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint64_t eventId, IpcKeyResponse* outResp) {
+    if (eventId == 0) return false;
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::CommitCancel);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.event_id = eventId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    IpcKeyResponse resp{};
+    bool ok = SendRequest(req, resp, 50);
+    if (outResp) *outResp = resp;
+    return ok && (resp.handled == 1);
+}
+
+bool IpcClient::SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags) {
+    if (m_hPipe != INVALID_HANDLE_VALUE) {
+        IpcKeyRequest req{};
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+        req.session_id = sessionId;
+        req.context_id = contextId;
+        req.mode_arg = modeFlags;
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+        IpcKeyResponse resp{};
+        return SendRequest(req, resp, 25);
+    }
+    return false;
 }
 
 bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs) {
@@ -292,6 +337,9 @@ bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWOR
         return false;
     }
     op->sendBuf = req;
+    if (op->sendBuf.protocol_version == 0) {
+        op->sendBuf.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    }
     op->inProgress.store(true);
 
     // 1. Write Phase
@@ -381,8 +429,9 @@ bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWOR
         return false;
     }
 
-    // 3. Strict response identity & type matching
-    if (op->recvBuf.msg_type != req.msg_type ||
+    // 3. Strict response identity, protocol version & type matching
+    if (op->recvBuf.protocol_version != IPC_PROTOCOL_VERSION_STAGE3 ||
+        op->recvBuf.msg_type != req.msg_type ||
         op->recvBuf.session_id != req.session_id ||
         op->recvBuf.context_id != req.context_id) {
         Disconnect();
@@ -393,8 +442,8 @@ bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWOR
     // Defensive buffer sanitation
     op->recvBuf.composition[sizeof(op->recvBuf.composition)/sizeof(wchar_t) - 1] = L'\0';
     op->recvBuf.commit_text[sizeof(op->recvBuf.commit_text)/sizeof(wchar_t) - 1] = L'\0';
-    if (op->recvBuf.candidate_count > 5) {
-        op->recvBuf.candidate_count = 5;
+    if (op->recvBuf.candidate_count > 9) {
+        op->recvBuf.candidate_count = 9;
     }
     for (uint32_t i = 0; i < op->recvBuf.candidate_count; ++i) {
         op->recvBuf.candidates[i][sizeof(op->recvBuf.candidates[i])/sizeof(wchar_t) - 1] = L'\0';

@@ -107,7 +107,7 @@ public:
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
-                2048, 2048, 0, nullptr
+                16384, 16384, 0, nullptr
             );
             if (hPipe == INVALID_HANDLE_VALUE) {
                 Sleep(10);
@@ -176,6 +176,7 @@ public:
                 resp.msg_type = req.msg_type;
                 resp.session_id = req.session_id;
                 resp.context_id = req.context_id;
+                resp.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
                 resp.handled = 1;
 
                 if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {

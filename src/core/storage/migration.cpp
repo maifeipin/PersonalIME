@@ -1,5 +1,6 @@
 #include "migration.h"
 #include <iostream>
+#include <set>
 
 namespace ime {
 
@@ -40,6 +41,60 @@ bool Migration::Migrate(SqliteDb& db) {
 
     if (needsV2) {
         if (!ApplyVersion2(db)) {
+            return false;
+        }
+    }
+
+    bool needsV3 = (currentVer < 3);
+    if (!needsV3) {
+        // Verify pending_commits table and all required columns exist
+        auto stmtPending = db.Prepare("PRAGMA table_info(pending_commits);");
+        if (!stmtPending) {
+            return false;
+        }
+        std::set<std::string> pendingCols;
+        while (stmtPending->Step()) {
+            pendingCols.insert(stmtPending->ColumnText(1));
+        }
+        if (stmtPending->HasError() || pendingCols.empty()) {
+            return false;
+        }
+        static const char* reqPendingCols[] = {
+            "event_id", "session_id", "context_id", "scheme",
+            "query_code", "entry_id", "text", "created_at"
+        };
+        for (const char* col : reqPendingCols) {
+            if (pendingCols.find(col) == pendingCols.end()) {
+                // Essential structure broken: cannot safely proceed with unverified pending log
+                return false;
+            }
+        }
+
+        // Verify commit_events table structure
+        auto stmtCe = db.Prepare("PRAGMA table_info(commit_events);");
+        if (!stmtCe) {
+            return false;
+        }
+        std::set<std::string> ceCols;
+        while (stmtCe->Step()) {
+            ceCols.insert(stmtCe->ColumnText(1));
+        }
+        if (stmtCe->HasError()) {
+            return false;
+        }
+        static const char* reqCeCols[] = {
+            "session_id", "context_id", "status"
+        };
+        for (const char* col : reqCeCols) {
+            if (ceCols.find(col) == ceCols.end()) {
+                needsV3 = true;
+                break;
+            }
+        }
+    }
+
+    if (needsV3) {
+        if (!ApplyVersion3(db)) {
             return false;
         }
     }
@@ -92,10 +147,24 @@ bool Migration::ApplyVersion1(SqliteDb& db) {
 
         CREATE TABLE IF NOT EXISTS commit_events (
             event_id TEXT PRIMARY KEY,
+            session_id INTEGER NOT NULL DEFAULT 0,
+            context_id INTEGER NOT NULL DEFAULT 0,
             scheme INTEGER NOT NULL DEFAULT 0,
             code TEXT NOT NULL DEFAULT '',
             entry_id TEXT NOT NULL DEFAULT '',
-            committed_at INTEGER NOT NULL
+            committed_at INTEGER NOT NULL,
+            status INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_commits (
+            event_id TEXT PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            context_id INTEGER NOT NULL,
+            scheme INTEGER NOT NULL,
+            query_code TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS meta_settings (
@@ -157,12 +226,102 @@ bool Migration::ApplyVersion2(SqliteDb& db) {
         }
     }
 
+    const char* schemaPending = R"SQL(
+        CREATE TABLE IF NOT EXISTS pending_commits (
+            event_id TEXT PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            context_id INTEGER NOT NULL,
+            scheme INTEGER NOT NULL,
+            query_code TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+    )SQL";
+    if (!db.Execute(schemaPending)) {
+        tx.Rollback();
+        return false;
+    }
+
     if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '2');")) {
         tx.Rollback();
         return false;
     }
 
     if (!db.Execute("PRAGMA user_version = 2;")) return false;
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion3(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    // 1. Ensure pending_commits exists
+    const char* schemaPending = R"SQL(
+        CREATE TABLE IF NOT EXISTS pending_commits (
+            event_id TEXT PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            context_id INTEGER NOT NULL,
+            scheme INTEGER NOT NULL,
+            query_code TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+    )SQL";
+    if (!db.Execute(schemaPending)) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 2. Add session_id, context_id, status to commit_events if not present
+    bool hasSessionId = false, hasContextId = false, hasStatus = false;
+    {
+        auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
+        if (!stmt) {
+            tx.Rollback();
+            return false;
+        }
+        while (stmt->Step()) {
+            std::string colName = stmt->ColumnText(1);
+            if (colName == "session_id") hasSessionId = true;
+            if (colName == "context_id") hasContextId = true;
+            if (colName == "status") hasStatus = true;
+        }
+        if (stmt->HasError()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!hasSessionId) {
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (!hasContextId) {
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN context_id INTEGER NOT NULL DEFAULT 0;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (!hasStatus) {
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN status INTEGER NOT NULL DEFAULT 1;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '3');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 3;")) {
+        tx.Rollback();
+        return false;
+    }
     return tx.Commit();
 }
 

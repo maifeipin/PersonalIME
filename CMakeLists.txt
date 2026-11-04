@@ -86,14 +86,32 @@ target_link_libraries(PersonalIME PRIVATE
     gdi32
 )
 
-# 2. Local IME Background Service Prototype
+# 2. Local IME Background Service
 add_executable(ime-service
     src/ime_service/main.cpp
 )
 
 target_link_libraries(ime-service PRIVATE
+    ime-core
     advapi32
     user32
+)
+
+# Stage 3 End-to-End Integration Test Runner
+add_executable(test_stage3_integration
+    tests/test_stage3_integration.cpp
+    src/tsf_client/ipc_client.cpp
+    src/tsf_client/text_input_processor.cpp
+    src/tsf_client/candidate_window.cpp
+)
+
+target_link_libraries(test_stage3_integration PRIVATE
+    ime-core
+    advapi32
+    user32
+    ole32
+    oleaut32
+    gdi32
 )
 
 # 3. IPC Automated Integration Test Runner
@@ -142,3 +160,9 @@ target_link_libraries(test_composition_lifecycle PRIVATE
     user32
     gdi32
 )
+
+add_executable(test_receipt_journal tests/test_receipt_journal.cpp)
+target_link_libraries(test_receipt_journal PRIVATE user32)
+
+add_executable(test_receipt_handover tests/test_receipt_handover.cpp src/tsf_client/text_input_processor.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
+target_link_libraries(test_receipt_handover PRIVATE ole32 oleaut32 advapi32 user32 gdi32)

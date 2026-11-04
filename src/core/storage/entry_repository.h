@@ -51,6 +51,16 @@ public:
 
     // Verification
     bool VerifyCandidateAffiliation(InputScheme scheme, const std::string& code, const std::string& entryId);
+    bool HasCommitEvent(const std::string& eventId);
+
+    struct CommitEventRecord {
+        std::string event_id;
+        uint64_t session_id = 0;
+        uint64_t context_id = 0;
+        int status = 0; // 0 = not found, 1 = Recorded, 2 = Cancelled
+        int64_t committed_at = 0;
+    };
+    CommitEventRecord GetCommitEventRecord(const std::string& eventId);
 
     // Sort Preferences (Pin / Rank)
     bool SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank = 1);
@@ -60,7 +70,12 @@ public:
     std::vector<SortPreference> GetPinnedPreferences(InputScheme scheme, const std::string& code);
 
     // Stats & Learning
-    bool RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId);
+    bool RecordCommit(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                      InputScheme scheme, const std::string& code, const std::string& entryId);
+    bool RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId) {
+        return RecordCommit(eventId, 0, 0, scheme, code, entryId);
+    }
+    bool RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId);
     bool SetStatDirect(InputScheme scheme, const std::string& code, const std::string& entryId,
                        int count, int64_t lastUsed, double effCount, int64_t lastDecayAt, bool mergeMode = false);
     std::optional<EntryStat> GetStat(InputScheme scheme, const std::string& code, const std::string& entryId);
@@ -70,6 +85,26 @@ public:
 
     // Utility: ensure a builtin entry has a row in entries if needed for stats/pinning
     bool EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text);
+
+    // Persistent Pending Commits across service crashes / restarts
+    struct PendingCommitRecord {
+        std::string event_id;
+        uint64_t session_id = 0;
+        uint64_t context_id = 0;
+        InputScheme scheme = InputScheme::Unknown;
+        std::string query_code;
+        std::string entry_id;
+        std::wstring text;
+        int64_t created_at = 0;
+    };
+    bool SavePendingCommit(const PendingCommitRecord& rec);
+    bool RemovePendingCommit(const std::string& eventId);
+    bool LoadAllPendingCommits(std::vector<PendingCommitRecord>& outRecords);
+    std::vector<PendingCommitRecord> LoadAllPendingCommits() {
+        std::vector<PendingCommitRecord> recs;
+        LoadAllPendingCommits(recs);
+        return recs;
+    }
 
 private:
     SqliteDb& m_db;

@@ -1,3 +1,7 @@
+param(
+    [switch]$RunTests
+)
+
 $ErrorActionPreference = "Stop"
 
 $cmakePath = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
@@ -17,3 +21,11 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "==> Build finished successfully!" -ForegroundColor Green
 Write-Host "Artifacts located in: $(Join-Path $projectRoot 'build\Release')"
+
+if ($RunTests) {
+    Write-Host "`n==> Running Core & Stage 3 Integration Tests..." -ForegroundColor Cyan
+    & (Join-Path $projectRoot "build\Release\test_ime_core.exe")
+    if ($LASTEXITCODE -ne 0) { throw "test_ime_core failed with exit code $LASTEXITCODE" }
+    & (Join-Path $projectRoot "build\Release\test_stage3_integration.exe")
+    if ($LASTEXITCODE -ne 0) { throw "test_stage3_integration failed with exit code $LASTEXITCODE" }
+}

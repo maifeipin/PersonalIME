@@ -28,9 +28,32 @@ public:
     QueryResult Query(InputScheme scheme, const std::string& code);
 
     bool CommitCandidate(const std::string& eventId,
+                         uint64_t sessionId,
+                         uint64_t contextId,
                          InputScheme scheme,
                          const std::string& code,
                          const std::string& entryId);
+    bool CommitCandidate(const std::string& eventId,
+                         InputScheme scheme,
+                         const std::string& code,
+                         const std::string& entryId) {
+        return CommitCandidate(eventId, 0, 0, scheme, code, entryId);
+    }
+    bool RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId);
+    EntryRepository::CommitEventRecord GetCommitEventInfo(const std::string& eventId);
+    bool IsCommitRecorded(const std::string& eventId);
+
+    // Persistent Pending Commits across service crashes / restarts
+    bool SavePendingCommit(const std::string& eventId,
+                           uint64_t sessionId,
+                           uint64_t contextId,
+                           InputScheme scheme,
+                           const std::string& queryCode,
+                           const std::string& entryId,
+                           const std::wstring& text);
+    bool RemovePendingCommit(const std::string& eventId);
+    bool LoadAllPendingCommits(std::vector<EntryRepository::PendingCommitRecord>& outRecords);
+    std::vector<EntryRepository::PendingCommitRecord> LoadAllPendingCommits();
 
     // User Dictionary Management
     std::string AddUserEntry(const std::wstring& text,

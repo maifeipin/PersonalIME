@@ -166,6 +166,8 @@ QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
 }
 
 bool ImeEngine::CommitCandidate(const std::string& eventId,
+                                uint64_t sessionId,
+                                uint64_t contextId,
                                 InputScheme scheme,
                                 const std::string& code,
                                 const std::string& entryId) {
@@ -183,7 +185,58 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
         if (!m_repo->EnsureBuiltinEntryExists(entryId, builtinCand->text)) return false;
     }
 
-    return m_repo->RecordCommit(eventId, scheme, clean, entryId);
+    return m_repo->RecordCommit(eventId, sessionId, contextId, scheme, clean, entryId);
+}
+
+bool ImeEngine::RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId) {
+    if (!m_initialized || !m_repo) return false;
+    return m_repo->RecordCancel(eventId, sessionId, contextId);
+}
+
+EntryRepository::CommitEventRecord ImeEngine::GetCommitEventInfo(const std::string& eventId) {
+    if (!m_initialized || !m_repo) return {};
+    return m_repo->GetCommitEventRecord(eventId);
+}
+
+bool ImeEngine::IsCommitRecorded(const std::string& eventId) {
+    if (!m_initialized || !m_repo) return false;
+    return m_repo->HasCommitEvent(eventId);
+}
+
+bool ImeEngine::SavePendingCommit(const std::string& eventId,
+                                  uint64_t sessionId,
+                                  uint64_t contextId,
+                                  InputScheme scheme,
+                                  const std::string& queryCode,
+                                  const std::string& entryId,
+                                  const std::wstring& text) {
+    if (!m_initialized || !m_repo || eventId.empty()) return false;
+    EntryRepository::PendingCommitRecord rec;
+    rec.event_id = eventId;
+    rec.session_id = sessionId;
+    rec.context_id = contextId;
+    rec.scheme = scheme;
+    rec.query_code = queryCode;
+    rec.entry_id = entryId;
+    rec.text = text;
+    rec.created_at = m_clock ? m_clock->Now() : 0;
+    return m_repo->SavePendingCommit(rec);
+}
+
+bool ImeEngine::RemovePendingCommit(const std::string& eventId) {
+    if (!m_initialized || !m_repo) return false;
+    return m_repo->RemovePendingCommit(eventId);
+}
+
+bool ImeEngine::LoadAllPendingCommits(std::vector<EntryRepository::PendingCommitRecord>& outRecords) {
+    if (!m_initialized || !m_repo) return false;
+    return m_repo->LoadAllPendingCommits(outRecords);
+}
+
+std::vector<EntryRepository::PendingCommitRecord> ImeEngine::LoadAllPendingCommits() {
+    std::vector<EntryRepository::PendingCommitRecord> recs;
+    LoadAllPendingCommits(recs);
+    return recs;
 }
 
 std::string ImeEngine::AddUserEntry(const std::wstring& text,

@@ -75,6 +75,7 @@ function Run-Scenario([string]$scenario) {
             [BitConverter]::GetBytes($reqSessionId).CopyTo($resp, 4)
             [BitConverter]::GetBytes($reqContextId).CopyTo($resp, 12)
             # handled = 0 (offset 20)
+            [BitConverter]::GetBytes([uint32]0x0300).CopyTo($resp, 24) # protocol_version
 
             $pipe.Write($resp, 0, $resp.Length)
             $pipe.Flush()
@@ -127,6 +128,7 @@ function Run-Scenario([string]$scenario) {
             [BitConverter]::GetBytes([uint64]999999).CopyTo($fakeResp, 4) # mismatched session
             [BitConverter]::GetBytes($reqContextId).CopyTo($fakeResp, 12)
             [BitConverter]::GetBytes([uint32]1).CopyTo($fakeResp, 20)      # handled = 1
+            [BitConverter]::GetBytes([uint32]0x0300).CopyTo($fakeResp, 24) # protocol_version
 
             $pipe.Write($fakeResp, 0, $fakeResp.Length)
             $pipe.Flush()

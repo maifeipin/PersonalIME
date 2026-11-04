@@ -36,9 +36,22 @@ $RECYCLE.BIN/
 
 # Raw dictionary intermediate downloads
 data/dictionaries/*.raw.yaml
+
+# Local databases and SQLite temporary files
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
 docs/*
 !docs/design.md
 !docs/dictionary-info.md
 !docs/stage2-design.md
+
+# Test output directories
+handover-*/
+receipt-*/
+
+
 
 

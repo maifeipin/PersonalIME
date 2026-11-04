@@ -467,6 +467,136 @@ bool EntryRepository::VerifyCandidateAffiliation(InputScheme scheme, const std::
     return stmt->Step();
 }
 
+bool EntryRepository::HasCommitEvent(const std::string& eventId) {
+    if (eventId.empty()) return false;
+    auto stmt = m_db.Prepare("SELECT 1 FROM commit_events WHERE event_id = ?;");
+    if (!stmt) return false;
+    stmt->BindText(1, eventId);
+    return stmt->Step();
+}
+
+EntryRepository::CommitEventRecord EntryRepository::GetCommitEventRecord(const std::string& eventId) {
+    CommitEventRecord rec;
+    if (eventId.empty()) return rec;
+    auto stmt = m_db.Prepare("SELECT session_id, context_id, status, committed_at FROM commit_events WHERE event_id = ?;");
+    if (!stmt) return rec;
+    stmt->BindText(1, eventId);
+    if (stmt->Step()) {
+        rec.event_id = eventId;
+        rec.session_id = static_cast<uint64_t>(stmt->ColumnInt64(0));
+        rec.context_id = static_cast<uint64_t>(stmt->ColumnInt64(1));
+        rec.status = stmt->ColumnInt(2);
+        rec.committed_at = stmt->ColumnInt64(3);
+    }
+    return rec;
+}
+
+bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
+    if (rec.event_id.empty()) return false;
+    // Use INSERT (not REPLACE) so existing event IDs are never overwritten
+    auto stmt = m_db.Prepare("INSERT INTO pending_commits (event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?);");
+    if (!stmt) return false;
+    stmt->BindText(1, rec.event_id);
+    stmt->BindInt64(2, static_cast<int64_t>(rec.session_id));
+    stmt->BindInt64(3, static_cast<int64_t>(rec.context_id));
+    stmt->BindInt(4, static_cast<int>(rec.scheme));
+    stmt->BindText(5, rec.query_code);
+    stmt->BindText(6, rec.entry_id);
+    stmt->BindText(7, WideToUtf8(rec.text));
+    stmt->BindInt64(8, rec.created_at);
+    return stmt->Execute();
+}
+
+bool EntryRepository::RemovePendingCommit(const std::string& eventId) {
+    if (eventId.empty()) return false;
+    auto stmt = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+    if (!stmt) return false;
+    stmt->BindText(1, eventId);
+    return stmt->Execute();
+}
+
+bool EntryRepository::RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId) {
+    if (eventId.empty()) return false;
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    // 1. Check if already recorded or cancelled in commit_events
+    auto stmtCheck = m_db.Prepare("SELECT session_id, context_id, status FROM commit_events WHERE event_id = ?;");
+    if (stmtCheck) {
+        stmtCheck->BindText(1, eventId);
+        if (stmtCheck->Step()) {
+            uint64_t prevSid = static_cast<uint64_t>(stmtCheck->ColumnInt64(0));
+            uint64_t prevCid = static_cast<uint64_t>(stmtCheck->ColumnInt64(1));
+            int prevStatus = stmtCheck->ColumnInt(2);
+            if (prevSid != sessionId || prevCid != contextId) {
+                tx.Rollback();
+                return false;
+            }
+            if (prevStatus == 1) {
+                // Recorded commit cannot be cancelled!
+                tx.Rollback();
+                return false;
+            } else if (prevStatus == 2) {
+                // Already cancelled by same owner: idempotent success
+                return true;
+            }
+        }
+    }
+
+    // 2. Delete from pending_commits and check execution
+    auto stmtDel = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+    if (!stmtDel) {
+        tx.Rollback();
+        return false;
+    }
+    stmtDel->BindText(1, eventId);
+    if (!stmtDel->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 3. Insert durable Cancelled record into commit_events
+    int64_t now = m_clock ? m_clock->Now() : 0;
+    auto stmtInsert = m_db.Prepare("INSERT OR REPLACE INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status) VALUES (?, ?, ?, 0, '', '', ?, 2);");
+    if (!stmtInsert) {
+        tx.Rollback();
+        return false;
+    }
+    stmtInsert->BindText(1, eventId);
+    stmtInsert->BindInt64(2, static_cast<int64_t>(sessionId));
+    stmtInsert->BindInt64(3, static_cast<int64_t>(contextId));
+    stmtInsert->BindInt64(4, now);
+    if (!stmtInsert->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    return tx.Commit();
+}
+
+bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& outRecords) {
+    outRecords.clear();
+    auto stmt = m_db.Prepare("SELECT event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at FROM pending_commits;");
+    if (!stmt) return false;
+    while (stmt->Step()) {
+        PendingCommitRecord r;
+        r.event_id = stmt->ColumnText(0);
+        r.session_id = static_cast<uint64_t>(stmt->ColumnInt64(1));
+        r.context_id = static_cast<uint64_t>(stmt->ColumnInt64(2));
+        r.scheme = static_cast<InputScheme>(stmt->ColumnInt(3));
+        r.query_code = stmt->ColumnText(4);
+        r.entry_id = stmt->ColumnText(5);
+        r.text = Utf8ToWide(stmt->ColumnText(6));
+        r.created_at = stmt->ColumnInt64(7);
+        outRecords.push_back(std::move(r));
+    }
+    if (stmt->HasError()) {
+        outRecords.clear();
+        return false;
+    }
+    return true;
+}
+
 bool EntryRepository::SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank) {
     if (code.empty() || entryId.empty()) return false;
     std::string lowerCode = code;
@@ -556,7 +686,8 @@ std::vector<SortPreference> EntryRepository::GetPinnedPreferences(InputScheme sc
     return list;
 }
 
-bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme scheme, const std::string& code, const std::string& entryId) {
+bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                   InputScheme scheme, const std::string& code, const std::string& entryId) {
     if (code.empty() || entryId.empty()) return false;
     int64_t now = m_clock->Now();
 
@@ -569,21 +700,40 @@ bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme schem
     }
 
     SqliteDb::Transaction tx(m_db);
-
-    // 1. Idempotency Check with exact payload verification (and legacy v1 compatibility)
     if (!tx.IsStarted()) return false;
+
+    // 1. Idempotency Check with exact payload and owner verification
     if (!eventId.empty()) {
-        auto stmtEventCheck = m_db.Prepare("SELECT scheme, code, entry_id FROM commit_events WHERE event_id = ?;");
+        auto stmtEventCheck = m_db.Prepare("SELECT session_id, context_id, scheme, code, entry_id, status FROM commit_events WHERE event_id = ?;");
         if (stmtEventCheck) {
             stmtEventCheck->BindText(1, eventId);
             if (stmtEventCheck->Step()) {
-                int prevScheme = stmtEventCheck->ColumnInt(0);
-                std::string prevCode = stmtEventCheck->ColumnText(1);
-                std::string prevEntryId = stmtEventCheck->ColumnText(2);
+                uint64_t prevSid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(0));
+                uint64_t prevCid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(1));
+                int prevScheme = stmtEventCheck->ColumnInt(2);
+                std::string prevCode = stmtEventCheck->ColumnText(3);
+                std::string prevEntryId = stmtEventCheck->ColumnText(4);
+                int prevStatus = stmtEventCheck->ColumnInt(5);
+
+                if (prevStatus == 2) {
+                    // Cancelled commit can NEVER become Recorded!
+                    tx.Rollback();
+                    return false;
+                }
+
+                // If session_id and context_id were stored (non-zero), verify owner
+                if (prevSid != 0 || prevCid != 0) {
+                    if (sessionId != 0 && contextId != 0 && (prevSid != sessionId || prevCid != contextId)) {
+                        tx.Rollback();
+                        return false; // Wrong owner replaying confirmation
+                    }
+                }
+
                 if (prevEntryId.empty() ||
                     (prevScheme == static_cast<int>(scheme) && prevCode == lowerCode && prevEntryId == entryId)) {
                     return true; // idempotent retry of identical commit (or migrated v1 event)
                 }
+                tx.Rollback();
                 return false; // event_id reused with conflicting payload
             }
         }
@@ -628,16 +778,28 @@ bool EntryRepository::RecordCommit(const std::string& eventId, InputScheme schem
     }
 
     if (!eventId.empty()) {
-        auto stmtEventInsert = m_db.Prepare("INSERT INTO commit_events (event_id, scheme, code, entry_id, committed_at) VALUES (?, ?, ?, ?, ?);");
+        // Delete pending commit and check execution!
+        auto stmtDelPending = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+        if (stmtDelPending) {
+            stmtDelPending->BindText(1, eventId);
+            if (!stmtDelPending->Execute()) {
+                tx.Rollback();
+                return false;
+            }
+        }
+
+        auto stmtEventInsert = m_db.Prepare("INSERT OR REPLACE INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1);");
         if (!stmtEventInsert) {
             tx.Rollback();
             return false;
         }
         stmtEventInsert->BindText(1, eventId);
-        stmtEventInsert->BindInt(2, static_cast<int>(scheme));
-        stmtEventInsert->BindText(3, lowerCode);
-        stmtEventInsert->BindText(4, entryId);
-        stmtEventInsert->BindInt64(5, now);
+        stmtEventInsert->BindInt64(2, static_cast<int64_t>(sessionId));
+        stmtEventInsert->BindInt64(3, static_cast<int64_t>(contextId));
+        stmtEventInsert->BindInt(4, static_cast<int>(scheme));
+        stmtEventInsert->BindText(5, lowerCode);
+        stmtEventInsert->BindText(6, entryId);
+        stmtEventInsert->BindInt64(7, now);
         if (!stmtEventInsert->Execute()) {
             tx.Rollback();
             return false;

@@ -3,17 +3,29 @@
 #include "globals.h"
 #include "../common/ime_guids.h"
 #include <wrl/client.h>
+#include <io.h>
+#include <sstream>
+#include "receipt_journal.h"
+#include "receipt_retry.h"
 
 static LONG64 s_sessionCounter = 0;
 
 CTextInputProcessor::CTextInputProcessor() {
     m_cRef = 1;
-    m_sessionId = static_cast<uint64_t>(InterlockedIncrement64(&s_sessionCounter));
+    uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
+    uint64_t counter = static_cast<uint64_t>(InterlockedIncrement64(&s_sessionCounter));
+    m_sessionId = (pid << 32) | (counter & 0xFFFFFFFF);
     DllAddRef();
 }
 
 CTextInputProcessor::~CTextInputProcessor() {
     // Final Release must not create sessions that AddRef a TIP already being destroyed.
+    DrainUnconfirmedCommits(false);
+    for (const auto& c : m_unconfirmedCommits) {
+        if (!c.persisted) receipt_retry::Retain({c.session_id, c.context_id, c.event_id, static_cast<int>(c.action), c.retry_count});
+    }
+    m_unconfirmedCommits.clear(); // Durable journal or independent retry owner retains every result.
+    StopDrainTimer();
     UninitKeyEventSink();
     SetComposition(nullptr, nullptr, CompositionState::None);
     m_pendingTerminations.clear();
@@ -289,6 +301,12 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
         return E_FAIL;
     }
 
+    LoadSpilloverCommitsFromFile();
+    if (!m_unconfirmedCommits.empty()) {
+        DrainUnconfirmedCommits(false);
+        StartDrainTimer();
+    }
+
     return S_OK;
 }
 
@@ -343,6 +361,13 @@ STDMETHODIMP CTextInputProcessor::Deactivate() {
     }
 
     m_tfClientId = TF_CLIENTID_NULL;
+    DrainUnconfirmedCommits(false);
+    if (!m_unconfirmedCommits.empty()) {
+        if (SpillUnconfirmedCommitsToFile(m_unconfirmedCommits)) {
+            m_unconfirmedCommits.clear();
+        }
+    }
+    StopDrainTimer();
     m_ipcClient.Disconnect();
     return S_OK;
 }
@@ -370,11 +395,23 @@ void CTextInputProcessor::UninitKeyEventSink() {
     }
 }
 
-static bool HasModifierDown() {
+static bool ShouldFilterKeystroke(WPARAM wParam) {
     bool isCtrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     bool isAlt  = (GetKeyState(VK_MENU) & 0x8000) != 0;
     bool isWin  = ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0;
-    return isCtrl || isAlt || isWin;
+
+    // Never intercept Alt or Win shortcuts (e.g. Alt+Tab, Win+R)
+    if (isAlt || isWin) return true;
+
+    // If Ctrl is held, only allow specific IME hotkeys to pass into IME engine
+    if (isCtrl) {
+        if (wParam == VK_SHIFT || wParam == VK_SPACE || wParam == VK_OEM_PERIOD) {
+            return false; // Allowed for IME (Ctrl+Shift, Ctrl+Space, Ctrl+.)
+        }
+        return true; // Pass all other Ctrl+... (Ctrl+C, Ctrl+V, etc.) to host
+    }
+
+    return false;
 }
 
 static bool IsContextReadOnly(ITfContext* pic) {
@@ -408,7 +445,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
 
-    if (HasModifierDown() || IsContextReadOnly(pic)) {
+    if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
         return S_OK;
     }
 
@@ -417,6 +454,13 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     req.session_id = m_sessionId;
     req.context_id = reinterpret_cast<uint64_t>(pic);
     req.vk_code = static_cast<uint32_t>(wParam);
+    req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
+    req.modifiers = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) req.modifiers |= 1;
+    if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
+    if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
 
     IpcKeyResponse resp{};
     if (m_ipcClient.SendRequest(req, resp, 50)) {
@@ -426,11 +470,141 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     return S_OK;
 }
 
+bool CTextInputProcessor::SpillUnconfirmedCommitsToFile(const std::vector<UnconfirmedCommit>& commits) {
+    std::vector<receipt_journal::Record> records;
+    for (const auto& c : commits) if (!c.persisted)
+        records.push_back({c.session_id ? c.session_id : m_sessionId, c.context_id, c.event_id, static_cast<int>(c.action), (std::min)(c.retry_count, 32)});
+    return records.empty() || receipt_journal::Append(records);
+}
+
+void CTextInputProcessor::LoadSpilloverCommitsFromFile() {
+    std::vector<receipt_journal::Record> records;
+    if (!receipt_journal::Read(records)) return; // Failure is not an empty snapshot.
+    for (const auto& r : records) {
+        if (m_unconfirmedCommits.size() >= 512) break;
+        bool exists = false;
+        for (const auto& c : m_unconfirmedCommits) if (c.event_id == r.eid) { exists = true; break; }
+        if (!exists) m_unconfirmedCommits.push_back({r.cid, r.eid, static_cast<UnconfirmedAction>(r.action), r.retry,
+            std::chrono::steady_clock::now(), r.sid, true});
+    }
+}
+
+bool CTextInputProcessor::RemoveConfirmedSpilloverRecord(uint64_t eventId) {
+    return receipt_journal::Ack(eventId);
+}
+
+bool CTextInputProcessor::HasPendingSpilloverRecords() {
+    std::vector<receipt_journal::Record> records;
+    return receipt_retry::Pending() || !receipt_journal::Read(records) || !records.empty();
+}
+static thread_local std::map<UINT_PTR, CTextInputProcessor*> s_timerMap;
+
+static VOID CALLBACK DrainTimerCallback(HWND, UINT, UINT_PTR idEvent, DWORD) {
+    auto it = s_timerMap.find(idEvent);
+    if (it != s_timerMap.end() && it->second) {
+        if (it->second->m_unconfirmedCommits.size() < 512 && it->second->HasPendingSpilloverRecords()) {
+            it->second->LoadSpilloverCommitsFromFile();
+        }
+        it->second->DrainUnconfirmedCommits(false);
+    }
+}
+
+void CTextInputProcessor::StartDrainTimer() {
+    if (m_drainTimerId == 0) {
+        m_drainTimerId = SetTimer(nullptr, 0, 300, DrainTimerCallback);
+        if (m_drainTimerId != 0) {
+            s_timerMap[m_drainTimerId] = this;
+        }
+    }
+}
+
+void CTextInputProcessor::StopDrainTimer() {
+    if (m_drainTimerId != 0) {
+        s_timerMap.erase(m_drainTimerId);
+        KillTimer(nullptr, m_drainTimerId);
+        m_drainTimerId = 0;
+    }
+}
+
+bool CTextInputProcessor::EnqueueUnconfirmedCommit(uint64_t contextId, uint64_t eventId, UnconfirmedAction action) {
+    UnconfirmedCommit c{contextId, eventId, action, 0, std::chrono::steady_clock::now(), m_sessionId, false};
+    c.persisted = SpillUnconfirmedCommitsToFile({c});
+    if (!c.persisted) {
+        receipt_retry::Retain({c.session_id,c.context_id,c.event_id,static_cast<int>(c.action),0});
+        StartDrainTimer();
+        return false; // An independent owner, NOT a durable claim.
+    }
+    if (m_unconfirmedCommits.size() < 512) m_unconfirmedCommits.push_back(c);
+    StartDrainTimer();
+    return true;
+}
+void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
+    constexpr size_t MAX_QUEUE_SIZE = 512;
+    if (m_unconfirmedCommits.empty()) {
+        if (!HasPendingSpilloverRecords()) {
+            StopDrainTimer();
+        }
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    size_t processed = 0;
+    constexpr size_t MAX_DRAIN_PER_INVOCATION = 8;
+
+    for (auto it = m_unconfirmedCommits.begin(); it != m_unconfirmedCommits.end() && processed < MAX_DRAIN_PER_INVOCATION; ) {
+        if (!forceNow && now < it->next_retry) {
+            ++it;
+            continue;
+        }
+        processed++;
+        bool ok = false;
+        IpcKeyResponse drainResp{};
+        uint64_t effectiveSession = (it->session_id != 0) ? it->session_id : m_sessionId;
+        if (it->action == UnconfirmedAction::Success) {
+            ok = m_ipcClient.NotifyCommitSuccess(effectiveSession, it->context_id, it->event_id);
+        } else {
+            ok = m_ipcClient.NotifyCommitCancel(effectiveSession, it->context_id, it->event_id, &drainResp);
+            if (ok) {
+                if (drainResp.candidate_count > 0 || (drainResp.has_composition && drainResp.composition[0] != L'\0')) {
+                    m_contextCandidateVersions[it->context_id] = drainResp.candidate_version;
+                }
+            }
+        }
+
+        if (ok) {
+            uint64_t confirmedEid = it->event_id;
+            if (RemoveConfirmedSpilloverRecord(confirmedEid)) it = m_unconfirmedCommits.erase(it); else ++it;
+        } else {
+            it->retry_count = (std::min)(it->retry_count + 1, 32);
+            int shift = (std::min)(it->retry_count, 5);
+            it->next_retry = now + std::chrono::milliseconds(50 * (1 << shift));
+            ++it;
+        }
+    }
+
+    if (m_unconfirmedCommits.size() > MAX_QUEUE_SIZE) {
+        size_t excess = m_unconfirmedCommits.size() - MAX_QUEUE_SIZE;
+        std::vector<UnconfirmedCommit> toSpill(m_unconfirmedCommits.begin(), m_unconfirmedCommits.begin() + excess);
+        if (SpillUnconfirmedCommitsToFile(toSpill)) {
+            m_unconfirmedCommits.erase(m_unconfirmedCommits.begin(), m_unconfirmedCommits.begin() + excess);
+        }
+    }
+
+    if (m_unconfirmedCommits.empty() && !HasPendingSpilloverRecords()) {
+        StopDrainTimer();
+    } else {
+        StartDrainTimer();
+    }
+}
+
 STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
 
-    if (HasModifierDown() || IsContextReadOnly(pic)) {
+    DrainUnconfirmedCommits();
+    if (receipt_retry::Pending()) return S_OK;
+
+    if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
         return S_OK;
     }
 
@@ -465,19 +639,46 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
     req.session_id = m_sessionId;
     req.context_id = contextId;
     req.vk_code = static_cast<uint32_t>(wParam);
+    req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
+    req.modifiers = 0;
+    if (GetKeyState(VK_SHIFT) & 0x8000) req.modifiers |= 1;
+    if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
+    if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+
+    uint32_t currentCandVer = 0;
+    auto itVer = m_contextCandidateVersions.find(contextId);
+    if (itVer != m_contextCandidateVersions.end()) {
+        currentCandVer = itVer->second;
+    }
+    req.candidate_version = currentCandVer;
 
     IpcKeyResponse resp{};
-    if (m_ipcClient.SendRequest(req, resp, 50)) {
+    if (m_ipcClient.SendRequest(req, resp, 80)) {
         if (!resp.handled) {
             return S_OK;
         }
 
+        if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
+            m_contextCandidateVersions[contextId] = resp.candidate_version;
+        } else {
+            m_contextCandidateVersions[contextId] = 0;
+        }
+
         std::vector<std::wstring> cands;
-        for (uint32_t i = 0; i < resp.candidate_count && i < 5; ++i) {
+        for (uint32_t i = 0; i < resp.candidate_count && i < 9; ++i) {
             cands.push_back(resp.candidates[i]);
         }
 
         if (resp.has_composition || resp.has_commit) {
+            if (resp.has_commit && resp.commit_event_id != 0 &&
+                !receipt_journal::Prepare({m_sessionId, contextId, resp.commit_event_id, 0, 0})) {
+                IpcKeyResponse restored{};
+                if (m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &restored))
+                    m_contextCandidateVersions[contextId] = restored.candidate_version;
+                return S_OK; // No host edit when the preflight barrier cannot persist.
+            }
             CEditSession* pSession = new CEditSession(
                 this, pic, &m_candidateWindow,
                 resp.has_composition != 0, resp.composition,
@@ -492,10 +693,18 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
 
             if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && result == EditSessionResult::Success) {
                 *pfEaten = TRUE;
+                if (resp.has_commit && resp.commit_event_id != 0) {
+                    EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Success);
+                    DrainUnconfirmedCommits(true);
+                }
             } else if (result == EditSessionResult::PartiallyModified) {
                 // THIS session modified host text; eat key to avoid duplication, do NOT rollback
                 *pfEaten = TRUE;
                 m_candidateWindow.Hide();
+                if (resp.has_commit && resp.commit_event_id != 0) {
+                    EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Success);
+                    DrainUnconfirmedCommits(true);
+                }
             } else {
                 // Unmodified or RecoveryBlocked: current key text was NOT applied to host!
                 // Do NOT eat the key (*pfEaten = FALSE), hide window, and roll back server for current key!
@@ -504,7 +713,32 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
                 }
                 *pfEaten = FALSE;
                 m_candidateWindow.Hide();
-                m_ipcClient.Rollback(m_sessionId, contextId);
+
+                IpcKeyResponse cancelOrRollbackResp{};
+                if (resp.has_commit && resp.commit_event_id != 0) {
+                    if (!EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Cancel) ||
+                        !m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &cancelOrRollbackResp)) {
+
+                        m_contextCandidateVersions[contextId] = 0;
+                    } else {
+                        // Synchronize restored snapshot from server!
+                        if (cancelOrRollbackResp.candidate_count > 0 || (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                            m_contextCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
+                        } else {
+                            m_contextCandidateVersions[contextId] = 0;
+                        }
+                    }
+                } else {
+                    if (m_ipcClient.Rollback(m_sessionId, contextId, &cancelOrRollbackResp)) {
+                        if (cancelOrRollbackResp.candidate_count > 0 || (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                            m_contextCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
+                        } else {
+                            m_contextCandidateVersions[contextId] = 0;
+                        }
+                    } else {
+                        m_contextCandidateVersions[contextId] = 0;
+                    }
+                }
             }
         } else {
             *pfEaten = TRUE;
@@ -539,6 +773,7 @@ STDMETHODIMP CTextInputProcessor::OnCompositionTerminated(TfEditCookie ecWrite, 
     if (m_pComposition == pComposition) {
         uint64_t terminatedContextId = m_compositionContextId;
         SetComposition(nullptr, nullptr, CompositionState::None);
+        m_contextCandidateVersions[terminatedContextId] = 0;
         m_ipcClient.ResetContext(m_sessionId, terminatedContextId);
         if (terminatedContextId == m_activeContextId) {
             m_candidateWindow.Hide();
@@ -550,6 +785,7 @@ STDMETHODIMP CTextInputProcessor::OnCompositionTerminated(TfEditCookie ecWrite, 
     for (auto it = m_pendingTerminations.begin(); it != m_pendingTerminations.end(); ++it) {
         if (it->pComp == pComposition) {
             uint64_t terminatedContextId = it->contextId;
+            m_contextCandidateVersions[terminatedContextId] = 0;
             m_ipcClient.ResetContext(m_sessionId, terminatedContextId);
             m_pendingTerminations.erase(it);
             return S_OK;

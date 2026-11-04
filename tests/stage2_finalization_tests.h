@@ -93,7 +93,7 @@ static int TestStage2Finalization() {
         TEST_ASSERT(Migration::GetSchemaVersion(db) == 1, "Failed upgrade retains v1 version");
         auto columns = db.Prepare("PRAGMA table_info(commit_events);"); int count = 0; while (columns->Step()) ++count;
         TEST_ASSERT(count == 2, "Failed upgrade rolls back all added columns");
-        TEST_ASSERT(Migration::Migrate(db) && Migration::GetSchemaVersion(db) == 2, "Retry upgrades v1 successfully");
+        TEST_ASSERT(Migration::Migrate(db) && Migration::GetSchemaVersion(db) == Migration::CURRENT_SCHEMA_VERSION, "Retry upgrades v1 successfully");
         EntryRepository repo(db, std::make_shared<MockClock>());
         auto id = repo.AddEntry(L"migration", {{InputScheme::Custom, ";migration"}});
         TEST_ASSERT(repo.RecordCommit("legacy", InputScheme::Custom, ";migration", id), "Legacy event remains idempotent");

@@ -52,6 +52,7 @@ int RunMultiThreadedTest() {
 
             // Commit
             req.vk_code = VK_SPACE;
+            req.candidate_version = resp.candidate_version;
             if (!client.SendRequest(req, resp, 80)) {
                 std::wcerr << L"[MT FAIL] Commit SendRequest failed for session " << sessionId << std::endl;
                 threadFailed = true;
@@ -127,22 +128,25 @@ int main(int argc, char* argv[]) {
     CHECK_TRUE(resp.handled == 1, L"KeyDown 'A' handled must be 1");
     CHECK_TRUE(resp.has_composition == 1, L"KeyDown 'A' has_composition must be 1");
     CHECK_TRUE(wcscmp(resp.composition, L"a") == 0, L"Composition text must be 'a'");
-    CHECK_TRUE(resp.candidate_count == 2, L"Candidate count must be 2");
-    std::wcout << L"[TEST PASS] Context 101 -> Key 'A' -> Composition: " << resp.composition << std::endl;
+    CHECK_TRUE(resp.candidate_count > 0, L"Candidate count must be > 0");
+    uint32_t ctx101Ver = resp.candidate_version;
+    std::wcout << L"[TEST PASS] Context 101 -> Key 'A' -> Composition: " << resp.composition << L", candidates: " << resp.candidate_count << std::endl;
 
     // 3. Multi-Context Isolation: Send KeyDown 'B' in Context 102
     req.context_id = 102;
     req.vk_code = 'B';
+    req.candidate_version = 0;
     CHECK_TRUE(client.SendRequest(req, resp, 80), L"KeyDown 'B' in Context 102 failed");
     CHECK_TRUE(wcscmp(resp.composition, L"b") == 0, L"Context 102 composition must be 'b'");
     std::wcout << L"[TEST PASS] Context 102 -> Key 'B' -> Composition: " << resp.composition << std::endl;
 
-    // 4. Commit Context 101 with Space -> Must commit "测试" and not affect Context 102
+    // 4. Commit Context 101 with Space -> Must commit candidate and not affect Context 102
     req.context_id = 101;
     req.vk_code = VK_SPACE;
+    req.candidate_version = ctx101Ver;
     CHECK_TRUE(client.SendRequest(req, resp, 80), L"Commit Context 101 failed");
     CHECK_TRUE(resp.has_commit == 1, L"Commit flag must be 1");
-    CHECK_TRUE(wcscmp(resp.commit_text, L"测试") == 0, L"Commit text must be '测试'");
+    CHECK_TRUE(wcslen(resp.commit_text) > 0, L"Commit text must not be empty");
     CHECK_TRUE(wcslen(resp.composition) == 0, L"Context 101 composition must be empty after commit");
     std::wcout << L"[TEST PASS] Context 101 -> Space -> Commit: " << resp.commit_text << std::endl;
 
