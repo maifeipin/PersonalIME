@@ -47,6 +47,10 @@ docs/*
 !docs/design.md
 !docs/dictionary-info.md
 !docs/stage2-design.md
+!docs/stage3-design.md
+!docs/stage3-receipt-wal.md
+!docs/stage3-finalization.md
+!docs/stage3-finalization-hashes.json
 
 # Test output directories
 handover-*/

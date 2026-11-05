@@ -1,0 +1,46 @@
+[
+  {
+    "path": "src/tsf_client/receipt_journal.h",
+    "sha256": "80482D67C11737E73947DAAB5F27184836551F9815D856C0D52DE36D582FBBA3"
+  },
+  {
+    "path": "src/tsf_client/text_input_processor.cpp",
+    "sha256": "9C893A019278C3C800D6DA61338CCD07AA6CB114ADA81EF54934BDBB7B3D920B"
+  },
+  {
+    "path": "tests/test_receipt_durability.cpp",
+    "sha256": "88F3B0385BE3A8D468828109403E1A495401B897D731F2CA6034B13B01D61C76"
+  },
+  {
+    "path": "tests/test_tip_candidate_snapshot.cpp",
+    "sha256": "E93F06A4BC192687A70F2EF426EAF414BD4CFFB703F5E8FD69142827A49808DC"
+  },
+  {
+    "path": "tests/tip_snapshot_driver.cpp",
+    "sha256": "E00E8B3E6E8C2B0C22BD37E19493442F70D7B0CA04957AA4E9A79F23E1932FE9"
+  },
+  {
+    "path": "scripts/verify_stage3.ps1",
+    "sha256": "3AB39BCC7B5D0362B9DF3838DB00EC2E0712AFECAF4C280CFA44DD64BDC35839"
+  },
+  {
+    "path": "build/Release/PersonalIME.dll",
+    "sha256": "A3595FECE0BC281F0A7EDC1A4068FAFA62256A8AE89E2F0F8E09AC695673DF8B"
+  },
+  {
+    "path": "build/Release/ime-service.exe",
+    "sha256": "273249698DEF1AF1978DC86A999D29DF7B62E61BCC0485BB53B72112C8C82E22"
+  },
+  {
+    "path": "build/Release/test_stage3_integration.exe",
+    "sha256": "C0726557A398A38AA33C5A7C77EB0619AA1E8D5C41E53E00547E8346C11E660E"
+  },
+  {
+    "path": "build/Release/test_receipt_durability.exe",
+    "sha256": "2FAAAD30D9D12B4195B903557C0CD0EF177BF933CDE212F1A0DBE1092E79E9E4"
+  },
+  {
+    "path": "build/Release/test_tip_candidate_snapshot.exe",
+    "sha256": "0544F224A15D25FE91D0ECCC7DD0AA25D3B7AA97C056CAFDF5FDE3B710E1D1BF"
+  }
+]

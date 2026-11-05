@@ -114,7 +114,9 @@ inline bool Append(const std::vector<Record>& records){
         if(!Valid(r))return false;
         if(s.acked.count(r.eid))continue;
         auto it=s.active.find(r.eid);
-        if(it!=s.active.end()){if(!Same(it->second,r))return false;continue;}
+        // A complete visible frame may be the residue of a failed _commit.
+        // Re-append and sync matching retries before reporting durability.
+        if(it!=s.active.end()&&!Same(it->second,r))return false;
         if(!AppendFrame("R1 "+Payload(r)))return false;
         s.active[r.eid]=r;
     }return true;

@@ -7,7 +7,7 @@
 
 **PersonalIME** 是一款面向个人用户、注重隐私控制与高性能体验的 Windows 11 中文输入法。项目采用现代 Windows Text Services Framework (TSF) 架构，支持拼音、五笔以及完全自定义的编码词条，并通过本地自适应排序引擎记录用户的输入习惯，实现“越用越顺手、数据全在本地”。
 
-当前进度：Stage 2 核心引擎和 CLI 已完成，核心回归包含 14 组测试。TSF 后台服务仍是 Stage 1 原型，真实词典与个人排序尚待 Stage 3 接入；WPF 管理器、实际按键的模式切换与全角半角控制在后续实现。当前核心仅验证了 Windows x64，与 TSF/UI 解耦不代表已经支持其他平台。
+当前进度：Stage 3 已接通真实引擎、TSF 服务、模式与全半角控制，并实现持久化事件和追加式回执日志。自动化包含 14 组核心测试、15 项服务集成及独立回执测试；完整入口为 `scripts/verify_stage3.ps1`。真实宿主 GUI 验收仍待完成，Stage 4 的 WPF 词库与设置管理器尚未实现。当前仅验证 Windows x64；回执契约见 [Stage 3 回执日志](docs/stage3-receipt-wal.md)。
 
 ---
 

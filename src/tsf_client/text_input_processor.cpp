@@ -662,7 +662,7 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
 
         if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
             m_contextCandidateVersions[contextId] = resp.candidate_version;
-        } else {
+        } else if (resp.has_composition && resp.composition[0] == L'\0') {
             m_contextCandidateVersions[contextId] = 0;
         }
 

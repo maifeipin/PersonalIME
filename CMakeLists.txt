@@ -166,3 +166,9 @@ target_link_libraries(test_receipt_journal PRIVATE user32)
 
 add_executable(test_receipt_handover tests/test_receipt_handover.cpp src/tsf_client/text_input_processor.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
 target_link_libraries(test_receipt_handover PRIVATE ole32 oleaut32 advapi32 user32 gdi32)
+
+add_executable(test_receipt_durability tests/test_receipt_durability.cpp)
+target_link_libraries(test_receipt_durability PRIVATE user32)
+
+add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
+target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32)
