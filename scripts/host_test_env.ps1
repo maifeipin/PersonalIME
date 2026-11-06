@@ -167,23 +167,67 @@ function Start-TestService {
     Set-Content -Path $PidFile -Value $proc.Id -Encoding utf8
     Write-Host "Test ime-service launched with PID: $($proc.Id) (ProcessName: $($proc.ProcessName))" -ForegroundColor Green
 
-    # 3. Wait for pipe readiness (up to 5 seconds)
-    Write-Host "Waiting for IPC pipes to become available..." -NoNewline
+    # 3. Wait for pipe readiness and perform semantic handshake with database verification
+    Write-Host "Waiting for IPC pipes and verifying service handshake..." -NoNewline
     $ready = $false
     for ($i = 0; $i -lt 50; $i++) {
         Start-Sleep -Milliseconds 100
         if ((Test-Path "\\.\pipe\PersonalIME_Service_Pipe") -and (Test-Path "\\.\pipe\PersonalIME_Admin_Pipe")) {
-            $ready = $true
-            break
+            # Perform semantic handshake: query GetStatus via Admin Pipe and verify db_path
+            try {
+                $pipe = [System.IO.Pipes.NamedPipeClientStream]::new(".", "PersonalIME_Admin_Pipe", [System.IO.Pipes.PipeDirection]::InOut)
+                $pipe.Connect(150)
+                $reqPayload = '{"action":"GetStatus"}'
+                $reqBytes = [System.Text.Encoding]::UTF8.GetBytes($reqPayload)
+                $frame = [byte[]]::new(16 + $reqBytes.Length)
+                [System.Text.Encoding]::ASCII.GetBytes("PIMA").CopyTo($frame, 0)
+                [BitConverter]::GetBytes([uint32]0x0100).CopyTo($frame, 4)
+                [BitConverter]::GetBytes([uint32]$reqBytes.Length).CopyTo($frame, 8)
+                [BitConverter]::GetBytes([uint32]1).CopyTo($frame, 12)
+                $reqBytes.CopyTo($frame, 16)
+                $pipe.Write($frame, 0, $frame.Length)
+                $pipe.Flush()
+
+                $hdr = [byte[]]::new(16)
+                $hRead = 0
+                while ($hRead -lt 16) {
+                    $r = $pipe.Read($hdr, $hRead, 16 - $hRead)
+                    if ($r -le 0) { break }
+                    $hRead += $r
+                }
+                if ($hRead -eq 16) {
+                    $pLen = [BitConverter]::ToUInt32($hdr, 8)
+                    $pBytes = [byte[]]::new($pLen)
+                    $pRead = 0
+                    while ($pRead -lt $pLen) {
+                        $r = $pipe.Read($pBytes, $pRead, $pLen - $pRead)
+                        if ($r -le 0) { break }
+                        $pRead += $r
+                    }
+                    $respObj = [System.Text.Encoding]::UTF8.GetString($pBytes) | ConvertFrom-Json
+                    if ($respObj.success -eq $true -and $respObj.data.db_path) {
+                        $actualDb = [System.IO.Path]::GetFullPath($respObj.data.db_path)
+                        $expectedDb = [System.IO.Path]::GetFullPath($targetDb)
+                        if ($actualDb -eq $expectedDb) {
+                            $ready = $true
+                            $pipe.Dispose()
+                            break
+                        }
+                    }
+                }
+                $pipe.Dispose()
+            } catch {
+                # Retry until deadline
+            }
         }
     }
 
     if ($ready) {
-        Write-Host " READY!" -ForegroundColor Green
+        Write-Host " READY! (Verified connection & DB: $targetDb)" -ForegroundColor Green
     } else {
-        Write-Host " TIMEOUT (Pipes did not become ready within 5s)" -ForegroundColor Red
+        Write-Host " TIMEOUT / HANDSHAKE FAILED (Could not verify connection or database binding within 5s)" -ForegroundColor Red
         Stop-TestService
-        throw "ime-service started (PID $($proc.Id)) but pipes timed out."
+        throw "ime-service started (PID $($proc.Id)) but semantic readiness handshake failed."
     }
 
     return $proc.Id

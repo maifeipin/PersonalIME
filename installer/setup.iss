@@ -89,7 +89,23 @@ Filename: "{app}\manager\{#MyAppExeName}"; Description: "打开 Personal IME 管
 
 [Code]
 var
+  G_InitialChecksum: String;
   G_RestartNeeded: Boolean;
+
+procedure InitializeWizard();
+begin
+  G_InitialChecksum := MakePendingFileRenameOperationsChecksum;
+  G_RestartNeeded := False;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if G_InitialChecksum <> MakePendingFileRenameOperationsChecksum then
+      G_RestartNeeded := True;
+  end;
+end;
 
 function NotRestarting(): Boolean;
 begin
@@ -100,12 +116,15 @@ function NeedRestart(): Boolean;
 begin
   Result := G_RestartNeeded;
 end;
-// Stop any currently running ime-service before installing, upgrading or uninstalling
+
+// Stop any currently running ime-service strictly belonging to this application directory
 procedure StopAppServiceIfRunning();
 var
   ResultCode: Integer;
+  AppPath: String;
 begin
-  Exec('taskkill.exe', '/F /IM {#MyServiceExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  AppPath := ExpandConstant('{app}');
+  Exec('powershell.exe', '-NoProfile -Command "Get-Process -Name ime-service -ErrorAction SilentlyContinue | Where-Object { try { $_.MainModule.FileName -like ''' + AppPath + '\*'' } catch { $false } } | Stop-Process -Force"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Sleep(200);
 end;
 
