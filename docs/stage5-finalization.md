@@ -23,7 +23,8 @@
 - **验证结果**：
   - 本地运行 `scripts/run_ci_gate.ps1` 100% 通过（40/40 WPF 测试，0 失败，0 跳过）。
   - `tests/test_gate_fault_injection.ps1` 实测通过（ExitCode=1, FailedAsExpected=True, ReachedPackaging=False）。
-  - GitHub Actions 云端 CI [Run #42300119863](https://github.com/maifeipin/PersonalIME/actions/runs/42300119863) 全绿通过。
+  - GitHub Actions 云端 CI [Run #42304064252](https://github.com/maifeipin/PersonalIME/actions/runs/42304064252) 全绿通过（100% 成功）。
+  - GitHub Actions Release 构建与打包 [Run #42304695495](https://github.com/maifeipin/PersonalIME/actions/runs/42304695495) 全绿通过。
 
 ### 1.3 测试环境和进程保护 (P1-3)
 - **修复位置**：`scripts/host_test_env.ps1`
@@ -59,16 +60,27 @@
 
 ## 2. 候选版本交付清单与产物哈希表 (Release Candidate v1.0.0-rc.1)
 
+- **最终提交 SHA**: `2e2e56cedca9594cb2a9cc8c6cc225529516e6cf`
 - **版本编号**: `1.0.0-rc.1`
 - **Git 标签**: `v1.0.0-rc.1` (候选发布标签)
 - **目标平台**: Windows 10 / Windows 11 (64-bit x64 ONLY)
 - **签名状态**: **未签名 (UNSIGNED)**
+- **Draft Release 链接**: [GitHub Draft Release (v1.0.0-rc.1)](https://github.com/maifeipin/PersonalIME/releases/tag/untagged-af1675a57d35adfb17fd) (参数: `draft=true`, `prerelease=true`)
+- **云端构建链接**:
+  - CI Pipeline: [Run #42304064252](https://github.com/maifeipin/PersonalIME/actions/runs/42304064252)
+  - Release Packaging: [Run #42304695495](https://github.com/maifeipin/PersonalIME/actions/runs/42304695495)
 
+### 云端 Release 产物文件清单与校验和
 | 产物文件 | 产物类型 | 大小 (字节) | SHA-256 校验和 |
 | :--- | :--- | :--- | :--- |
-| **`PersonalIME-Setup-x64.exe`** | Inno Setup 标准安装包 | 46,160,176 | `6ACC6A9564709F4F4D4481C422C0F48EFE5A0925F8DCBB2FA2AB2899D2068207` |
-| **`PersonalIME-v1.0.0-rc.1-portable-x64.zip`** | 绿色便携免安装包 | 63,033,285 | `CCDBAE09911EE364E4FBACEDE767E02FF0EEF355621E0F1B86B806C3C5CBA199` |
-| **`SHA256SUMS.txt`** | 校验和清单文件 | 185 | *(对应上述两个二进制文件哈希)* |
+| **`PersonalIME-Setup-x64.exe`** | Inno Setup 标准安装包 | 46,194,403 | `FAD17C6EC28766F6725C45C0D098DDDFDBB1AA5262A3C22D244B2EB5C305799D` |
+| **`PersonalIME-v1.0.0-rc.1-portable-x64.zip`** | 绿色便携免安装包 | 63,077,263 | `D89B82B0EE27303E8BC0910D3DAF08F4AE396225A1C1E82EFB849E1634A3618C` |
+| **`SHA256SUMS.txt`** | 校验和清单文件 | 201 | *(见下方清单原文)* |
+
+```text
+FAD17C6EC28766F6725C45C0D098DDDFDBB1AA5262A3C22D244B2EB5C305799D  PersonalIME-Setup-x64.exe
+D89B82B0EE27303E8BC0910D3DAF08F4AE396225A1C1E82EFB849E1634A3618C  PersonalIME-v1.0.0-rc.1-portable-x64.zip
+```
 
 ---
 
