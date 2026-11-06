@@ -1,5 +1,6 @@
 #include "ime_engine.h"
 #include "../storage/migration.h"
+#include "../strategy/input_policy_json.h"
 #include <algorithm>
 #include <iostream>
 
@@ -26,11 +27,26 @@ bool ImeEngine::Initialize(const std::string& dbPath,
     }
 
     m_repo = std::make_unique<EntryRepository>(m_db, m_clock);
+    m_repo->SetBuiltinDictionary(&m_builtinDict);
 
     if (!dictDir.empty()) {
         if (!m_builtinDict.Load(dictDir)) {
             return false;
         }
+    }
+
+    m_coordinator = std::make_unique<InputCoordinator>(*m_repo, m_builtinDict, m_clock);
+
+    // Load persisted input policy if present
+    auto savedPolicyJson = m_repo->GetMetaSetting("input_policy");
+    if (savedPolicyJson && !savedPolicyJson->empty()) {
+        try {
+            auto j = nlohmann::json::parse(*savedPolicyJson);
+            InputPolicy policy;
+            if (InputPolicyFromJson(j, policy)) {
+                m_coordinator->SetPolicy(policy);
+            }
+        } catch (...) {}
     }
 
     m_initialized = true;
@@ -209,7 +225,11 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
                                   InputScheme scheme,
                                   const std::string& queryCode,
                                   const std::string& entryId,
-                                  const std::wstring& text) {
+                                  const std::wstring& text,
+                                  bool learningEnabled,
+                                  const std::string& layoutId,
+                                  const std::string& matchedCode,
+                                  const std::string& resolvedCode) {
     if (!m_initialized || !m_repo || eventId.empty()) return false;
     EntryRepository::PendingCommitRecord rec;
     rec.event_id = eventId;
@@ -220,6 +240,10 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
     rec.entry_id = entryId;
     rec.text = text;
     rec.created_at = m_clock ? m_clock->Now() : 0;
+    rec.learning_enabled = learningEnabled;
+    rec.layout_id = layoutId;
+    rec.matched_code = matchedCode;
+    rec.resolved_code = resolvedCode;
     return m_repo->SavePendingCommit(rec);
 }
 
@@ -327,6 +351,72 @@ std::vector<std::string> ImeEngine::ExplainCandidates(InputScheme scheme, const 
         explanations.push_back(line);
     }
     return explanations;
+}
+
+bool ImeEngine::SavePolicy(const InputPolicy& policy,
+                           std::optional<uint64_t> expectedRevision,
+                           std::string* errorOut,
+                           uint64_t* outRevision,
+                           bool* outConflict) {
+    if (outConflict) *outConflict = false;
+    std::lock_guard<std::mutex> lock(m_policySaveMutex);
+    if (!m_initialized || !m_coordinator || !m_repo) {
+        if (errorOut) *errorOut = "Engine not initialized";
+        return false;
+    }
+    if (!ValidateInputPolicy(policy, errorOut)) {
+        return false;
+    }
+
+    auto currentPolicy = m_coordinator->GetPolicySnapshot();
+    if (expectedRevision.has_value()) {
+        uint64_t curRev = currentPolicy ? currentPolicy->revision : 0;
+        if (curRev != *expectedRevision) {
+            if (outConflict) *outConflict = true;
+            if (errorOut) *errorOut = "Policy revision conflict: current revision is " + std::to_string(curRev);
+            return false;
+        }
+    }
+
+    InputPolicy toSave = policy;
+
+    // Atomically bump revision from current live snapshot
+    uint64_t nextRev = (currentPolicy ? currentPolicy->revision : 0) + 1;
+    toSave.revision = nextRev;
+
+    // Persist to meta_settings FIRST (fail-safe atomic update)
+    try {
+        auto j = InputPolicyToJson(toSave);
+        if (!m_repo->SetMetaSetting("input_policy", j.dump())) {
+            if (errorOut) *errorOut = "Failed to write input_policy to database";
+            return false;
+        }
+    } catch (const std::exception& e) {
+        if (errorOut) *errorOut = e.what();
+        return false;
+    }
+
+    // Only update in-memory coordinator if database write succeeded!
+    m_coordinator->SetPolicy(toSave);
+    if (outRevision) {
+        *outRevision = toSave.revision;
+    }
+    return true;
+}
+
+std::shared_ptr<const InputPolicy> ImeEngine::GetPolicy() const {
+    if (!m_coordinator) return nullptr;
+    return m_coordinator->GetPolicySnapshot();
+}
+
+bool ImeEngine::ResetAllStats() {
+    if (!m_repo) return false;
+    return m_repo->ResetAllStats();
+}
+
+int64_t ImeEngine::GetLastResetStatsAt() {
+    if (!m_repo) return 0;
+    return m_repo->GetLastResetStatsAt();
 }
 
 } // namespace ime

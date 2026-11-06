@@ -2,6 +2,11 @@
 build/
 bin/
 out/
+obj/
+**/bin/
+**/obj/
+TestResults/
+**/TestResults/
 
 # Visual Studio files
 .vs/
@@ -51,10 +56,19 @@ docs/*
 !docs/stage3-receipt-wal.md
 !docs/stage3-finalization.md
 !docs/stage3-finalization-hashes.json
+!docs/stage4-design.md
+!docs/input-policy-design.md
+!docs/stage5-host-acceptance.md
+!docs/stage5-finalization.md
+
 
 # Test output directories
 handover-*/
 receipt-*/
+
+# Development archive
+.归档/
+.*归档*
 
 
 

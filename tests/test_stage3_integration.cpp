@@ -1224,8 +1224,566 @@ int main(int argc, char* argv[]) {
         SetEnvironmentVariableW(L"TEMP",oldTemp);SetEnvironmentVariableW(L"TMP",oldTemp);
         std::wcout << L"[PASS] Original owner, durable handover, real timer and terminal ACK." << std::endl;
     }
+    // Stage 4B finalization: query flags describe only the current composition.
+    {
+        std::wcout << L"\n[TEST 16] Real service query status and reset boundaries..." << std::endl;
+        client.Disconnect();
+        service.Stop();
+        std::string flagsDb = "out/status-flags-" + std::to_string(GetCurrentProcessId()) + ".db";
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(flagsDb, dictDir), L"Seed isolated query flag DB");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Shuangpin;
+            policy.shuangpin_layout = ime::ShuangpinLayout::Natural;
+            CHECK_TRUE(seed.SavePolicy(policy), L"Persist shuangpin policy for real service flag test");
+        }
+        ServiceProcess flagService;
+        CHECK_TRUE(flagService.Start(flagsDb, dictDir), L"Start isolated service for query flags");
+        IpcKeyRequest r{};
+        r.session_id = 1616;
+        r.context_id = 1;
+        r.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        IpcKeyResponse out{};
+        r.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        CHECK_TRUE(client.SendRequest(r, out, 200), L"Connect status test client before mode update");
+        CHECK_TRUE(client.SetScheme(r.session_id, r.context_id, ime::InputScheme::Wubi86), L"Select Wubi context for invalid-code flag");
+        CHECK_TRUE(client.SetMode(r.session_id, r.context_id, IPC_MODE_CHINESE), L"Set Chinese mode");
+        r.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        r.vk_code = 'Z';
+        for (int i = 0; i < 5; ++i) CHECK_TRUE(client.SendRequest(r, out, 200), L"Type invalid Wubi code");
+        CHECK_TRUE(out.status_flags & IPC_STATUS_ERROR, L"Invalid code reports query error flag");
+        r.msg_type = static_cast<uint32_t>(IpcMsgType::Reset);
+        CHECK_TRUE(client.SendRequest(r, out, 200), L"Reset error context");
+        constexpr uint32_t queryFlags = IPC_STATUS_HAS_NEXT_DICT | IPC_STATUS_TRUNCATED | IPC_STATUS_ERROR;
+        CHECK_EQUAL(out.status_flags & queryFlags, 0u, L"Reset clears all query-specific status flags");
+
+        r.context_id = 2; // A new context inherits the persisted natural shuangpin policy.
+        r.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        for (int i = 0; i < 5; ++i) {
+            r.vk_code = 'N'; CHECK_TRUE(client.SendRequest(r, out, 200), L"Type ambiguous shuangpin initial");
+            r.vk_code = 'T'; CHECK_TRUE(client.SendRequest(r, out, 200), L"Type ambiguous shuangpin final");
+        }
+        CHECK_TRUE(out.status_flags & IPC_STATUS_TRUNCATED, L"Actual service propagates decoder budget truncation");
+        r.vk_code = VK_ESCAPE;
+        CHECK_TRUE(client.SendRequest(r, out, 200), L"Cancel truncated composition");
+        CHECK_EQUAL(out.status_flags & queryFlags, 0u, L"Escape clears truncation and next-dictionary hints");
+
+        r.context_id = 3;
+        r.vk_code = 'N';
+        for (int i = 0; i < 65; ++i) CHECK_TRUE(client.SendRequest(r, out, 200), L"Type beyond shuangpin input limit");
+        CHECK_TRUE(out.status_flags & IPC_STATUS_ERROR, L"InputLengthExceeded is distinguishable from ordinary empty candidates");
+        client.Disconnect();
+        flagService.Stop();
+        std::wcout << L"[PASS] Real query errors, length limits, truncation and reset status." << std::endl;
+    }
+
+    // -------------------------------------------------------------
+    // Test 17: Real Fast Pipe Scheme Independence, Mode Updates, and Enabling Lifecycle
+    // -------------------------------------------------------------
+    {
+        std::wcout << L"\n[TEST 17] Real Fast Pipe Scheme Independence, Mode Updates, and Enabling Lifecycle..." << std::endl;
+        client.Disconnect();
+        service.Stop();
+
+        std::string schemeDb = "out/scheme-test-" + std::to_string(GetCurrentProcessId()) + ".db";
+        std::error_code ec;
+        std::filesystem::remove(schemeDb, ec);
+
+        // 1. Initial seed with all 3 schemes enabled
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(schemeDb, dictDir), L"Seed isolated scheme DB");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Wubi86;
+            policy.SetMethodEnabled(ime::InputScheme::Wubi86, true);
+            policy.SetMethodEnabled(ime::InputScheme::Pinyin, true);
+            policy.SetMethodEnabled(ime::InputScheme::Shuangpin, true);
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with all 3 schemes enabled");
+        }
+
+        ServiceProcess schemeService;
+        CHECK_TRUE(schemeService.Start(schemeDb, dictDir), L"Start service with all 3 schemes enabled");
+
+        uint64_t sid = 1700;
+        uint64_t cid = 1;
+
+        // Connect
+        IpcKeyRequest pingReq{};
+        pingReq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        pingReq.session_id = sid;
+        pingReq.context_id = cid;
+        pingReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse pingResp{};
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping scheme test service");
+
+        // -------------------------------------------------------------
+        // Part 1: Independent Raw Golden Byte Vectors (Wire 1=Wubi, 2=Pinyin, 3=Shuangpin)
+        // -------------------------------------------------------------
+        std::wcout << L"  [17.1] Testing Raw Golden Frame Byte Vectors for Wire Scheme IDs..." << std::endl;
+        {
+            // A. Raw Golden Wire 1 -> Wubi86
+            IpcKeyRequest goldenReq{};
+            goldenReq.msg_type = 13; // SetScheme
+            goldenReq.session_id = sid;
+            goldenReq.context_id = cid;
+            goldenReq.protocol_version = 0x0400; // Stage 4
+            goldenReq.scheme_id = 1; // Literal wire value 1 for Wubi86
+            goldenReq.update_mask = 1 << 3; // IPC_UPDATE_SCHEME
+            IpcKeyResponse goldenResp{};
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send raw golden wire 1");
+            CHECK_EQUAL(goldenResp.handled, 1u, L"Raw golden wire 1 accepted");
+            CHECK_EQUAL((goldenResp.status_flags & 0x00FF0000u) >> 16, 1u, L"status_flags bits 16..23 must be 1 for Wubi86");
+
+            // Verify typing 'a' under Wire 1 (Wubi86) produces "工"
+            IpcKeyRequest keyReq{};
+            keyReq.msg_type = 4; // KeyDown
+            keyReq.session_id = sid;
+            keyReq.context_id = cid;
+            keyReq.protocol_version = 0x0400;
+            keyReq.vk_code = 'A';
+            IpcKeyResponse keyResp{};
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'a' in Wubi86");
+            CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist for 'a' in Wubi86");
+            CHECK_TRUE(wcsstr(keyResp.candidates[0], L"工") != nullptr, L"Wire 1 produces Wubi86 top candidate 工");
+
+            // Cancel composition
+            keyReq.vk_code = VK_ESCAPE;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Cancel composition");
+
+            // B. Raw Golden Wire 2 -> Pinyin
+            goldenReq.scheme_id = 2; // Literal wire value 2 for Pinyin
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send raw golden wire 2");
+            CHECK_EQUAL(goldenResp.handled, 1u, L"Raw golden wire 2 accepted");
+            CHECK_EQUAL((goldenResp.status_flags & 0x00FF0000u) >> 16, 2u, L"status_flags bits 16..23 must be 2 for Pinyin");
+
+            // Verify typing "zhongwen" under Wire 2 (Pinyin) produces "中文"
+            for (char ch : std::string("ZHONGWEN")) {
+                keyReq.vk_code = static_cast<uint32_t>(ch);
+                CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type zhongwen letter");
+            }
+            CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist for zhongwen in Pinyin");
+            CHECK_TRUE(wcsstr(keyResp.candidates[0], L"中文") != nullptr, L"Wire 2 produces Pinyin top candidate 中文");
+
+            keyReq.vk_code = VK_ESCAPE;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Cancel composition");
+
+            // C. Raw Golden Wire 3 -> Shuangpin
+            goldenReq.scheme_id = 3; // Literal wire value 3 for Shuangpin
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send raw golden wire 3");
+            CHECK_EQUAL(goldenResp.handled, 1u, L"Raw golden wire 3 accepted");
+            CHECK_EQUAL((goldenResp.status_flags & 0x00FF0000u) >> 16, 3u, L"status_flags bits 16..23 must be 3 for Shuangpin");
+
+            // D. Raw Golden Wire 99 -> Invalid scheme rejected with handled = 0
+            goldenReq.scheme_id = 99; // Invalid wire scheme
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send raw golden wire 99");
+            CHECK_EQUAL(goldenResp.handled, 0u, L"Invalid wire scheme 99 must be rejected with handled=0");
+            CHECK_EQUAL((goldenResp.status_flags & 0x00FF0000u) >> 16, 3u, L"Scheme remains wire 3 (Shuangpin) after rejection");
+
+            // E. Raw Golden Wire 4 (Custom) -> Rejected as primary scheme with handled = 0
+            goldenReq.scheme_id = 4; // Custom wire scheme
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send raw golden wire 4");
+            CHECK_EQUAL(goldenResp.handled, 0u, L"Wire scheme 4 (Custom) must be rejected with handled=0");
+            CHECK_EQUAL((goldenResp.status_flags & 0x00FF0000u) >> 16, 3u, L"Scheme remains wire 3 after Custom rejection");
+
+            // F. Stage 4 commands rejected under legacy protocol version 0x0300
+            goldenReq.protocol_version = 0x0300; // Legacy Stage 3
+            goldenReq.scheme_id = 1;
+            CHECK_TRUE(client.SendRequest(goldenReq, goldenResp, 200), L"Send SetScheme with 0x0300");
+            CHECK_EQUAL(goldenResp.handled, 0u, L"SetScheme under 0x0300 must be rejected with handled=0");
+
+            IpcKeyRequest getSchemeLegacyReq{};
+            getSchemeLegacyReq.msg_type = 14; // GetScheme
+            getSchemeLegacyReq.session_id = sid;
+            getSchemeLegacyReq.context_id = cid;
+            getSchemeLegacyReq.protocol_version = 0x0300;
+            IpcKeyResponse getSchemeLegacyResp{};
+            CHECK_TRUE(client.SendRequest(getSchemeLegacyReq, getSchemeLegacyResp, 200), L"Send GetScheme with 0x0300");
+            CHECK_EQUAL(getSchemeLegacyResp.handled, 0u, L"GetScheme under 0x0300 must be rejected with handled=0");
+        }
+
+        // -------------------------------------------------------------
+        // Part 2: Selective update_mask & Atomic State Rejection
+        // -------------------------------------------------------------
+        std::wcout << L"  [17.2] Testing Selective update_mask and Atomic Rejection..." << std::endl;
+        {
+            // Initial state: ensure Chinese = true, Full-Width = false, Chinese Punct = true, Scheme = Wubi86
+            CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+            CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4, 0), L"SetMode whole-set baseline");
+
+            uint32_t mf = 0;
+            ime::InputScheme sc;
+            CHECK_TRUE(client.GetMode(sid, cid, mf, sc), L"GetMode baseline");
+            CHECK_TRUE((mf & IPC_MODE_CHINESE) != 0, L"Baseline Chinese=true");
+            CHECK_EQUAL(mf & IPC_MODE_FULL_WIDTH, 0u, L"Baseline FullWidth=false");
+            CHECK_TRUE((mf & IPC_MODE_CHINESE_PUNCT) != 0, L"Baseline Punct=true");
+            CHECK_EQUAL(static_cast<uint32_t>(sc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Baseline Scheme=Wubi86");
+
+            // Selective update: only update Full-Width to true
+            CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_FULL_WIDTH, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH), L"Selective SetMode FullWidth");
+            CHECK_TRUE(client.GetMode(sid, cid, mf, sc), L"GetMode after selective FullWidth");
+            CHECK_TRUE((mf & IPC_MODE_FULL_WIDTH) != 0, L"FullWidth is now true");
+            CHECK_TRUE((mf & IPC_MODE_CHINESE) != 0, L"Chinese is STILL true (preserved)");
+            CHECK_TRUE((mf & IPC_MODE_CHINESE_PUNCT) != 0, L"Punct is STILL true (preserved)");
+            CHECK_EQUAL(static_cast<uint32_t>(sc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Scheme STILL Wubi86 (preserved)");
+
+            // Selective update: only update Chinese to false (English)
+            CHECK_TRUE(client.SetMode(sid, cid, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE), L"Selective SetMode Chinese=false");
+            CHECK_TRUE(client.GetMode(sid, cid, mf, sc), L"GetMode after selective English");
+            CHECK_EQUAL(mf & IPC_MODE_CHINESE, 0u, L"Chinese is now false");
+            CHECK_TRUE((mf & IPC_MODE_FULL_WIDTH) != 0, L"FullWidth is STILL true (preserved)");
+            CHECK_TRUE((mf & IPC_MODE_CHINESE_PUNCT) != 0, L"Punct is STILL true (preserved)");
+            CHECK_EQUAL(static_cast<uint32_t>(sc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Scheme STILL Wubi86 (preserved)");
+
+            // Unknown mask bit rejection: update_mask = 0x80
+            IpcKeyRequest badMaskReq{};
+            badMaskReq.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+            badMaskReq.session_id = sid;
+            badMaskReq.context_id = cid;
+            badMaskReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+            badMaskReq.update_mask = 0x80; // Unknown mask bit!
+            badMaskReq.mode_arg = IPC_MODE_CHINESE;
+            IpcKeyResponse badMaskResp{};
+            CHECK_TRUE(client.SendRequest(badMaskReq, badMaskResp, 200), L"Send SetMode with unknown mask bit");
+            CHECK_EQUAL(badMaskResp.handled, 0u, L"Unknown mask bit must be rejected with handled=0");
+
+            // Verify state is completely UNTOUCHED after unknown mask rejection
+            CHECK_TRUE(client.GetMode(sid, cid, mf, sc), L"GetMode after bad mask");
+            CHECK_EQUAL(mf & IPC_MODE_CHINESE, 0u, L"Chinese is STILL false after rejection");
+            CHECK_TRUE((mf & IPC_MODE_FULL_WIDTH) != 0, L"FullWidth is STILL true after rejection");
+
+            // Atomic rejection when scheme invalid in SetMode:
+            // update_mask has IPC_UPDATE_FULL_WIDTH and IPC_UPDATE_SCHEME, but scheme_id is 99 (invalid)
+            IpcKeyRequest badSchemeSetModeReq{};
+            badSchemeSetModeReq.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+            badSchemeSetModeReq.session_id = sid;
+            badSchemeSetModeReq.context_id = cid;
+            badSchemeSetModeReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+            badSchemeSetModeReq.update_mask = IPC_UPDATE_FULL_WIDTH | IPC_UPDATE_SCHEME;
+            badSchemeSetModeReq.mode_arg = 0; // Request FullWidth=false
+            badSchemeSetModeReq.scheme_id = 99; // Invalid scheme!
+            IpcKeyResponse badSchemeSetModeResp{};
+            CHECK_TRUE(client.SendRequest(badSchemeSetModeReq, badSchemeSetModeResp, 200), L"Send SetMode with invalid scheme");
+            CHECK_EQUAL(badSchemeSetModeResp.handled, 0u, L"SetMode with invalid scheme rejected with handled=0");
+
+            // Verify Full-Width was NOT modified to false (atomic rejection!)
+            CHECK_TRUE(client.GetMode(sid, cid, mf, sc), L"GetMode after atomic rejection");
+            CHECK_TRUE((mf & IPC_MODE_FULL_WIDTH) != 0, L"FullWidth is STILL true (atomic rejection kept previous state)");
+            CHECK_EQUAL(static_cast<uint32_t>(sc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Scheme STILL Wubi86");
+
+            // Active composition untouched on rejection vs cleared on valid change:
+            // Restore Chinese mode
+            CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4, 0), L"Restore whole-set Chinese");
+            // Start composition with 'a'
+            IpcKeyRequest typeReq{};
+            typeReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+            typeReq.session_id = sid;
+            typeReq.context_id = cid;
+            typeReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+            typeReq.vk_code = 'A';
+            IpcKeyResponse typeResp{};
+            CHECK_TRUE(client.SendRequest(typeReq, typeResp, 200), L"Type 'a'");
+            CHECK_TRUE(wcscmp(typeResp.composition, L"a") == 0, L"Composition is 'a'");
+
+            // Send invalid SetScheme (wire 99)
+            IpcKeyRequest rejSchemeReq{};
+            rejSchemeReq.msg_type = static_cast<uint32_t>(IpcMsgType::SetScheme);
+            rejSchemeReq.session_id = sid;
+            rejSchemeReq.context_id = cid;
+            rejSchemeReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+            rejSchemeReq.scheme_id = 99;
+            IpcKeyResponse rejSchemeResp{};
+            CHECK_TRUE(client.SendRequest(rejSchemeReq, rejSchemeResp, 200), L"Send invalid SetScheme");
+            CHECK_EQUAL(rejSchemeResp.handled, 0u, L"Invalid SetScheme rejected");
+
+            // Verify active composition was NOT cleared by rejected request!
+            // Type 'a' again -> should become "aa", not "a"!
+            CHECK_TRUE(client.SendRequest(typeReq, typeResp, 200), L"Type second 'a'");
+            CHECK_TRUE(wcscmp(typeResp.composition, L"aa") == 0, L"Composition remained 'aa' (unmodified by rejection)");
+
+            // Now send VALID SetScheme (Pinyin) -> composition MUST be cleared cleanly
+            CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Pinyin), L"Valid SetScheme Pinyin");
+            // Next keystroke should be fresh composition
+            CHECK_TRUE(client.SendRequest(typeReq, typeResp, 200), L"Type 'a' in Pinyin");
+            CHECK_TRUE(wcscmp(typeResp.composition, L"a") == 0, L"Composition was reset by valid scheme change");
+            typeReq.vk_code = VK_ESCAPE;
+            CHECK_TRUE(client.SendRequest(typeReq, typeResp, 200), L"Cancel composition");
+        }
+
+        // -------------------------------------------------------------
+        // Part 3: Three schemes * Mode flag updates without scheme change (IpcClient API)
+        // -------------------------------------------------------------
+        std::wcout << L"  [17.3] Testing Scheme Set/Get roundtrip and Mode flag updates..." << std::endl;
+        std::vector<ime::InputScheme> testSchemes = {
+            ime::InputScheme::Wubi86,
+            ime::InputScheme::Pinyin,
+            ime::InputScheme::Shuangpin
+        };
+
+        for (auto testSc : testSchemes) {
+            CHECK_TRUE(client.SetScheme(sid, cid, testSc), L"SetScheme succeeded");
+            ime::InputScheme currentScheme;
+            CHECK_TRUE(client.GetScheme(sid, cid, currentScheme), L"GetScheme succeeded");
+            CHECK_EQUAL(static_cast<uint32_t>(currentScheme), static_cast<uint32_t>(testSc), L"Scheme matches set scheme");
+
+            // Update mode flags: Full-Width + Chinese (Stage 4 whole-set)
+            CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_FULL_WIDTH, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese+FullWidth");
+            uint32_t modeFlags = 0;
+            CHECK_TRUE(client.GetMode(sid, cid, modeFlags, currentScheme), L"GetMode after Chinese+FullWidth");
+            CHECK_TRUE(modeFlags & IPC_MODE_CHINESE, L"Mode flag Chinese is set");
+            CHECK_TRUE(modeFlags & IPC_MODE_FULL_WIDTH, L"Mode flag FullWidth is set");
+            CHECK_EQUAL(static_cast<uint32_t>(currentScheme), static_cast<uint32_t>(testSc), L"Scheme unchanged after Chinese+FullWidth update");
+
+            // Update mode flags: English + Half-Width (Stage 4 whole-set)
+            CHECK_TRUE(client.SetMode(sid, cid, 0, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode English+HalfWidth");
+            CHECK_TRUE(client.GetMode(sid, cid, modeFlags, currentScheme), L"GetMode after English+HalfWidth");
+            CHECK_EQUAL(modeFlags & IPC_MODE_CHINESE, 0u, L"Mode flag Chinese is cleared");
+            CHECK_EQUAL(modeFlags & IPC_MODE_FULL_WIDTH, 0u, L"Mode flag FullWidth is cleared");
+            CHECK_EQUAL(static_cast<uint32_t>(currentScheme), static_cast<uint32_t>(testSc), L"Scheme unchanged after English update");
+
+            // Restore Chinese + Half-Width + Chinese Punctuation (Stage 4 whole-set)
+            CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese+Punct");
+            CHECK_TRUE(client.GetMode(sid, cid, modeFlags, currentScheme), L"GetMode after Chinese+Punct");
+            CHECK_EQUAL(static_cast<uint32_t>(currentScheme), static_cast<uint32_t>(testSc), L"Scheme unchanged after Punct update");
+        }
+
+        // Part 4: Explicit switch and rejection when scheme disabled
+        client.Disconnect();
+        schemeService.Stop();
+
+        // Disable Shuangpin in DB
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(schemeDb, dictDir), L"Re-open DB to disable Shuangpin");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Wubi86;
+            policy.SetMethodEnabled(ime::InputScheme::Wubi86, true);
+            policy.SetMethodEnabled(ime::InputScheme::Pinyin, true);
+            policy.SetMethodEnabled(ime::InputScheme::Shuangpin, false);
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with Shuangpin disabled");
+        }
+
+        CHECK_TRUE(schemeService.Start(schemeDb, dictDir), L"Start service with Shuangpin disabled");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping after service restart");
+
+        // Verify initial scheme is primary (Wubi86)
+        ime::InputScheme activeSc;
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"Get initial scheme");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Initial scheme is Wubi86");
+
+        // Attempt explicit switch to disabled Shuangpin -> MUST be rejected with handled = 0!
+        bool setDisabledOk = client.SetScheme(sid, cid, ime::InputScheme::Shuangpin);
+        CHECK_TRUE(!setDisabledOk, L"Explicit SetScheme to disabled scheme MUST return false (rejected)");
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"GetScheme after rejected switch");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Context scheme remains unmodified after rejection");
+
+        // Part 5: Hotkey Ctrl+Shift cycles skipping disabled schemes
+        // Current scheme: Wubi86. Enabled schemes: Wubi86, Pinyin. Disabled: Shuangpin.
+        IpcKeyRequest hotkeyReq{};
+        hotkeyReq.session_id = sid;
+        hotkeyReq.context_id = cid;
+        hotkeyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        hotkeyReq.vk_code = VK_SHIFT;
+        hotkeyReq.modifiers = 2; // Ctrl
+        hotkeyReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse hotkeyResp{};
+
+        // Press Ctrl+Shift -> cycles from Wubi86 to Pinyin
+        CHECK_TRUE(client.SendRequest(hotkeyReq, hotkeyResp, 200) && hotkeyResp.handled == 1, L"Send Ctrl+Shift #1");
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"Get scheme after Ctrl+Shift #1");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Pinyin), L"Ctrl+Shift cycled to Pinyin");
+
+        // Press Ctrl+Shift -> cycles from Pinyin back to Wubi86 (skipping disabled Shuangpin!)
+        CHECK_TRUE(client.SendRequest(hotkeyReq, hotkeyResp, 200) && hotkeyResp.handled == 1, L"Send Ctrl+Shift #2");
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"Get scheme after Ctrl+Shift #2");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Ctrl+Shift cycled back to Wubi86 (skipping Shuangpin)");
+
+        // Part 6: Single enabled method remaining
+        client.Disconnect();
+        schemeService.Stop();
+
+        // Enable ONLY Wubi86
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(schemeDb, dictDir), L"Re-open DB for single enabled method");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Wubi86;
+            policy.SetMethodEnabled(ime::InputScheme::Wubi86, true);
+            policy.SetMethodEnabled(ime::InputScheme::Pinyin, false);
+            policy.SetMethodEnabled(ime::InputScheme::Shuangpin, false);
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with only Wubi86 enabled");
+        }
+
+        CHECK_TRUE(schemeService.Start(schemeDb, dictDir), L"Start service with single enabled scheme");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping single-scheme service");
+
+        // Press Ctrl+Shift -> stays on Wubi86
+        CHECK_TRUE(client.SendRequest(hotkeyReq, hotkeyResp, 200) && hotkeyResp.handled == 1, L"Send Ctrl+Shift on single scheme");
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"Get scheme after Ctrl+Shift on single scheme");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Single scheme remains on Wubi86");
+
+        // Part 7: Restart persistence
+        client.Disconnect();
+        schemeService.Stop();
+
+        CHECK_TRUE(schemeService.Start(schemeDb, dictDir), L"Restart service to test persistence");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping restarted service");
+        CHECK_TRUE(client.GetScheme(sid, cid, activeSc), L"Get scheme after service restart");
+        CHECK_EQUAL(static_cast<uint32_t>(activeSc), static_cast<uint32_t>(ime::InputScheme::Wubi86), L"Scheme persists across service restart");
+        CHECK_TRUE(!client.SetScheme(sid, cid, ime::InputScheme::Pinyin), L"Disabled Pinyin rejected after restart");
+        CHECK_TRUE(!client.SetScheme(sid, cid, ime::InputScheme::Shuangpin), L"Disabled Shuangpin rejected after restart");
+
+        client.Disconnect();
+        schemeService.Stop();
+        std::filesystem::remove(schemeDb, ec);
+
+        std::wcout << L"[PASS] Scheme independence, mode flag isolation, hotkey skipping, and restart verified!" << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 18: Real Candidate Window Reverse Lookup Hint & Pure Commit (Stage 4C-2)
+    // -------------------------------------------------------------------------
+    {
+        std::wcout << L"\n[TEST 18] Testing Real Candidate Window Reverse Lookup Hint & Pure Commit..." << std::endl;
+
+        std::string rlDb = "out/stage4c2_fastpipe.db";
+        std::error_code ec;
+        std::filesystem::remove(rlDb, ec);
+
+        // 1. Seed policy with reverse lookup ENABLED, target_method = Wubi86
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(rlDb, dictDir), L"Initialize seed engine for Test 18");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Pinyin;
+            policy.reverse_lookup.enabled = true;
+            policy.reverse_lookup.target_method = ime::InputScheme::Wubi86;
+            policy.reverse_lookup.timing = "always";
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with reverse lookup enabled");
+        }
+
+        ServiceProcess rlService;
+        CHECK_TRUE(rlService.Start(rlDb, dictDir), L"Start service with reverse lookup enabled");
+
+        uint64_t sid = 0x4C2001;
+        uint64_t cid = 0x4C2002;
+
+        IpcKeyRequest pingReq{};
+        pingReq.session_id = sid;
+        pingReq.context_id = cid;
+        pingReq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        pingReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse pingResp{};
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping service for Test 18");
+
+        // Ensure in Chinese Pinyin mode
+        CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
+        CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Pinyin), L"SetScheme Pinyin");
+
+        // Type 'g', 'o', 'n', 'g'
+        IpcKeyRequest keyReq{};
+        keyReq.session_id = sid;
+        keyReq.context_id = cid;
+        keyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        keyReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse keyResp{};
+
+        const char* gongKeys = "gong";
+        for (const char* p = gongKeys; *p; ++p) {
+            keyReq.vk_code = static_cast<uint32_t>(toupper(*p));
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type key in gong");
+        }
+
+        CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist for 'gong'");
+        for (uint32_t i = 0; i < keyResp.candidate_count; ++i) {
+            std::wcout << L"  Candidate " << i << L" with Wubi reverse lookup: " << keyResp.candidates[i] << std::endl;
+            // Every candidate must have reverse lookup code in bracket format
+            CHECK_TRUE(wcsstr(keyResp.candidates[i], L"[") != nullptr, L"Candidate label contains reverse lookup hint '['");
+            CHECK_TRUE(wcsstr(keyResp.candidates[i], L"]") != nullptr, L"Candidate label contains reverse lookup hint ']'");
+        }
+
+        // Commit candidate 0 via Space bar
+        keyReq.vk_code = VK_SPACE;
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Press Space to commit candidate 0");
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit must be 1");
+
+        // CRITICAL CONTRACT: Reverse lookup hint is purely presentational!
+        // The committed text MUST strictly be pure text, NOT containing brackets or reverse codes!
+        std::wcout << L"  Committed text: " << keyResp.commit_text << std::endl;
+        CHECK_TRUE(wcschr(keyResp.commit_text, L'[') == nullptr, L"Committed text must NOT contain '['");
+        CHECK_TRUE(wcschr(keyResp.commit_text, L']') == nullptr, L"Committed text must NOT contain ']'");
+        CHECK_TRUE(wcslen(keyResp.commit_text) > 0, L"Committed text is non-empty");
+
+        // 2. Switch reverse lookup target to Shuangpin Natural via seed
+        client.Disconnect();
+        rlService.Stop();
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(rlDb, dictDir), L"Reopen DB for Shuangpin reverse lookup target");
+            auto policy = *seed.GetPolicy();
+            policy.primary_method = ime::InputScheme::Wubi86;
+            policy.reverse_lookup.enabled = true;
+            policy.reverse_lookup.target_method = ime::InputScheme::Shuangpin;
+            policy.reverse_lookup.shuangpin_layout = ime::ShuangpinLayout::Natural;
+            policy.reverse_lookup.timing = "always";
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with Shuangpin reverse lookup target");
+        }
+
+        CHECK_TRUE(rlService.Start(rlDb, dictDir), L"Restart service with Shuangpin reverse lookup target");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping reconnected client for Shuangpin");
+
+        // In Wubi86 mode, type 'a'
+        CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese Wubi");
+        CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+
+        keyReq.vk_code = 'A';
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'a' in Wubi86");
+        CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist for 'a' in Wubi86");
+        std::wcout << L"  Candidate 0 with Shuangpin reverse lookup: " << keyResp.candidates[0] << std::endl;
+
+        // Candidate 0 text is '工', reverse code under Shuangpin Natural is 'gs'
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"工") != nullptr, L"Candidate 0 text contains '工'");
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"[gs]") != nullptr, L"Candidate 0 label contains Shuangpin hint '[gs]'");
+
+        // Commit candidate 0 via Space
+        keyReq.vk_code = VK_SPACE;
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Press Space to commit candidate 0");
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit must be 1");
+        CHECK_TRUE(wcscmp(keyResp.commit_text, L"工") == 0, L"Committed text must strictly be '工'");
+
+        // 3. Disable reverse lookup: candidates must NOT contain brackets
+        client.Disconnect();
+        rlService.Stop();
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(rlDb, dictDir), L"Reopen DB to disable reverse lookup");
+            auto policy = *seed.GetPolicy();
+            policy.reverse_lookup.enabled = false;
+            CHECK_TRUE(seed.SavePolicy(policy), L"Save policy with reverse lookup disabled");
+        }
+
+        CHECK_TRUE(rlService.Start(rlDb, dictDir), L"Restart service with reverse lookup disabled");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping reconnected client for disabled");
+
+        keyReq.vk_code = 'A';
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'a' with reverse lookup disabled");
+        CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist");
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"[") == nullptr, L"Candidate label must NOT contain '[' when reverse lookup disabled");
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"工") != nullptr, L"Candidate label still contains '工'");
+
+        client.Disconnect();
+        rlService.Stop();
+        std::filesystem::remove(rlDb, ec);
+
+        std::wcout << L"[PASS] Reverse lookup candidate hint display and pure text commit verified!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 End-to-End Integration Tests PASSED! (15/15)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 End-to-End Tests PASSED! (18/18)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

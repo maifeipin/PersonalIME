@@ -1,0 +1,23 @@
+Personal IME Dictionary Attribution & Licenses Notice
+=====================================================
+
+This software includes precompiled dictionary tables derived from open-source projects:
+
+1. 86-Edition Wubi Base Dictionary (wubi86.dict)
+   - Source Project: Rime 86 Wubi (rime/rime-wubi)
+   - Commit: 152a0d3f3efe40cae216d1e3b338242446848d07
+   - License: GNU Lesser General Public License (LGPL) v2.1
+   - Upstream URL: https://github.com/rime/rime-wubi
+
+2. Pinyin Simplified Base Dictionary (pinyin.dict)
+   - Source Project: Rime Pinyin Simp (rime/rime-pinyin-simp)
+   - Commit: 0c6861ef7420ee780270ca6d993d18d4101049d0
+   - License: Apache License 2.0 / LGPL
+   - Upstream URL: https://github.com/rime/rime-pinyin-simp
+
+3. SQLite Database Engine (Embedded)
+   - Public Domain: Dedicated to the public domain by D. Richard Hipp.
+   - Upstream URL: https://www.sqlite.org/
+
+For full license texts and compilation details, see docs/dictionary-info.md and LICENSE.
+

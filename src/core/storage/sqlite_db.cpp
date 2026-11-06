@@ -40,11 +40,13 @@ bool SqliteDb::Open(const std::string& path) {
     if (err) sqlite3_free(err);
 
     sqlite3_busy_timeout(m_db, 5000); // 5 seconds busy timeout
+    m_path = path;
     return true;
 }
 
 void SqliteDb::Close() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_path.clear();
     if (m_db) {
         sqlite3_close_v2(m_db);
         m_db = nullptr;
@@ -85,6 +87,18 @@ std::unique_ptr<Statement> SqliteDb::Prepare(const std::string& sql) {
         return nullptr;
     }
     return std::make_unique<Statement>(stmt, m_mutex);
+}
+
+std::string SqliteDb::GetLastError() const {
+    std::lock_guard<std::recursive_mutex> lock(const_cast<std::recursive_mutex&>(m_mutex));
+    if (!m_db) return "Database not open";
+    return sqlite3_errmsg(m_db);
+}
+
+int SqliteDb::GetLastErrorCode() const {
+    std::lock_guard<std::recursive_mutex> lock(const_cast<std::recursive_mutex&>(m_mutex));
+    if (!m_db) return SQLITE_MISUSE;
+    return sqlite3_errcode(m_db);
 }
 
 SqliteDb::Transaction::Transaction(SqliteDb& db)

@@ -98,6 +98,37 @@ bool Migration::Migrate(SqliteDb& db) {
             return false;
         }
     }
+
+    bool needsV4 = (currentVer < 4);
+    if (!needsV4) {
+        // Verify pending_commits columns and entry_resets table exist
+        auto stmtPending = db.Prepare("PRAGMA table_info(pending_commits);");
+        if (!stmtPending) {
+            return false;
+        }
+        std::set<std::string> pendingCols;
+        while (stmtPending->Step()) {
+            pendingCols.insert(stmtPending->ColumnText(1));
+        }
+        if (stmtPending->HasError() || pendingCols.empty()) {
+            return false;
+        }
+        static const char* reqPendingCols[] = {
+            "learning_enabled", "layout_id", "matched_code", "resolved_code", "global_epoch", "entry_epoch"
+        };
+        for (const char* col : reqPendingCols) {
+            if (pendingCols.find(col) == pendingCols.end()) {
+                needsV4 = true;
+                break;
+            }
+        }
+    }
+
+    if (needsV4) {
+        if (!ApplyVersion4(db)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -319,6 +350,94 @@ bool Migration::ApplyVersion3(SqliteDb& db) {
     }
 
     if (!db.Execute("PRAGMA user_version = 3;")) {
+        tx.Rollback();
+        return false;
+    }
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion4(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    // 1. Ensure entry_resets table
+    const char* schemaEntryResets = R"SQL(
+        CREATE TABLE IF NOT EXISTS entry_resets (
+            entry_id TEXT PRIMARY KEY,
+            reset_epoch INTEGER NOT NULL DEFAULT 1
+        );
+    )SQL";
+    if (!db.Execute(schemaEntryResets)) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 2. Ensure meta_settings has global_stats_reset_epoch
+    if (!db.Execute("INSERT OR IGNORE INTO meta_settings (key, value) VALUES ('global_stats_reset_epoch', '1');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 3. Add columns to pending_commits if missing
+    std::set<std::string> pendingCols;
+    {
+        auto stmt = db.Prepare("PRAGMA table_info(pending_commits);");
+        if (!stmt) {
+            tx.Rollback();
+            return false;
+        }
+        while (stmt->Step()) {
+            pendingCols.insert(stmt->ColumnText(1));
+        }
+        if (stmt->HasError()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (pendingCols.find("learning_enabled") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN learning_enabled INTEGER NOT NULL DEFAULT 1;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (pendingCols.find("layout_id") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN layout_id TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (pendingCols.find("matched_code") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN matched_code TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (pendingCols.find("resolved_code") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN resolved_code TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (pendingCols.find("global_epoch") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN global_epoch INTEGER NOT NULL DEFAULT 1;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+    if (pendingCols.find("entry_epoch") == pendingCols.end()) {
+        if (!db.Execute("ALTER TABLE pending_commits ADD COLUMN entry_epoch INTEGER NOT NULL DEFAULT 1;")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '4');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 4;")) {
         tx.Rollback();
         return false;
     }

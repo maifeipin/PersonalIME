@@ -1,0 +1,139 @@
+<UserControl x:Class="PersonalIME.Manager.Views.MaintenanceView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008" 
+             xmlns:vm="clr-namespace:PersonalIME.Manager.ViewModels"
+             mc:Ignorable="d" 
+             d:DataContext="{d:DesignInstance Type=vm:MaintenanceViewModel}"
+             d:DesignHeight="700" d:DesignWidth="850">
+    <Grid>
+        <!-- Main Content -->
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <Grid Margin="20">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- Card 1: Service Diagnostics -->
+                <Border Grid.Row="0" Background="White" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="8" Padding="16" Margin="0,0,0,16">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,12">
+                            <TextBlock Text="PersonalIME 运行诊断" FontSize="15" FontWeight="Bold" VerticalAlignment="Center"/>
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button Content="刷新状态" Command="{Binding RefreshStatusCommand}" Padding="12,4" Margin="0,0,8,0"/>
+                                <Button Content="复制诊断信息" Command="{Binding CopyDiagnosticsCommand}" Padding="12,4"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="26"/>
+                                <RowDefinition Height="26"/>
+                                <RowDefinition Height="26"/>
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding Status.ServiceVersion, StringFormat='服务版本: v{0}'}"/>
+                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding FormattedUptime, StringFormat='运行时间: {0}'}"/>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding Status.ActiveClients, StringFormat='当前活动客户端: {0} 个'}"/>
+                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding FormattedDbSize, StringFormat='数据库大小: {0}'}"/>
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Text="{Binding Status.DatabasePath, StringFormat='数据库路径: {0}'}" TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Card 2: Backup and Import -->
+                <Border Grid.Row="1" Background="White" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="8" Padding="16" Margin="0,0,0,16">
+                    <StackPanel>
+                        <TextBlock Text="词库与配置备份" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
+                        <TextBlock Text="备份文件包含全部自定义词条、置顶规则与输入配置，标准 JSON 格式 (version: 1.0)。" Foreground="#666" Margin="0,0,0,14"/>
+
+                        <Grid Margin="0,0,0,16">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="导出当前所有自定义词库、置顶设定及引擎配置为 JSON 文件" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Content="导出词库备份 (JSON)" Command="{Binding ExportDataCommand}" Background="#0066CC" Foreground="White" FontWeight="Bold" Padding="16,6"/>
+                        </Grid>
+
+                        <Separator Margin="0,0,0,16"/>
+
+                        <TextBlock Text="词库数据恢复与导入" FontSize="14" FontWeight="Bold" Margin="0,0,0,8"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                                <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+                                    <RadioButton Content="增量合并导入 (保留现有词条，仅追加或更新)" IsChecked="True" GroupName="ImportMode" Margin="0,0,20,0"/>
+                                    <RadioButton Content="危险：覆盖导入 (清除现有词条，完全替换)" GroupName="ImportMode" Margin="0,0,0,0">
+                                        <RadioButton.Style>
+                                            <Style TargetType="RadioButton">
+                                                <Style.Triggers>
+                                                    <Trigger Property="IsChecked" Value="True">
+                                                        <Setter Property="Foreground" Value="#CC0000"/>
+                                                        <Setter Property="FontWeight" Value="Bold"/>
+                                                    </Trigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </RadioButton.Style>
+                                    </RadioButton>
+                                </StackPanel>
+                                <TextBlock Text="注：覆盖导入属于破坏性操作，在执行前会弹出二次确认对话框。" Foreground="#888" FontSize="12"/>
+                            </StackPanel>
+                            <Button Grid.Column="1" Content="导入词库文件..." Command="{Binding RequestImportDataCommand}" Padding="16,6" VerticalAlignment="Center"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Card 3: Learning Stats Reset -->
+                <Border Grid.Row="2" Background="#FFF5F5" BorderBrush="#FFCCCC" BorderThickness="1" CornerRadius="8" Padding="16">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                            <TextBlock Text="重置自学习习惯统计" FontSize="14" FontWeight="Bold" Foreground="#CC0000" Margin="0,0,0,4"/>
+                            <TextBlock Text="清空所有按键打字习惯记忆和动态置顶频次，将所有词频恢复为初始状态。自定义词条本身不会被删除。" Foreground="#666" FontSize="12"/>
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="危险：重置自学习习惯" Command="{Binding RequestResetStatsCommand}" Background="#CC3333" Foreground="White" FontWeight="Bold" Padding="16,8" VerticalAlignment="Center"/>
+                    </Grid>
+                </Border>
+            </Grid>
+        </ScrollViewer>
+
+        <!-- Destructive Action Confirmation Modal -->
+        <Grid Background="#66000000" Visibility="{Binding IsConfirmDialogOpen, Converter={StaticResource BooleanToVisibilityConverter}, FallbackValue=Collapsed}">
+            <Border Width="450" Background="White" CornerRadius="8" Padding="20" HorizontalAlignment="Center" VerticalAlignment="Center" BorderBrush="#CC0000" BorderThickness="2">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Text="{Binding ConfirmDialogTitle}" FontSize="16" FontWeight="Bold" Foreground="#CC0000" Margin="0,0,0,12"/>
+                    <TextBlock Grid.Row="1" Text="{Binding ConfirmDialogMessage}" TextWrapping="Wrap" Margin="0,0,0,20" LineHeight="20"/>
+
+                    <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="取消" Command="{Binding CancelActionCommand}" Padding="16,6" Margin="0,0,10,0"/>
+                        <Button Content="确认执行" Command="{Binding ConfirmActionCommand}" Background="#CC0000" Foreground="White" FontWeight="Bold" Padding="18,6"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</UserControl>
+

@@ -388,10 +388,13 @@ bool JsonBackup::ImportFromFile(EntryRepository& repo, SqliteDb& db, const std::
 
     try {
         if (replaceMode) {
-            // Clear all user entries, preferences, stats, and commit events
+            if (repo.HasAnyPendingCommits()) {
+                throw std::runtime_error("Cannot replace database while unconfirmed pending commits are in flight");
+            }
+            // Clear all user entries, preferences, and stats (terminal commit_events audit log MUST be preserved)
             if (!db.Execute("DELETE FROM sort_preferences;") ||
                 !db.Execute("DELETE FROM entry_stats;") ||
-                !db.Execute("DELETE FROM commit_events;") ||
+                !db.Execute("DELETE FROM entry_resets;") ||
                 !db.Execute("DELETE FROM entries WHERE source = 1;") ||
                 !db.Execute("DELETE FROM entry_codes WHERE entry_id NOT IN (SELECT id FROM entries);") ||
                 !db.Execute("DELETE FROM entries WHERE source = 0;")) {

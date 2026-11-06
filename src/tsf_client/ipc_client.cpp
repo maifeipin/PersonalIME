@@ -300,16 +300,60 @@ bool IpcClient::NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint6
     return ok && (resp.handled == 1);
 }
 
-bool IpcClient::SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags) {
-    if (m_hPipe != INVALID_HANDLE_VALUE) {
-        IpcKeyRequest req{};
-        req.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
-        req.session_id = sessionId;
-        req.context_id = contextId;
-        req.mode_arg = modeFlags;
-        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
-        IpcKeyResponse resp{};
-        return SendRequest(req, resp, 25);
+bool IpcClient::SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion, uint32_t updateMask) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.mode_arg = modeFlags;
+    req.protocol_version = protocolVersion;
+    req.update_mask = updateMask;
+    IpcKeyResponse resp{};
+    return SendRequest(req, resp, 80) && (resp.handled == 1);
+}
+
+bool IpcClient::GetMode(uint64_t sessionId, uint64_t contextId, uint32_t& outModeFlags, ime::InputScheme& outScheme) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::GetMode);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    if (SendRequest(req, resp, 80) && resp.handled == 1) {
+        outModeFlags = resp.status_flags;
+        uint32_t s = (resp.status_flags & IPC_SCHEME_MASK) >> IPC_SCHEME_SHIFT;
+        IpcSchemeIdToInputScheme(s, outScheme);
+        return true;
+    }
+    return false;
+}
+
+bool IpcClient::SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::SetScheme);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    IpcSchemeId wireId = InputSchemeToIpcSchemeId(scheme);
+    req.scheme_id = static_cast<uint32_t>(wireId);
+    req.mode_arg = req.scheme_id;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    if (SendRequest(req, resp, 80)) {
+        return (resp.handled == 1);
+    }
+    return false;
+}
+
+bool IpcClient::GetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme& outScheme) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::GetScheme);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    if (SendRequest(req, resp, 80) && resp.handled == 1) {
+        uint32_t s = (resp.status_flags & IPC_SCHEME_MASK) >> IPC_SCHEME_SHIFT;
+        return IpcSchemeIdToInputScheme(s, outScheme);
     }
     return false;
 }
@@ -430,7 +474,7 @@ bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWOR
     }
 
     // 3. Strict response identity, protocol version & type matching
-    if (op->recvBuf.protocol_version != IPC_PROTOCOL_VERSION_STAGE3 ||
+    if (op->recvBuf.protocol_version != op->sendBuf.protocol_version ||
         op->recvBuf.msg_type != req.msg_type ||
         op->recvBuf.session_id != req.session_id ||
         op->recvBuf.context_id != req.context_id) {

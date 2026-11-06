@@ -10,9 +10,12 @@
 #include "../encoding/custom_encoder.h"
 #include "../dictionary/builtin_dict.h"
 #include "../ranking/ranker.h"
+#include "../strategy/input_coordinator.h"
 #include <memory>
 #include <string>
 #include <vector>
+#include <optional>
+#include <mutex>
 
 namespace ime {
 
@@ -50,7 +53,11 @@ public:
                            InputScheme scheme,
                            const std::string& queryCode,
                            const std::string& entryId,
-                           const std::wstring& text);
+                           const std::wstring& text,
+                           bool learningEnabled = true,
+                           const std::string& layoutId = "",
+                           const std::string& matchedCode = "",
+                           const std::string& resolvedCode = "");
     bool RemovePendingCommit(const std::string& eventId);
     bool LoadAllPendingCommits(std::vector<EntryRepository::PendingCommitRecord>& outRecords);
     std::vector<EntryRepository::PendingCommitRecord> LoadAllPendingCommits();
@@ -80,14 +87,28 @@ public:
 
     std::shared_ptr<IClock> GetClock() const { return m_clock; }
     const BuiltinDictionary& GetBuiltinDict() const { return m_builtinDict; }
+    EntryRepository* GetRepo() { return m_repo.get(); }
+    InputCoordinator* GetCoordinator() { return m_coordinator.get(); }
+    SqliteDb& GetDb() { return m_db; }
+
+    bool SavePolicy(const InputPolicy& policy,
+                    std::optional<uint64_t> expectedRevision = std::nullopt,
+                    std::string* errorOut = nullptr,
+                    uint64_t* outRevision = nullptr,
+                    bool* outConflict = nullptr);
+    std::shared_ptr<const InputPolicy> GetPolicy() const;
+    bool ResetAllStats();
+    int64_t GetLastResetStatsAt();
 
 private:
+    mutable std::mutex m_policySaveMutex;
     std::shared_ptr<IClock> m_clock;
     SqliteDb m_db;
     std::unique_ptr<EntryRepository> m_repo;
     PinyinSegmenter m_pinyinSegmenter;
     BuiltinDictionary m_builtinDict;
     std::unique_ptr<Ranker> m_ranker;
+    std::unique_ptr<InputCoordinator> m_coordinator;
     bool m_initialized = false;
 };
 

@@ -1,9 +1,11 @@
 #include "entry_repository.h"
+#include "../dictionary/builtin_dict.h"
 #include <cmath>
 #include <sstream>
 #include <random>
 #include <iomanip>
 #include <unordered_map>
+#include <set>
 
 namespace ime {
 
@@ -132,10 +134,20 @@ bool EntryRepository::SetEntryCodes(const std::string& entryId, const std::vecto
     int64_t now = m_clock->Now();
     SqliteDb::Transaction tx(m_db);
     if (!tx.IsStarted()) return false;
-    if (!GetEntry(entryId)) return false;
+    if (HasPendingCommitsForEntry(entryId)) {
+        tx.Rollback();
+        return false;
+    }
+    if (!GetEntry(entryId)) {
+        tx.Rollback();
+        return false;
+    }
 
     auto stmtDel = m_db.Prepare("DELETE FROM entry_codes WHERE entry_id = ?;");
-    if (!stmtDel) return false;
+    if (!stmtDel) {
+        tx.Rollback();
+        return false;
+    }
     stmtDel->BindText(1, entryId);
     if (!stmtDel->Execute()) {
         tx.Rollback();
@@ -174,9 +186,16 @@ bool EntryRepository::UpdateEntry(const std::string& entryId, const std::wstring
     int64_t now = m_clock->Now();
     SqliteDb::Transaction tx(m_db);
     if (!tx.IsStarted()) return false;
+    if (HasPendingCommitsForEntry(entryId)) {
+        tx.Rollback();
+        return false;
+    }
 
     auto stmt = m_db.Prepare("UPDATE entries SET text = ?, updated_at = ? WHERE id = ?;");
-    if (!stmt) return false;
+    if (!stmt) {
+        tx.Rollback();
+        return false;
+    }
     stmt->BindText(1, WideToUtf8(newText));
     stmt->BindInt64(2, now);
     stmt->BindText(3, entryId);
@@ -227,21 +246,37 @@ bool EntryRepository::UpdateEntry(const std::string& entryId, const std::wstring
 bool EntryRepository::UpdateEntryText(const std::string& entryId, const std::wstring& newText) {
     if (entryId.empty() || !IsValidText(newText)) return false;
     int64_t now = m_clock->Now();
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+    if (HasPendingCommitsForEntry(entryId)) {
+        tx.Rollback();
+        return false;
+    }
     std::string textUtf8 = WideToUtf8(newText);
 
     auto stmt = m_db.Prepare("UPDATE entries SET text = ?, updated_at = ? WHERE id = ?;");
-    if (!stmt) return false;
+    if (!stmt) {
+        tx.Rollback();
+        return false;
+    }
     stmt->BindText(1, textUtf8);
     stmt->BindInt64(2, now);
     stmt->BindText(3, entryId);
-    if (!stmt->Execute() || m_db.Changes() == 0) return false;
-    return true;
+    if (!stmt->Execute() || m_db.Changes() == 0) {
+        tx.Rollback();
+        return false;
+    }
+    return tx.Commit();
 }
 
 bool EntryRepository::DeleteEntry(const std::string& entryId) {
     if (entryId.empty()) return false;
     SqliteDb::Transaction tx(m_db);
     if (!tx.IsStarted()) return false;
+    if (HasPendingCommitsForEntry(entryId)) {
+        tx.Rollback();
+        return false;
+    }
 
     auto stmt = m_db.Prepare("DELETE FROM entries WHERE id = ?;");
     if (!stmt) return false;
@@ -384,12 +419,17 @@ std::vector<Candidate> EntryRepository::QueryUserCandidates(InputScheme scheme, 
     )SQL";
 
     auto stmt = m_db.Prepare(sql);
-    if (!stmt) return result;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("QueryUserCandidates prepare failed: " + m_db.GetLastError());
+        }
+        return result;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     stmt->BindText(3, escapedLike);
 
-    std::unordered_map<std::string, size_t> entryIndexMap;
+    std::unordered_map<std::string, size_t> entryCodeMap;
 
     while (stmt->Step()) {
         std::string entryId = stmt->ColumnText(0);
@@ -398,15 +438,14 @@ std::vector<Candidate> EntryRepository::QueryUserCandidates(InputScheme scheme, 
 
         MatchQuality quality = (matchedCode == lowerCode) ? MatchQuality::ExactFull : MatchQuality::PrefixCompletion;
 
-        auto it = entryIndexMap.find(entryId);
-        if (it != entryIndexMap.end()) {
+        std::string mappingKey = entryId + ":" + matchedCode;
+        auto it = entryCodeMap.find(mappingKey);
+        if (it != entryCodeMap.end()) {
             Candidate& existing = result[it->second];
-            if (static_cast<int>(quality) < static_cast<int>(existing.quality) ||
-                (quality == existing.quality && matchedCode.length() < existing.matched_code.length())) {
+            if (static_cast<int>(quality) < static_cast<int>(existing.quality)) {
                 existing.quality = quality;
-                existing.matched_code = matchedCode;
             }
-            continue; // Deduplicate by entry_id: do not add duplicate candidate or multiply stats!
+            continue;
         }
 
         Candidate c;
@@ -432,8 +471,50 @@ std::vector<Candidate> EntryRepository::QueryUserCandidates(InputScheme scheme, 
             c.effective_count = CalculateDecayedCount(stat->effective_count, stat->last_decay_at, m_clock->Now());
         }
 
-        entryIndexMap[entryId] = result.size();
+        entryCodeMap[mappingKey] = result.size();
         result.push_back(std::move(c));
+    }
+    if (stmt->HasError()) {
+        throw std::runtime_error("QueryUserCandidates step failed: " + stmt->LastErrorMessage());
+    }
+    return result;
+}
+
+std::vector<std::string> EntryRepository::GetUserCodesForText(const std::wstring& text, InputScheme scheme) const {
+    std::vector<std::string> result;
+    if (text.empty()) return result;
+
+    std::string textUtf8 = WideToUtf8(text);
+    if (textUtf8.empty()) return result;
+
+    std::string sql;
+    if (scheme == InputScheme::Unknown) {
+        sql = "SELECT ec.code FROM entry_codes ec JOIN entries e ON ec.entry_id = e.id WHERE e.text = ? ORDER BY ec.id ASC;";
+    } else {
+        sql = "SELECT ec.code FROM entry_codes ec JOIN entries e ON ec.entry_id = e.id WHERE e.text = ? AND ec.scheme = ? ORDER BY ec.id ASC;";
+    }
+
+    auto stmt = m_db.Prepare(sql);
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("GetUserCodesForText prepare failed: " + m_db.GetLastError());
+        }
+        return result;
+    }
+    stmt->BindText(1, textUtf8);
+    if (scheme != InputScheme::Unknown) {
+        stmt->BindInt(2, static_cast<int>(scheme));
+    }
+
+    std::unordered_set<std::string> seen;
+    while (stmt->Step()) {
+        std::string code = stmt->ColumnText(0);
+        if (!code.empty() && seen.insert(code).second) {
+            result.push_back(std::move(code));
+        }
+    }
+    if (stmt->LastErrorCode() != SQLITE_DONE && stmt->LastErrorCode() != SQLITE_OK) {
+        throw std::runtime_error("GetUserCodesForText step failed: " + stmt->LastErrorMessage());
     }
     return result;
 }
@@ -449,22 +530,53 @@ bool EntryRepository::VerifyCandidateAffiliation(InputScheme scheme, const std::
         return true;
     }
 
-    std::string escapedLike = EscapeLike(lowerCode) + "%";
+    // Strip layout prefix if scoped code was passed (e.g. "natural:zhongwen" -> "zhongwen")
+    std::string cleanCode = lowerCode;
+    auto colonPos = cleanCode.find(':');
+    if (colonPos != std::string::npos) {
+        cleanCode = cleanCode.substr(colonPos + 1);
+    }
+
+    std::string cleanNoApos = cleanCode;
+    cleanNoApos.erase(std::remove(cleanNoApos.begin(), cleanNoApos.end(), '\''), cleanNoApos.end());
+
     const char* sql = R"SQL(
-        SELECT 1 FROM entry_codes ec
+        SELECT ec.code FROM entry_codes ec
         JOIN entries e ON ec.entry_id = e.id
-        WHERE e.id = ? AND ec.scheme = ? AND (ec.code = ? OR ec.code LIKE ? ESCAPE '\')
-        LIMIT 1;
+        WHERE e.id = ?
+          AND (ec.scheme = ? OR (? = 4 AND ec.scheme = 1));
     )SQL";
 
     auto stmt = m_db.Prepare(sql);
-    if (!stmt) return false;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("VerifyCandidateAffiliation prepare failed: " + m_db.GetLastError());
+        }
+        return false;
+    }
     stmt->BindText(1, entryId);
     stmt->BindInt(2, static_cast<int>(scheme));
-    stmt->BindText(3, lowerCode);
-    stmt->BindText(4, escapedLike);
+    stmt->BindInt(3, static_cast<int>(scheme)); // 4 is Shuangpin, 1 is Pinyin
 
-    return stmt->Step();
+    while (stmt->Step()) {
+        std::string rCode = stmt->ColumnText(0);
+        std::transform(rCode.begin(), rCode.end(), rCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+        if (rCode == cleanCode || rCode.rfind(cleanCode, 0) == 0) {
+            return true;
+        }
+
+        std::string rNoApos = rCode;
+        rNoApos.erase(std::remove(rNoApos.begin(), rNoApos.end(), '\''), rNoApos.end());
+        if (rNoApos == cleanNoApos || rNoApos.rfind(cleanNoApos, 0) == 0) {
+            return true;
+        }
+    }
+
+    if (stmt->HasError()) {
+        throw std::runtime_error("VerifyCandidateAffiliation step failed: " + stmt->LastErrorMessage());
+    }
+    return false;
 }
 
 bool EntryRepository::HasCommitEvent(const std::string& eventId) {
@@ -494,7 +606,12 @@ EntryRepository::CommitEventRecord EntryRepository::GetCommitEventRecord(const s
 bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     if (rec.event_id.empty()) return false;
     // Use INSERT (not REPLACE) so existing event IDs are never overwritten
-    auto stmt = m_db.Prepare("INSERT INTO pending_commits (event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?);");
+    auto stmt = m_db.Prepare(
+        "INSERT INTO pending_commits "
+        "(event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at, "
+        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+    );
     if (!stmt) return false;
     stmt->BindText(1, rec.event_id);
     stmt->BindInt64(2, static_cast<int64_t>(rec.session_id));
@@ -504,6 +621,15 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     stmt->BindText(6, rec.entry_id);
     stmt->BindText(7, WideToUtf8(rec.text));
     stmt->BindInt64(8, rec.created_at);
+    stmt->BindInt(9, rec.learning_enabled ? 1 : 0);
+    stmt->BindText(10, rec.layout_id);
+    stmt->BindText(11, rec.matched_code);
+    stmt->BindText(12, rec.resolved_code);
+
+    int64_t gEpoch = rec.global_epoch > 0 ? rec.global_epoch : GetGlobalStatsResetEpoch();
+    int64_t eEpoch = rec.entry_epoch > 0 ? rec.entry_epoch : GetEntryStatsResetEpoch(rec.entry_id);
+    stmt->BindInt64(13, gEpoch);
+    stmt->BindInt64(14, eEpoch);
     return stmt->Execute();
 }
 
@@ -576,7 +702,11 @@ bool EntryRepository::RecordCancel(const std::string& eventId, uint64_t sessionI
 
 bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& outRecords) {
     outRecords.clear();
-    auto stmt = m_db.Prepare("SELECT event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at FROM pending_commits;");
+    auto stmt = m_db.Prepare(
+        "SELECT event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at, "
+        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch "
+        "FROM pending_commits;"
+    );
     if (!stmt) return false;
     while (stmt->Step()) {
         PendingCommitRecord r;
@@ -588,6 +718,12 @@ bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& ou
         r.entry_id = stmt->ColumnText(5);
         r.text = Utf8ToWide(stmt->ColumnText(6));
         r.created_at = stmt->ColumnInt64(7);
+        r.learning_enabled = stmt->ColumnInt(8) != 0;
+        r.layout_id = stmt->ColumnText(9);
+        r.matched_code = stmt->ColumnText(10);
+        r.resolved_code = stmt->ColumnText(11);
+        r.global_epoch = stmt->ColumnInt64(12);
+        r.entry_epoch = stmt->ColumnInt64(13);
         outRecords.push_back(std::move(r));
     }
     if (stmt->HasError()) {
@@ -597,12 +733,41 @@ bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& ou
     return true;
 }
 
-bool EntryRepository::SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank) {
+bool EntryRepository::SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank,
+                                       std::optional<uint64_t> expectedRevision, uint64_t* outRevision, bool* outConflict) {
+    if (outConflict) *outConflict = false;
     if (code.empty() || entryId.empty()) return false;
     std::string lowerCode = code;
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
-    int64_t now = m_clock->Now();
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    // Builtin entry materialization inside transaction
+    if (isPinned && entryId.rfind("b_", 0) == 0) {
+        if (!m_builtinDict) {
+            tx.Rollback();
+            return false;
+        }
+        auto textOpt = m_builtinDict->GetTextById(entryId);
+        if (!textOpt || textOpt->empty()) {
+            tx.Rollback();
+            return false;
+        }
+        if (!EnsureBuiltinEntryExists(entryId, *textOpt)) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    uint64_t curRev = GetPinnedRevision(scheme, lowerCode);
+    if (expectedRevision.has_value() && *expectedRevision != curRev) {
+        if (outConflict) *outConflict = true;
+        tx.Rollback();
+        return false;
+    }
+
+    int64_t now = m_clock ? m_clock->Now() : 0;
     const char* sql = R"SQL(
         INSERT INTO sort_preferences (scheme, code, entry_id, is_pinned, order_rank, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -613,18 +778,34 @@ bool EntryRepository::SetPinPreference(InputScheme scheme, const std::string& co
     )SQL";
 
     auto stmt = m_db.Prepare(sql);
-    if (!stmt) return false;
+    if (!stmt) {
+        tx.Rollback();
+        return false;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     stmt->BindText(3, entryId);
     stmt->BindInt(4, isPinned ? 1 : 0);
     stmt->BindInt(5, orderRank);
     stmt->BindInt64(6, now);
-    return stmt->Execute();
+    if (!stmt->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    uint64_t nextRev = curRev + 1;
+    if (!SetPinnedRevision(scheme, lowerCode, nextRev)) {
+        tx.Rollback();
+        return false;
+    }
+    if (outRevision) *outRevision = nextRev;
+
+    return tx.Commit();
 }
 
-bool EntryRepository::UnpinPreference(InputScheme scheme, const std::string& code, const std::string& entryId) {
-    return SetPinPreference(scheme, code, entryId, false, 0);
+bool EntryRepository::UnpinPreference(InputScheme scheme, const std::string& code, const std::string& entryId,
+                                     std::optional<uint64_t> expectedRevision, uint64_t* outRevision, bool* outConflict) {
+    return SetPinPreference(scheme, code, entryId, false, 0, expectedRevision, outRevision, outConflict);
 }
 
 std::optional<SortPreference> EntryRepository::GetSortPreference(InputScheme scheme, const std::string& code, const std::string& entryId) {
@@ -632,11 +813,21 @@ std::optional<SortPreference> EntryRepository::GetSortPreference(InputScheme sch
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
     auto stmt = m_db.Prepare("SELECT is_pinned, order_rank FROM sort_preferences WHERE scheme = ? AND code = ? AND entry_id = ?;");
-    if (!stmt) return std::nullopt;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("GetSortPreference prepare failed: " + m_db.GetLastError());
+        }
+        return std::nullopt;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     stmt->BindText(3, entryId);
-    if (!stmt->Step()) return std::nullopt;
+    if (!stmt->Step()) {
+        if (stmt->HasError()) {
+            throw std::runtime_error("GetSortPreference step failed: " + stmt->LastErrorMessage());
+        }
+        return std::nullopt;
+    }
 
     SortPreference p;
     p.scheme = scheme;
@@ -671,7 +862,12 @@ std::vector<SortPreference> EntryRepository::GetPinnedPreferences(InputScheme sc
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
     auto stmt = m_db.Prepare("SELECT scheme, code, entry_id, is_pinned, order_rank FROM sort_preferences WHERE scheme = ? AND code = ? AND is_pinned = 1 ORDER BY order_rank ASC;");
-    if (!stmt) return list;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("GetPinnedPreferences prepare failed: " + m_db.GetLastError());
+        }
+        return list;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     while (stmt->Step()) {
@@ -683,20 +879,44 @@ std::vector<SortPreference> EntryRepository::GetPinnedPreferences(InputScheme sc
         p.order_rank = stmt->ColumnInt(4);
         list.push_back(std::move(p));
     }
+    if (stmt->HasError()) {
+        throw std::runtime_error("GetPinnedPreferences step failed: " + stmt->LastErrorMessage());
+    }
     return list;
 }
 
 bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
-                                   InputScheme scheme, const std::string& code, const std::string& entryId) {
+                                   InputScheme scheme, const std::string& code, const std::string& entryId,
+                                   bool updateStats,
+                                   InputScheme affiliationScheme,
+                                   const std::string& affiliationCode) {
     if (code.empty() || entryId.empty()) return false;
     int64_t now = m_clock->Now();
 
     std::string lowerCode = code;
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
+    InputScheme affScheme = (affiliationScheme != InputScheme::Unknown) ? affiliationScheme : scheme;
+    std::string affCode = !affiliationCode.empty() ? affiliationCode : lowerCode;
+
     // Verify candidate affiliation
-    if (!VerifyCandidateAffiliation(scheme, lowerCode, entryId)) {
-        return false;
+    if (!VerifyCandidateAffiliation(affScheme, affCode, entryId)) {
+        // Verified historical snapshot fallback (P1/Requirement 7):
+        // If entry was deleted or codes modified while commit was in-flight,
+        // verify against the verified pending_commits snapshot so WAL receipt is never lost!
+        bool hasVerifiedSnapshot = false;
+        if (!eventId.empty()) {
+            auto stmtPending = m_db.Prepare("SELECT entry_id FROM pending_commits WHERE event_id = ?;");
+            if (stmtPending) {
+                stmtPending->BindText(1, eventId);
+                if (stmtPending->Step() && stmtPending->ColumnText(0) == entryId) {
+                    hasVerifiedSnapshot = true;
+                }
+            }
+        }
+        if (!hasVerifiedSnapshot) {
+            return false;
+        }
     }
 
     SqliteDb::Transaction tx(m_db);
@@ -739,42 +959,70 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
         }
     }
 
-    // 2. Fetch existing stats for this exact (scheme, code, entry_id)
-    auto statOpt = GetStat(scheme, lowerCode, entryId);
-    int newCount = 1;
-    double newEff = 1.0;
-
-    if (statOpt) {
-        newCount = statOpt->selected_count + 1;
-        double decayed = CalculateDecayedCount(statOpt->effective_count, statOpt->last_decay_at, now);
-        newEff = decayed + 1.0;
+    // 2. Fetch existing stats for this exact (scheme, code, entry_id) and update if updateStats is true
+    if (updateStats) {
+        if (!eventId.empty()) {
+            auto stmtPending = m_db.Prepare("SELECT global_epoch, entry_epoch, created_at FROM pending_commits WHERE event_id = ?;");
+            if (stmtPending) {
+                stmtPending->BindText(1, eventId);
+                if (stmtPending->Step()) {
+                    int64_t pGlobalEpoch = stmtPending->ColumnInt64(0);
+                    int64_t pEntryEpoch = stmtPending->ColumnInt64(1);
+                    int64_t pCreatedAt = stmtPending->ColumnInt64(2);
+                    int64_t curGlobalEpoch = GetGlobalStatsResetEpoch();
+                    int64_t curEntryEpoch = GetEntryStatsResetEpoch(entryId);
+                    if (pGlobalEpoch < curGlobalEpoch || pEntryEpoch < curEntryEpoch) {
+                        updateStats = false; // Reset occurred after pending commit was created!
+                    }
+                    if (pGlobalEpoch == 0 && pEntryEpoch == 0) {
+                        // Legacy v3 records without monotonic epoch: conservatively compare against wall-clock
+                        int64_t lastReset = GetLastResetStatsAt();
+                        if (lastReset > 0 && pCreatedAt > 0 && pCreatedAt < lastReset) {
+                            updateStats = false;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    const char* sqlUpsert = R"SQL(
-        INSERT INTO entry_stats (scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(scheme, code, entry_id) DO UPDATE SET
-            selected_count = excluded.selected_count,
-            last_selected_at = excluded.last_selected_at,
-            effective_count = excluded.effective_count,
-            last_decay_at = excluded.last_decay_at;
-    )SQL";
+    if (updateStats) {
+        auto statOpt = GetStat(scheme, lowerCode, entryId);
+        int newCount = 1;
+        double newEff = 1.0;
 
-    auto stmtStat = m_db.Prepare(sqlUpsert);
-    if (!stmtStat) {
-        tx.Rollback();
-        return false;
-    }
-    stmtStat->BindInt(1, static_cast<int>(scheme));
-    stmtStat->BindText(2, lowerCode);
-    stmtStat->BindText(3, entryId);
-    stmtStat->BindInt(4, newCount);
-    stmtStat->BindInt64(5, now);
-    stmtStat->BindDouble(6, newEff);
-    stmtStat->BindInt64(7, now);
-    if (!stmtStat->Execute()) {
-        tx.Rollback();
-        return false;
+        if (statOpt) {
+            newCount = statOpt->selected_count + 1;
+            double decayed = CalculateDecayedCount(statOpt->effective_count, statOpt->last_decay_at, now);
+            newEff = decayed + 1.0;
+        }
+
+        const char* sqlUpsert = R"SQL(
+            INSERT INTO entry_stats (scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scheme, code, entry_id) DO UPDATE SET
+                selected_count = excluded.selected_count,
+                last_selected_at = excluded.last_selected_at,
+                effective_count = excluded.effective_count,
+                last_decay_at = excluded.last_decay_at;
+        )SQL";
+
+        auto stmtStat = m_db.Prepare(sqlUpsert);
+        if (!stmtStat) {
+            tx.Rollback();
+            return false;
+        }
+        stmtStat->BindInt(1, static_cast<int>(scheme));
+        stmtStat->BindText(2, lowerCode);
+        stmtStat->BindText(3, entryId);
+        stmtStat->BindInt(4, newCount);
+        stmtStat->BindInt64(5, now);
+        stmtStat->BindDouble(6, newEff);
+        stmtStat->BindInt64(7, now);
+        if (!stmtStat->Execute()) {
+            tx.Rollback();
+            return false;
+        }
     }
 
     if (!eventId.empty()) {
@@ -891,7 +1139,12 @@ std::vector<EntryStat> EntryRepository::GetActiveStats(InputScheme scheme, const
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
     auto stmt = m_db.Prepare("SELECT scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at FROM entry_stats WHERE scheme = ? AND code = ? AND selected_count > 0;");
-    if (!stmt) return list;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("GetActiveStats prepare failed: " + m_db.GetLastError());
+        }
+        return list;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     while (stmt->Step()) {
@@ -905,6 +1158,9 @@ std::vector<EntryStat> EntryRepository::GetActiveStats(InputScheme scheme, const
         s.last_decay_at = stmt->ColumnInt64(6);
         list.push_back(std::move(s));
     }
+    if (stmt->HasError()) {
+        throw std::runtime_error("GetActiveStats step failed: " + stmt->LastErrorMessage());
+    }
     return list;
 }
 
@@ -913,11 +1169,21 @@ std::optional<EntryStat> EntryRepository::GetStat(InputScheme scheme, const std:
     std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
 
     auto stmt = m_db.Prepare("SELECT selected_count, last_selected_at, effective_count, last_decay_at FROM entry_stats WHERE scheme = ? AND code = ? AND entry_id = ?;");
-    if (!stmt) return std::nullopt;
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("GetStat prepare failed: " + m_db.GetLastError());
+        }
+        return std::nullopt;
+    }
     stmt->BindInt(1, static_cast<int>(scheme));
     stmt->BindText(2, lowerCode);
     stmt->BindText(3, entryId);
-    if (!stmt->Step()) return std::nullopt;
+    if (!stmt->Step()) {
+        if (stmt->HasError()) {
+            throw std::runtime_error("GetStat step failed: " + stmt->LastErrorMessage());
+        }
+        return std::nullopt;
+    }
 
     EntryStat s;
     s.selected_count = stmt->ColumnInt(0);
@@ -927,17 +1193,58 @@ std::optional<EntryStat> EntryRepository::GetStat(InputScheme scheme, const std:
     return s;
 }
 
+int64_t EntryRepository::GetGlobalStatsResetEpoch() {
+    auto val = GetMetaSetting("global_stats_reset_epoch");
+    if (!val || val->empty()) return 1;
+    try {
+        return std::stoll(*val);
+    } catch (...) {
+        return 1;
+    }
+}
+
+int64_t EntryRepository::GetEntryStatsResetEpoch(const std::string& entryId) {
+    if (entryId.empty()) return 1;
+    auto stmt = m_db.Prepare("SELECT reset_epoch FROM entry_resets WHERE entry_id = ?;");
+    if (!stmt) return 1;
+    stmt->BindText(1, entryId);
+    if (stmt->Step()) {
+        return stmt->ColumnInt64(0);
+    }
+    return 1;
+}
+
 bool EntryRepository::ResetStats(const std::string& entryId) {
+    if (entryId.empty()) {
+        return ResetAllStats();
+    }
     SqliteDb::Transaction tx(m_db);
     if (!tx.IsStarted()) return false;
-    if (entryId.empty()) {
-        if (!m_db.Execute("DELETE FROM entry_stats; DELETE FROM commit_events;")) return false;
-    } else {
-        auto stmt = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
-        if (!stmt) return false;
-        stmt->BindText(1, entryId);
-        if (!stmt->Execute()) return false;
+
+    auto stmt = m_db.Prepare("DELETE FROM entry_stats WHERE entry_id = ?;");
+    if (!stmt) {
+        tx.Rollback();
+        return false;
     }
+    stmt->BindText(1, entryId);
+    if (!stmt->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    int64_t curEpoch = GetEntryStatsResetEpoch(entryId);
+    auto stmtEpoch = m_db.Prepare("INSERT OR REPLACE INTO entry_resets (entry_id, reset_epoch) VALUES (?, ?);");
+    if (!stmtEpoch) {
+        tx.Rollback();
+        return false;
+    }
+    stmtEpoch->BindText(1, entryId);
+    stmtEpoch->BindInt64(2, curEpoch + 1);
+    if (!stmtEpoch->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
     return tx.Commit();
 }
 
@@ -951,6 +1258,211 @@ bool EntryRepository::EnsureBuiltinEntryExists(const std::string& entryId, const
     stmt->BindInt64(3, now);
     stmt->BindInt64(4, now);
     return stmt->Execute();
+}
+
+bool EntryRepository::ResetAllStats() {
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+    if (!m_db.Execute("DELETE FROM entry_stats;")) {
+        tx.Rollback();
+        return false;
+    }
+    if (!m_db.Execute("DELETE FROM entry_resets;")) {
+        tx.Rollback();
+        return false;
+    }
+    int64_t curEpoch = GetGlobalStatsResetEpoch();
+    if (!SetMetaSetting("global_stats_reset_epoch", std::to_string(curEpoch + 1))) {
+        tx.Rollback();
+        return false;
+    }
+    int64_t now = m_clock ? m_clock->Now() : 0;
+    SetLastResetStatsAt(now);
+    return tx.Commit();
+}
+
+int64_t EntryRepository::GetLastResetStatsAt() {
+    auto val = GetMetaSetting("last_reset_stats_at");
+    if (!val || val->empty()) return 0;
+    try {
+        return std::stoll(*val);
+    } catch (...) {
+        return 0;
+    }
+}
+
+void EntryRepository::SetLastResetStatsAt(int64_t ts) {
+    SetMetaSetting("last_reset_stats_at", std::to_string(ts));
+}
+
+bool EntryRepository::ReorderPinnedEntries(InputScheme scheme, const std::string& code, const std::vector<std::string>& entryIds,
+                                          std::optional<uint64_t> expectedRevision, uint64_t* outRevision, bool* outConflict) {
+    if (outConflict) *outConflict = false;
+    if (code.empty()) return false;
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    // Validate entryIds: no empty IDs, no duplicates
+    std::set<std::string> seenIds;
+    for (const auto& eid : entryIds) {
+        if (eid.empty()) return false;
+        if (!seenIds.insert(eid).second) return false;
+    }
+
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    // Builtin entry materialization inside transaction
+    for (const auto& eid : entryIds) {
+        if (eid.rfind("b_", 0) == 0) {
+            if (!m_builtinDict) {
+                tx.Rollback();
+                return false;
+            }
+            auto textOpt = m_builtinDict->GetTextById(eid);
+            if (!textOpt || textOpt->empty()) {
+                tx.Rollback();
+                return false;
+            }
+            if (!EnsureBuiltinEntryExists(eid, *textOpt)) {
+                tx.Rollback();
+                return false;
+            }
+        }
+    }
+
+    uint64_t curRev = GetPinnedRevision(scheme, lowerCode);
+    if (expectedRevision.has_value() && *expectedRevision != curRev) {
+        if (outConflict) *outConflict = true;
+        tx.Rollback();
+        return false;
+    }
+
+    int64_t now = m_clock ? m_clock->Now() : 0;
+
+    // Unpin existing items for this code
+    auto stmtUnpin = m_db.Prepare("UPDATE sort_preferences SET is_pinned = 0, order_rank = 0, updated_at = ? WHERE scheme = ? AND code = ?;");
+    if (!stmtUnpin) {
+        tx.Rollback();
+        return false;
+    }
+    stmtUnpin->BindInt64(1, now);
+    stmtUnpin->BindInt(2, static_cast<int>(scheme));
+    stmtUnpin->BindText(3, lowerCode);
+    if (!stmtUnpin->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    const char* sqlUpsert = R"SQL(
+        INSERT INTO sort_preferences (scheme, code, entry_id, is_pinned, order_rank, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT(scheme, code, entry_id) DO UPDATE SET
+            is_pinned = 1,
+            order_rank = excluded.order_rank,
+            updated_at = excluded.updated_at;
+    )SQL";
+    auto stmtUpsert = m_db.Prepare(sqlUpsert);
+    if (!stmtUpsert) {
+        tx.Rollback();
+        return false;
+    }
+
+    for (size_t i = 0; i < entryIds.size(); ++i) {
+        stmtUpsert->Reset();
+        stmtUpsert->BindInt(1, static_cast<int>(scheme));
+        stmtUpsert->BindText(2, lowerCode);
+        stmtUpsert->BindText(3, entryIds[i]);
+        stmtUpsert->BindInt(4, static_cast<int>(i + 1));
+        stmtUpsert->BindInt64(5, now);
+        if (!stmtUpsert->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    uint64_t nextRev = curRev + 1;
+    if (!SetPinnedRevision(scheme, lowerCode, nextRev)) {
+        tx.Rollback();
+        return false;
+    }
+    if (outRevision) *outRevision = nextRev;
+
+    return tx.Commit();
+}
+
+uint64_t EntryRepository::GetPinnedRevision(InputScheme scheme, const std::string& code) {
+    if (code.empty()) return 1;
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::string key = "pin_rev:" + SchemeToString(scheme) + ":" + lowerCode;
+    auto val = GetMetaSetting(key);
+    if (!val || val->empty()) return 1;
+    try {
+        return std::stoull(*val);
+    } catch (...) {
+        return 1;
+    }
+}
+
+bool EntryRepository::SetPinnedRevision(InputScheme scheme, const std::string& code, uint64_t revision) {
+    if (code.empty()) return false;
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::string key = "pin_rev:" + SchemeToString(scheme) + ":" + lowerCode;
+    return SetMetaSetting(key, std::to_string(revision));
+}
+
+bool EntryRepository::SetMetaSetting(const std::string& key, const std::string& value) {
+    if (key.empty()) return false;
+    auto stmt = m_db.Prepare("INSERT INTO meta_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;");
+    if (!stmt) return false;
+    stmt->BindText(1, key);
+    stmt->BindText(2, value);
+    return stmt->Execute();
+}
+
+std::optional<std::string> EntryRepository::GetMetaSetting(const std::string& key) {
+    if (key.empty()) return std::nullopt;
+    auto stmt = m_db.Prepare("SELECT value FROM meta_settings WHERE key = ?;");
+    if (!stmt) return std::nullopt;
+    stmt->BindText(1, key);
+    if (stmt->Step()) {
+        return stmt->ColumnText(0);
+    }
+    return std::nullopt;
+}
+
+bool EntryRepository::HasPendingCommitsForEntry(const std::string& entryId) {
+    if (entryId.empty()) return false;
+    auto stmt = m_db.Prepare("SELECT 1 FROM pending_commits WHERE entry_id = ? LIMIT 1;");
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("HasPendingCommitsForEntry prepare failed: " + m_db.GetLastError());
+        }
+        return false;
+    }
+    stmt->BindText(1, entryId);
+    bool has = stmt->Step();
+    if (stmt->HasError()) {
+        throw std::runtime_error("HasPendingCommitsForEntry step failed: " + stmt->LastErrorMessage());
+    }
+    return has;
+}
+
+bool EntryRepository::HasAnyPendingCommits() {
+    auto stmt = m_db.Prepare("SELECT 1 FROM pending_commits LIMIT 1;");
+    if (!stmt) {
+        if (m_db.GetLastErrorCode() != SQLITE_OK && m_db.GetLastErrorCode() != SQLITE_DONE) {
+            throw std::runtime_error("HasAnyPendingCommits prepare failed: " + m_db.GetLastError());
+        }
+        return false;
+    }
+    bool has = stmt->Step();
+    if (stmt->HasError()) {
+        throw std::runtime_error("HasAnyPendingCommits step failed: " + stmt->LastErrorMessage());
+    }
+    return has;
 }
 
 } // namespace ime

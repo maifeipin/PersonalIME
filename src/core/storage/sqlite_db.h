@@ -23,12 +23,16 @@ public:
     bool Open(const std::string& path);
     void Close();
     bool IsOpen() const { return m_db != nullptr; }
+    const std::string& GetPath() const { return m_path; }
 
     bool Execute(const std::string& sql);
     int64_t LastInsertRowId() const;
     int Changes() const;
 
     std::unique_ptr<Statement> Prepare(const std::string& sql);
+
+    std::string GetLastError() const;
+    int GetLastErrorCode() const;
 
     std::recursive_mutex& GetMutex() { return m_mutex; }
     sqlite3* GetRawHandle() { return m_db; }
@@ -51,6 +55,7 @@ public:
 
 private:
     sqlite3* m_db = nullptr;
+    std::string m_path;
     std::recursive_mutex m_mutex;
     int m_transactionDepth = 0;
 };

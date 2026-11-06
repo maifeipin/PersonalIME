@@ -40,11 +40,18 @@ STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv) {
 
 static BOOL SetRegString(HKEY hRoot, const wchar_t* subkey, const wchar_t* name, const wchar_t* data) {
     HKEY hKey;
-    if (RegCreateKeyExW(hRoot, subkey, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+    LONG res = RegCreateKeyExW(hRoot, subkey, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
+    if (res == ERROR_ACCESS_DENIED && hRoot == HKEY_CLASSES_ROOT) {
+        // Fallback to Per-User COM registration under HKCU\Software\Classes
+        wchar_t userSubkey[MAX_PATH];
+        StringCchPrintfW(userSubkey, ARRAYSIZE(userSubkey), L"Software\\Classes\\%s", subkey);
+        res = RegCreateKeyExW(HKEY_CURRENT_USER, userSubkey, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr);
+    }
+    if (res != ERROR_SUCCESS) {
         return FALSE;
     }
     DWORD bytes = static_cast<DWORD>((wcslen(data) + 1) * sizeof(wchar_t));
-    LONG res = RegSetValueExW(hKey, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(data), bytes);
+    res = RegSetValueExW(hKey, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(data), bytes);
     RegCloseKey(hKey);
     return (res == ERROR_SUCCESS);
 }
@@ -164,6 +171,10 @@ STDAPI DllUnregisterServer() {
     wchar_t szKey[MAX_PATH];
     StringCchPrintfW(szKey, ARRAYSIZE(szKey), L"CLSID\\%s", szClsid);
     RegDeleteTreeW(HKEY_CLASSES_ROOT, szKey);
+
+    wchar_t szUserKey[MAX_PATH];
+    StringCchPrintfW(szUserKey, ARRAYSIZE(szUserKey), L"Software\\Classes\\CLSID\\%s", szClsid);
+    RegDeleteTreeW(HKEY_CURRENT_USER, szUserKey);
 
     return S_OK;
 }

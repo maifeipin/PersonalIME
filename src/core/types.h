@@ -21,7 +21,8 @@ enum class InputScheme : int {
     Unknown = 0,
     Pinyin = 1,
     Wubi86 = 2,
-    Custom = 3
+    Custom = 3,
+    Shuangpin = 4
 };
 
 inline std::string SchemeToString(InputScheme s) {
@@ -29,6 +30,7 @@ inline std::string SchemeToString(InputScheme s) {
         case InputScheme::Pinyin: return "pinyin";
         case InputScheme::Wubi86: return "wubi";
         case InputScheme::Custom: return "custom";
+        case InputScheme::Shuangpin: return "shuangpin";
         default: return "unknown";
     }
 }
@@ -39,6 +41,7 @@ inline InputScheme SchemeFromString(const std::string& str) {
     if (lower == "pinyin" || lower == "py") return InputScheme::Pinyin;
     if (lower == "wubi" || lower == "wubi86" || lower == "wb") return InputScheme::Wubi86;
     if (lower == "custom" || lower == "phrase") return InputScheme::Custom;
+    if (lower == "shuangpin" || lower == "sp") return InputScheme::Shuangpin;
     return InputScheme::Unknown;
 }
 
@@ -72,6 +75,13 @@ inline bool IsValidCode(InputScheme scheme, const std::string& code) {
             for (char c : code) {
                 unsigned char uc = static_cast<unsigned char>(c);
                 if (uc < 33 || uc > 126) return false; // printable ASCII, no whitespace
+            }
+            return true;
+        }
+        case InputScheme::Shuangpin: {
+            for (char c : code) {
+                char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if ((lower < 'a' || lower > 'z') && lower != ';' && lower != '\'') return false;
             }
             return true;
         }
@@ -141,6 +151,17 @@ struct Candidate {
     int64_t last_selected_at = 0;
     EntrySource source = EntrySource::Builtin;
     std::string explain_info;
+
+    // Stage 4 full provenance fields
+    std::string dict_id;         // e.g. "dict_custom", "dict_builtin_wubi", "dict_builtin_pinyin"
+    std::string layout_id;       // e.g. "natural", "ms", "xiaohe", or ""
+    std::string raw_code;        // User typed raw input
+    std::string resolved_code;   // Actual resolved code/syllable used for lookup
+    int method_priority = 0;     // 0 = primary method, 1, 2... for active input methods order
+
+    // Stage 4C-2 reverse lookup linkage
+    std::string reverse_lookup_code;      // Reverse lookup code (e.g. "aaaa" or "gong")
+    bool is_reverse_char_by_char = false; // true if derived from char-by-char decomposition
 };
 
 struct Entry {

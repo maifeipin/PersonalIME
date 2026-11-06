@@ -784,6 +784,218 @@ static int TestReviewRound2Probes() {
 
 #include "stage2_finalization_tests.h"
 
+static int TestStage4C2ReverseLookupCore(ImeEngine& engine) {
+    std::cout << "[TEST] Running Stage 4C-2 Reverse Lookup Core & Decomposition Suite..." << std::endl;
+
+    const auto& dict = engine.GetBuiltinDict();
+    TEST_ASSERT(dict.IsLoaded(), "Builtin dictionary must be loaded");
+
+    // 1. Built-in Dictionary Text-to-Code Reverse Lookup
+    {
+        // 1.1 Wubi86
+        auto wbGong = dict.ReverseLookupWubi(L"工");
+        TEST_ASSERT(!wbGong.empty(), "ReverseLookupWubi for '工' must return codes");
+        TEST_ASSERT(wbGong[0] == "aaaa", "Primary Wubi code for '工' must be full code 'aaaa'");
+        TEST_ASSERT(std::find(wbGong.begin(), wbGong.end(), "a") != wbGong.end(), "Wubi codes must include short code 'a'");
+
+        auto wbGongqi = dict.ReverseLookupWubi(L"工期");
+        TEST_ASSERT(!wbGongqi.empty(), "ReverseLookupWubi for '工期' must return codes");
+        TEST_ASSERT(wbGongqi[0] == "aaad", "Wubi code for '工期' must be 'aaad'");
+
+        // 1.2 Pinyin
+        auto pyGong = dict.ReverseLookupPinyin(L"工");
+        TEST_ASSERT(!pyGong.empty(), "ReverseLookupPinyin for '工' must return codes");
+        TEST_ASSERT(pyGong[0] == "gong", "Pinyin code for '工' must be 'gong'");
+
+        auto pyZhongwen = dict.ReverseLookupPinyin(L"中文");
+        TEST_ASSERT(!pyZhongwen.empty(), "ReverseLookupPinyin for '中文' must return codes");
+        TEST_ASSERT(pyZhongwen[0] == "zhongwen", "Pinyin code for '中文' must be 'zhongwen'");
+
+        // 1.3 Shuangpin via Builtin Dictionary
+        ShuangpinDecoder decNatural(ShuangpinLayout::Natural);
+        ShuangpinDecoder decMS(ShuangpinLayout::Microsoft);
+        ShuangpinDecoder decXiaohe(ShuangpinLayout::Xiaohe);
+
+        auto spNatural = dict.ReverseLookupShuangpin(L"中文", decNatural);
+        TEST_ASSERT(!spNatural.empty() && spNatural[0] == "vswf", "Shuangpin Natural for '中文' must be 'vswf'");
+
+        auto spXiaohe = dict.ReverseLookupShuangpin(L"中文", decXiaohe);
+        TEST_ASSERT(!spXiaohe.empty() && spXiaohe[0] == "vswf", "Shuangpin Xiaohe for '中文' must be 'vswf'");
+
+        auto spGong = dict.ReverseLookupShuangpin(L"工", decNatural);
+        TEST_ASSERT(!spGong.empty() && spGong[0] == "gs", "Shuangpin Natural for '工' must be 'gs'");
+    }
+
+    // 2. Direct Shuangpin Encoder Unit Tests (Zero-initials & Phonotactics)
+    {
+        ShuangpinDecoder decNatural(ShuangpinLayout::Natural);
+        ShuangpinDecoder decMS(ShuangpinLayout::Microsoft);
+
+        TEST_ASSERT(decNatural.EncodePinyinSyllable("a") == "aa", "Natural 'a' -> 'aa'");
+        TEST_ASSERT(decMS.EncodePinyinSyllable("a") == "oa", "MS 'a' -> 'oa'");
+        TEST_ASSERT(decNatural.EncodePinyinSyllable("er") == "er", "Natural 'er' -> 'er'");
+        TEST_ASSERT(decMS.EncodePinyinSyllable("er") == "or", "MS 'er' -> 'or'");
+        TEST_ASSERT(decNatural.EncodePinyinSyllable("ang") == "ah", "Natural 'ang' -> 'ah'");
+        TEST_ASSERT(decMS.EncodePinyinSyllable("ang") == "oh", "MS 'ang' -> 'oh'");
+        TEST_ASSERT(decNatural.EncodePinyinSyllable("zhong") == "vs", "Natural 'zhong' -> 'vs'");
+        TEST_ASSERT(decNatural.EncodePinyinSyllable("wen") == "wf", "Natural 'wen' -> 'wf'");
+    }
+
+    // 3. InputCoordinator Reverse Lookup Contract (User priority, whole-word, char-by-char, no guessing)
+    {
+        auto coord = engine.GetCoordinator();
+        TEST_ASSERT(coord != nullptr, "Coordinator must be available");
+
+        // 3.1 Whole-word builtin lookup
+        auto resGong = coord->ReverseLookup(L"工", InputScheme::Wubi86);
+        TEST_ASSERT(resGong.found, "ReverseLookup for '工' must be found");
+        TEST_ASSERT(resGong.is_phrase, "'工' must be recognized as whole-word/phrase");
+        TEST_ASSERT(resGong.primary_code == "aaaa", "Primary code for '工' must be 'aaaa'");
+
+        // 3.2 User custom entry priority over builtin
+        std::string customId = engine.AddUserEntry(L"测试置顶工", {
+            {InputScheme::Wubi86, "aaaa"},
+            {InputScheme::Pinyin, "ceshi"}
+        });
+        TEST_ASSERT(!customId.empty(), "Create custom entry");
+
+        auto resCustomWb = coord->ReverseLookup(L"测试置顶工", InputScheme::Wubi86);
+        TEST_ASSERT(resCustomWb.found, "Custom entry reverse lookup found");
+        TEST_ASSERT(resCustomWb.is_phrase, "Custom entry must be whole-word");
+        TEST_ASSERT(resCustomWb.primary_code == "aaaa", "Custom entry explicitly bound code prioritized");
+
+        // 3.3 Char-by-Char Decomposition (逐字拆码)
+        // '工期工': not in dictionary as a whole-word
+        auto resDecomp = coord->ReverseLookup(L"工期工", InputScheme::Wubi86);
+        TEST_ASSERT(resDecomp.found, "Char-by-char decomposition for '工期工' must succeed");
+        TEST_ASSERT(!resDecomp.is_phrase, "Char-by-char decomposition must have is_phrase=false");
+        TEST_ASSERT(resDecomp.char_codes.size() == 3, "char_codes must have 3 elements");
+        TEST_ASSERT(resDecomp.char_codes[0] == "aaaa", "Char 0 is 'aaaa'");
+        TEST_ASSERT(resDecomp.char_codes[1] == "adwe", "Char 1 is 'adwe'");
+        TEST_ASSERT(resDecomp.char_codes[2] == "aaaa", "Char 2 is 'aaaa'");
+        TEST_ASSERT(resDecomp.primary_code == "aaaa adwe aaaa", "Decomposition primary code must be space-joined");
+
+        // 3.4 '查不到不猜造' Negative Case: text containing unknown symbol
+        auto resMissing = coord->ReverseLookup(L"工⚡", InputScheme::Wubi86);
+        TEST_ASSERT(!resMissing.found, "Text containing non-existent characters must NOT be found (no fictitious guessing)");
+        TEST_ASSERT(resMissing.primary_code.empty(), "Code must be empty when not found");
+        TEST_ASSERT(resMissing.all_codes.empty(), "All codes empty when not found");
+
+        // 3.5 Candidate Hint Annotation via Policy Switch
+        InputPolicy policyOn;
+        policyOn.primary_method = InputScheme::Pinyin;
+        policyOn.reverse_lookup.enabled = true;
+        policyOn.reverse_lookup.target_method = InputScheme::Wubi86;
+
+        auto qrOn = coord->Query("gong", std::make_shared<InputPolicy>(policyOn));
+        TEST_ASSERT(!qrOn.candidates.empty(), "Query 'gong' must return candidates");
+        auto itGong = std::find_if(qrOn.candidates.begin(), qrOn.candidates.end(),
+            [](const ime::Candidate& c) { return c.text == L"工"; });
+        TEST_ASSERT(itGong != qrOn.candidates.end(), "Candidate list must contain '工'");
+        TEST_ASSERT(itGong->reverse_lookup_code == "aaaa", "Candidate must carry reverse lookup code 'aaaa'");
+
+        InputPolicy policyOff;
+        policyOff.primary_method = InputScheme::Pinyin;
+        policyOff.reverse_lookup.enabled = false;
+        auto qrOff = coord->Query("gong", std::make_shared<InputPolicy>(policyOff));
+        TEST_ASSERT(!qrOff.candidates.empty(), "Query 'gong' without reverse lookup");
+        auto itGongOff = std::find_if(qrOff.candidates.begin(), qrOff.candidates.end(),
+            [](const ime::Candidate& c) { return c.text == L"工"; });
+        TEST_ASSERT(itGongOff != qrOff.candidates.end(), "Candidate list without reverse lookup must contain '工'");
+        TEST_ASSERT(itGongOff->reverse_lookup_code.empty(), "Reverse lookup code must be empty when disabled");
+
+        // 3.6 P1 Fix: Canonical Syllable Contract (xian vs xi'an, no spurious segmentations)
+        std::string idSingle = engine.AddUserEntry(L"ROUND_SINGLE", {
+            {InputScheme::Pinyin, "xian"}
+        });
+        TEST_ASSERT(!idSingle.empty(), "Add ROUND_SINGLE with xian");
+
+        std::string idSplit = engine.AddUserEntry(L"ROUND_SPLIT", {
+            {InputScheme::Pinyin, "xi'an"}
+        });
+        TEST_ASSERT(!idSplit.empty(), "Add ROUND_SPLIT with xi'an");
+
+        std::string idBoth = engine.AddUserEntry(L"ROUND_BOTH", {
+            {InputScheme::Pinyin, "xian"},
+            {InputScheme::Pinyin, "xi'an"}
+        });
+        TEST_ASSERT(!idBoth.empty(), "Add ROUND_BOTH with xian and xi'an");
+
+        // ROUND_SINGLE: must ONLY produce 'xm' under Natural layout, NEVER 'xian'
+        auto resSingleSp = coord->ReverseLookup(L"ROUND_SINGLE", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resSingleSp.found, "ROUND_SINGLE found in Shuangpin");
+        TEST_ASSERT(resSingleSp.primary_code == "xm", "ROUND_SINGLE primary code is 'xm'");
+        TEST_ASSERT(resSingleSp.all_codes.size() == 1, "ROUND_SINGLE all_codes has exactly 1 code");
+        TEST_ASSERT(resSingleSp.all_codes[0] == "xm", "ROUND_SINGLE all_codes contains 'xm'");
+        // Crucial: 'xian' must NOT be in all_codes!
+        for (const auto& c : resSingleSp.all_codes) {
+            TEST_ASSERT(c != "xian", "ROUND_SINGLE must NOT contain 'xian' in reverse lookup codes");
+            // Must forward recall original entry
+            auto cands = coord->QueryScopedCandidates(InputScheme::Shuangpin, "natural", c, "");
+            bool foundOrig = std::any_of(cands.begin(), cands.end(), [&](const auto& cd) { return cd.entry_id == idSingle; });
+            TEST_ASSERT(foundOrig, "Reverse code must forward recall original entry");
+        }
+
+        // ROUND_SPLIT: must ONLY produce 'xian' under Natural layout, NEVER 'xm'
+        auto resSplitSp = coord->ReverseLookup(L"ROUND_SPLIT", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resSplitSp.found, "ROUND_SPLIT found in Shuangpin");
+        TEST_ASSERT(resSplitSp.primary_code == "xian", "ROUND_SPLIT primary code is 'xian'");
+        TEST_ASSERT(resSplitSp.all_codes.size() == 1, "ROUND_SPLIT all_codes has exactly 1 code");
+        for (const auto& c : resSplitSp.all_codes) {
+            TEST_ASSERT(c != "xm", "ROUND_SPLIT must NOT contain 'xm'");
+            auto cands = coord->QueryScopedCandidates(InputScheme::Shuangpin, "natural", c, "");
+            bool foundOrig = std::any_of(cands.begin(), cands.end(), [&](const auto& cd) { return cd.entry_id == idSplit; });
+            TEST_ASSERT(foundOrig, "Reverse code 'xian' must forward recall ROUND_SPLIT");
+        }
+
+        // ROUND_BOTH: must produce BOTH 'xm' and 'xian' and both must forward recall original entry
+        auto resBothSp = coord->ReverseLookup(L"ROUND_BOTH", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resBothSp.found, "ROUND_BOTH found in Shuangpin");
+        TEST_ASSERT(resBothSp.all_codes.size() == 2, "ROUND_BOTH has 2 codes");
+        for (const auto& c : resBothSp.all_codes) {
+            auto cands = coord->QueryScopedCandidates(InputScheme::Shuangpin, "natural", c, "");
+            bool foundOrig = std::any_of(cands.begin(), cands.end(), [&](const auto& cd) { return cd.entry_id == idBoth; });
+            TEST_ASSERT(foundOrig, "Every code in all_codes must forward recall ROUND_BOTH");
+        }
+
+        // 3.7 Layout Vectors: Natural vs Microsoft vs Xiaohe
+        // '快' (kuai): Natural -> ky, Xiaohe -> kk (Xiaohe uai is k)
+        auto resKuaiNat = coord->ReverseLookup(L"快", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resKuaiNat.found && resKuaiNat.primary_code == "ky", "Kuai in Natural is 'ky'");
+        auto resKuaiXiaohe = coord->ReverseLookup(L"快", InputScheme::Shuangpin, ShuangpinLayout::Xiaohe);
+        TEST_ASSERT(resKuaiXiaohe.found && resKuaiXiaohe.primary_code == "kk", "Kuai in Xiaohe is 'kk'");
+
+        // 3.8 Special Characters, Multi-syllable != Char length, and Leading/Trailing Spaces
+        std::string idEdge = engine.AddUserEntry(L"  EDGE  ", {
+            {InputScheme::Pinyin, "zhong"}
+        });
+        TEST_ASSERT(!idEdge.empty(), "Add entry with leading/trailing spaces");
+        auto resEdge = coord->ReverseLookup(L"  EDGE  ", InputScheme::Pinyin);
+        TEST_ASSERT(resEdge.found, "Exact edge with spaces found");
+        TEST_ASSERT(resEdge.primary_code == "zhong", "Exact edge code is 'zhong'");
+
+        // Emoji surrogate pair (length 2 in UTF-16, length 1 glyph)
+        std::string idEmoji = engine.AddUserEntry(L"🚀", {
+            {InputScheme::Pinyin, "huojian"}
+        });
+        TEST_ASSERT(!idEmoji.empty(), "Add emoji with multi-syllable pinyin");
+        auto resEmojiSp = coord->ReverseLookup(L"🚀", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resEmojiSp.found, "Emoji found in Shuangpin");
+        TEST_ASSERT(resEmojiSp.primary_code == "hojm", "Emoji huojian in Natural is 'hojm'");
+
+        // 3.9 Management reverse lookup under disabled scheme
+        InputPolicy policyDisabled;
+        policyDisabled.SetMethodEnabled(InputScheme::Shuangpin, false);
+        // Reverse lookup must still succeed because management query is scheme-independent
+        auto resDisabledCheck = coord->ReverseLookup(L"工", InputScheme::Shuangpin, ShuangpinLayout::Natural);
+        TEST_ASSERT(resDisabledCheck.found, "Management reverse lookup works even when scheme disabled");
+        TEST_ASSERT(resDisabledCheck.primary_code == "gs", "Code for '工' in Natural is 'gs'");
+    }
+
+    std::cout << "[PASS] Stage 4C-2 Reverse Lookup Core & Decomposition verified!\n";
+    return 0;
+}
+
 int main() {
     SetConsoleOutputCP(CP_UTF8);
     std::cout << "=== Running PersonalIME Stage 2 (ime-core) Test Suite ===" << std::endl;
@@ -824,6 +1036,10 @@ int main() {
     if (TestReviewRound2Probes() != 0) return 1;
 
     if (TestStage2Finalization() != 0) return 1;
-    std::cout << "=== ALL Stage 2 Test Suites (14/14) PASSED WITH ZERO ERRORS! ===" << std::endl;
+
+    std::cout << "Step 15: Starting TestStage4C2ReverseLookupCore..." << std::endl;
+    if (TestStage4C2ReverseLookupCore(engine) != 0) return 1;
+
+    std::cout << "=== ALL Stage 2 & 4C-2 Core Test Suites (15/15) PASSED WITH ZERO ERRORS! ===" << std::endl;
     return 0;
 }

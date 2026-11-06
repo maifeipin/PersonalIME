@@ -36,6 +36,8 @@ add_library(ime-core STATIC
     src/core/storage/entry_repository.cpp
     src/core/storage/json_backup.cpp
     src/core/encoding/pinyin_segmenter.cpp
+    src/core/encoding/shuangpin_decoder.cpp
+    src/core/strategy/input_coordinator.cpp
     src/core/dictionary/builtin_dict.cpp
     src/core/ranking/ranker.cpp
     src/core/engine/ime_engine.cpp
@@ -89,6 +91,7 @@ target_link_libraries(PersonalIME PRIVATE
 # 2. Local IME Background Service
 add_executable(ime-service
     src/ime_service/main.cpp
+    src/ime_service/admin_server.cpp
 )
 
 target_link_libraries(ime-service PRIVATE
@@ -172,3 +175,15 @@ target_link_libraries(test_receipt_durability PRIVATE user32)
 
 add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
 target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32)
+
+# Stage 4A: Input Policy & Shuangpin Test
+add_executable(test_input_policy tests/test_input_policy.cpp)
+target_link_libraries(test_input_policy PRIVATE ime-core sqlite3)
+
+# Stage 4B: Admin IPC & Service Integration Test
+add_executable(test_admin_ipc
+    tests/test_admin_ipc.cpp
+    src/ime_service/admin_server.cpp
+)
+target_link_libraries(test_admin_ipc PRIVATE ime-core sqlite3 advapi32 user32)
+

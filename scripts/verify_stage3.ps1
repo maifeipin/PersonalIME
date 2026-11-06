@@ -14,7 +14,7 @@ try {
     $env:TEMP = $runDir
     $env:TMP = $runDir
     & (Join-Path $PSScriptRoot 'build.ps1') -RunTests
-    foreach ($name in @('test_receipt_journal', 'test_receipt_handover', 'test_receipt_durability', 'test_tip_candidate_snapshot')) {
+    foreach ($name in @('test_receipt_journal', 'test_receipt_handover', 'test_receipt_durability', 'test_tip_candidate_snapshot', 'test_input_policy', 'test_admin_ipc')) {
         & (Join-Path $projectRoot "build\Release\$name.exe")
         if ($LASTEXITCODE -ne 0) { throw "$name failed with exit code $LASTEXITCODE" }
     }

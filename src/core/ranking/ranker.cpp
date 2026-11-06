@@ -76,6 +76,15 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
             existing.selected_count = (std::max)(existing.selected_count, c.selected_count);
             existing.effective_count = (std::max)(existing.effective_count, c.effective_count);
             existing.last_selected_at = (std::max)(existing.last_selected_at, c.last_selected_at);
+            // Higher priority input method provenance takes precedence
+            if (c.method_priority < existing.method_priority) {
+                existing.method_priority = c.method_priority;
+                existing.scheme = c.scheme;
+                existing.dict_id = c.dict_id;
+                existing.layout_id = c.layout_id;
+                existing.raw_code = c.raw_code;
+                existing.resolved_code = c.resolved_code;
+            }
             // Better match quality takes precedence
             if (static_cast<int>(c.quality) < static_cast<int>(existing.quality)) {
                 existing.quality = c.quality;
@@ -90,7 +99,7 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
         ComputeScore(c, now);
     }
 
-    // 3. Strict 4-Level Deterministic Sorter
+    // 3. Strict Deterministic Sorter with Input Method Priority
     std::sort(uniqueCandidates.begin(), uniqueCandidates.end(), [](const Candidate& a, const Candidate& b) {
         // Level 1: Pinned status
         if (a.is_pinned != b.is_pinned) {
@@ -100,6 +109,9 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
             if (a.order_rank != b.order_rank) {
                 return a.order_rank < b.order_rank; // Lower rank number comes first
             }
+            if (a.method_priority != b.method_priority) {
+                return a.method_priority < b.method_priority;
+            }
         }
 
         // Level 2: Match Quality group
@@ -107,12 +119,17 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
             return static_cast<int>(a.quality) < static_cast<int>(b.quality); // ExactFull < PrefixFull < PrefixCompletion
         }
 
-        // Level 3: Score (DESC)
+        // Level 3: Input Method Priority (cascade within same match quality tier)
+        if (a.method_priority != b.method_priority) {
+            return a.method_priority < b.method_priority; // Higher priority method (e.g. 0 before 1) comes first
+        }
+
+        // Level 4: Score (DESC)
         if (a.score != b.score) {
             return a.score > b.score;
         }
 
-        // Level 4: Stable entry_id ASC (tie-breaker)
+        // Level 5: Stable entry_id ASC (tie-breaker)
         return a.entry_id < b.entry_id;
     });
 

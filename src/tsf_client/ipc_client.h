@@ -3,6 +3,7 @@
 #include <memory>
 #include <atomic>
 #include "../common/ipc_protocol.h"
+#include "../core/types.h"
 
 // Non-singleton, per-TIP instance IPC client
 class IpcClient {
@@ -18,7 +19,10 @@ public:
     bool Rollback(uint64_t sessionId, uint64_t contextId, IpcKeyResponse* outResp = nullptr);
     bool NotifyCommitSuccess(uint64_t sessionId, uint64_t contextId, uint64_t eventId);
     bool NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint64_t eventId, IpcKeyResponse* outResp = nullptr);
-    bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags);
+    bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion = IPC_PROTOCOL_VERSION_STAGE3, uint32_t updateMask = 0);
+    bool GetMode(uint64_t sessionId, uint64_t contextId, uint32_t& outModeFlags, ime::InputScheme& outScheme);
+    bool SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme);
+    bool GetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme& outScheme);
     void Disconnect();
 
     struct AsyncIoOperation {
