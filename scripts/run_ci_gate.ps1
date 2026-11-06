@@ -12,23 +12,35 @@
 #>
 
 param(
-    [switch]$SkipWpf
+    [switch]$SkipWpf,
+    [string]$BuildDir = $env:PERSONALIME_BUILD_DIR,
+    [string]$OutDir = $env:PERSONALIME_OUT_DIR
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptRoot
-$BinDir = Join-Path $ProjectRoot "build\Release"
-$GateTestDir = Join-Path $ProjectRoot "out\ci_gate_test"
-$TrxPath = Join-Path $ProjectRoot "out\test-results\ci-manager-tests.trx"
+
+if (-not $BuildDir) { $BuildDir = "build" }
+if (-not $OutDir) { $OutDir = "out" }
+
+$resolvedBuildDir = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $ProjectRoot $BuildDir }
+$resolvedOutDir = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $ProjectRoot $OutDir }
+
+$BinDir = Join-Path $resolvedBuildDir "Release"
+$GateTestDir = Join-Path $resolvedOutDir "ci_gate_test"
+$TrxDir = Join-Path $resolvedOutDir "test-results"
+$TrxPath = Join-Path $TrxDir "ci-manager-tests.trx"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  Personal IME: Unified CI / Pre-Release Quality Gate" -ForegroundColor Cyan
+Write-Host "  Binaries Directory : $BinDir" -ForegroundColor Cyan
+Write-Host "  Output Directory   : $resolvedOutDir" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # Ensure test directories exist
-if (-not (Test-Path (Join-Path $ProjectRoot "out\test-results"))) {
-    New-Item -ItemType Directory -Path (Join-Path $ProjectRoot "out\test-results") -Force | Out-Null
+if (-not (Test-Path $TrxDir)) {
+    New-Item -ItemType Directory -Path $TrxDir -Force | Out-Null
 }
 if (-not (Test-Path $GateTestDir)) {
     New-Item -ItemType Directory -Path $GateTestDir -Force | Out-Null
@@ -166,7 +178,7 @@ if (-not $SkipWpf) {
     if (Test-Path $TrxPath) { Remove-Item -Path $TrxPath -Force }
 
     Write-Host "Running dotnet test with TRX logging..." -ForegroundColor Cyan
-    & dotnet test $managerTestProj -c Release --logger "trx;LogFileName=ci-manager-tests.trx" --results-directory (Join-Path $ProjectRoot "out\test-results")
+    & dotnet test $managerTestProj -c Release --logger "trx;LogFileName=ci-manager-tests.trx" --results-directory $TrxDir
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet test exited with non-zero code $LASTEXITCODE"
     }

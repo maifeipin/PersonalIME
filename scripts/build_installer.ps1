@@ -11,17 +11,27 @@
 param(
     [string]$Version = "1.0.0",
     [switch]$ReuseExistingBinaries,
-    [switch]$SkipPublishManager
+    [switch]$SkipPublishManager,
+    [string]$BuildDir = $env:PERSONALIME_BUILD_DIR,
+    [string]$OutputDir = $env:PERSONALIME_OUT_DIR
 )
 
 $ErrorActionPreference = "Stop"
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptRoot
-$OutputDir = Join-Path $ProjectRoot "out\installer"
+
+if (-not $BuildDir) { $BuildDir = "build" }
+if (-not $OutputDir) { $OutputDir = "out" }
+
+$resolvedBuildDir = if ([System.IO.Path]::IsPathRooted($BuildDir)) { $BuildDir } else { Join-Path $ProjectRoot $BuildDir }
+$resolvedOutDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $ProjectRoot $OutputDir }
+$installerOutputDir = Join-Path $resolvedOutDir "installer"
 
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  Personal IME: Local Installer Build (Inno Setup x64)" -ForegroundColor Cyan
-Write-Host "  Target Package Version: $Version" -ForegroundColor Cyan
+Write-Host "  Target Package Version : $Version" -ForegroundColor Cyan
+Write-Host "  Binaries Directory     : $resolvedBuildDir" -ForegroundColor Cyan
+Write-Host "  Installer Output       : $installerOutputDir" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 
 # 1. Locate ISCC.exe
@@ -52,13 +62,13 @@ if (-not $isccPath) {
 Write-Host "[1/4] Using Inno Setup Compiler: $isccPath" -ForegroundColor Green
 
 # 2. Build or Verify C++ Native Binaries from Current Source
-$dll = Join-Path $ProjectRoot "build\Release\PersonalIME.dll"
-$service = Join-Path $ProjectRoot "build\Release\ime-service.exe"
-$cli = Join-Path $ProjectRoot "build\Release\ime-cli.exe"
+$dll = Join-Path $resolvedBuildDir "Release\PersonalIME.dll"
+$service = Join-Path $resolvedBuildDir "Release\ime-service.exe"
+$cli = Join-Path $resolvedBuildDir "Release\ime-cli.exe"
 
 if (-not $ReuseExistingBinaries) {
     Write-Host "[2/4] Building C++ native binaries from current source..." -ForegroundColor Cyan
-    & (Join-Path $ScriptRoot "build.ps1")
+    & (Join-Path $ScriptRoot "build.ps1") -BuildDir $BuildDir
 } else {
     Write-Host "[2/4] Reusing existing binaries as requested (-ReuseExistingBinaries)." -ForegroundColor Yellow
 }
@@ -69,10 +79,10 @@ foreach ($b in @(@{Name="PersonalIME.dll"; Path=$dll}, @{Name="ime-service.exe";
         throw "Required binary missing: $($b.Name) at $($b.Path)"
     }
 }
-Write-Host "      Verified C++ binaries (DLL, Service, CLI) in build\Release." -ForegroundColor Green
+Write-Host "      Verified C++ binaries (DLL, Service, CLI) in: $resolvedBuildDir\Release" -ForegroundColor Green
 
 # 3. Publish WPF Desktop Manager (Self-Contained)
-$managerPublishDir = Join-Path $ProjectRoot "out\publish\manager"
+$managerPublishDir = Join-Path $resolvedOutDir "publish\manager"
 $managerExe = Join-Path $managerPublishDir "PersonalIME.Manager.exe"
 
 if (-not $SkipPublishManager -or -not (Test-Path $managerExe)) {
@@ -89,8 +99,8 @@ if (-not $SkipPublishManager -or -not (Test-Path $managerExe)) {
 
 # 4. Compile Installer via ISCC
 Write-Host "[4/4] Compiling installer with ISCC (Version: $Version)..." -ForegroundColor Cyan
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+if (-not (Test-Path $installerOutputDir)) {
+    New-Item -ItemType Directory -Path $installerOutputDir -Force | Out-Null
 }
 
 $issPath = Join-Path $ProjectRoot "installer\setup.iss"
@@ -100,7 +110,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
 }
 
-$setupExe = Join-Path $OutputDir "PersonalIME-Setup-x64.exe"
+$setupExe = Join-Path $installerOutputDir "PersonalIME-Setup-x64.exe"
 if (-not (Test-Path $setupExe)) {
     throw "Expected installer output not found at: $setupExe"
 }

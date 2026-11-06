@@ -7,8 +7,21 @@ using namespace receipt_journal;
 #define REQUIRE(x) do{if(!(x)){std::cerr<<"FAIL line "<<__LINE__<<": "<<#x<<'\n';return 1;}}while(false)
 int main(int argc,char**argv){
     if(argc>1){std::vector<Record> r;for(int i=0;i<40;++i)r.push_back({12,34,static_cast<uint64_t>(std::stoull(argv[1])+i),0,0});for(int i=0;i<60;++i){if(Append(r))return 0;Sleep(50);}return 1;}
-    auto dir=std::filesystem::absolute("receipt-unit-"+std::to_string(GetCurrentProcessId()));
-    std::filesystem::create_directories(dir);SetEnvironmentVariableW(L"TEMP",dir.c_str());SetEnvironmentVariableW(L"TMP",dir.c_str());
+    wchar_t oldTemp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, oldTemp);
+    auto dir = std::filesystem::temp_directory_path() / ("PersonalIME_journal_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(dir);
+    SetEnvironmentVariableW(L"TEMP", dir.c_str()); SetEnvironmentVariableW(L"TMP", dir.c_str());
+    struct Cleanup {
+        std::filesystem::path p;
+        std::wstring prev;
+        ~Cleanup() {
+            SetEnvironmentVariableW(L"TEMP", prev.c_str());
+            SetEnvironmentVariableW(L"TMP", prev.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{dir, oldTemp};
     std::vector<Record> r;
     REQUIRE(Read(r)&&r.empty());
     REQUIRE(Prepare({1,2,3,0,0}));REQUIRE(Read(r)&&r.empty());

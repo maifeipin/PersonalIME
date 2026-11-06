@@ -12,9 +12,21 @@ static int InjectedCommit(int fd) {
 #include <iostream>
 #define REQUIRE(x) do { if (!(x)) { std::cerr << "FAIL line " << __LINE__ << ": " << #x << '\n'; return 1; } } while (false)
 int main() {
-    auto dir = std::filesystem::absolute("receipt-durability-" + std::to_string(GetCurrentProcessId()));
+    wchar_t oldTemp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, oldTemp);
+    auto dir = std::filesystem::temp_directory_path() / ("PersonalIME_durability_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(dir);
     SetEnvironmentVariableW(L"TEMP", dir.c_str()); SetEnvironmentVariableW(L"TMP", dir.c_str());
+    struct Cleanup {
+        std::filesystem::path p;
+        std::wstring prev;
+        ~Cleanup() {
+            SetEnvironmentVariableW(L"TEMP", prev.c_str());
+            SetEnvironmentVariableW(L"TMP", prev.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{dir, oldTemp};
     receipt_journal::Record r{1, 2, 3, 0, 0};
     REQUIRE(!receipt_journal::Append({r}));
     // The full frame is readable despite the rejected physical sync.

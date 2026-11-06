@@ -15,8 +15,21 @@
 LONG g_cDllRef=0;HINSTANCE g_hInst=nullptr;
 #define REQUIRE(x) do{if(!(x)){std::cerr<<"FAIL line "<<__LINE__<<": "<<#x<<'\n';return 1;}}while(false)
 int main(){
-    auto dir=std::filesystem::absolute("handover-"+std::to_string(GetCurrentProcessId()));std::filesystem::create_directories(dir);
-    SetEnvironmentVariableW(L"TEMP",dir.c_str());SetEnvironmentVariableW(L"TMP",dir.c_str());
+    wchar_t oldTemp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, oldTemp);
+    auto dir = std::filesystem::temp_directory_path() / ("PersonalIME_handover_" + std::to_string(GetCurrentProcessId()));
+    std::filesystem::create_directories(dir);
+    SetEnvironmentVariableW(L"TEMP", dir.c_str()); SetEnvironmentVariableW(L"TMP", dir.c_str());
+    struct Cleanup {
+        std::filesystem::path p;
+        std::wstring prev;
+        ~Cleanup() {
+            SetEnvironmentVariableW(L"TEMP", prev.c_str());
+            SetEnvironmentVariableW(L"TMP", prev.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{dir, oldTemp};
     auto path=receipt_journal::Path();std::filesystem::create_directory(path);
     auto tip=new CTextInputProcessor();
     // Obtain the true owner through a successful durable legacy-compatible spill later.

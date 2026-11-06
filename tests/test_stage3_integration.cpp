@@ -1188,7 +1188,7 @@ int main(int argc, char* argv[]) {
     {
         std::wcout << L"\n[TEST 15] Append-only journal and TIP handover..." << std::endl;
         wchar_t oldTemp[MAX_PATH]{}; GetTempPathW(MAX_PATH, oldTemp);
-        auto dir = std::filesystem::absolute("receipt-integration-" + std::to_string(GetCurrentProcessId()));
+        auto dir = std::filesystem::temp_directory_path() / ("PersonalIME_integ_" + std::to_string(GetCurrentProcessId()));
         std::filesystem::create_directories(dir);
         SetEnvironmentVariableW(L"TEMP", dir.c_str()); SetEnvironmentVariableW(L"TMP", dir.c_str());
         auto tipA = new CTextInputProcessor();
@@ -1222,6 +1222,7 @@ int main(int argc, char* argv[]) {
         auto tipC=new CTextInputProcessor();tipC->LoadSpilloverCommitsFromFile();
         CHECK_EQUAL(tipC->m_unconfirmedCommits.size(),0,L"ACK survives TIP reconstruction");delete tipC;
         SetEnvironmentVariableW(L"TEMP",oldTemp);SetEnvironmentVariableW(L"TMP",oldTemp);
+        std::error_code ecDir; std::filesystem::remove_all(dir, ecDir);
         std::wcout << L"[PASS] Original owner, durable handover, real timer and terminal ACK." << std::endl;
     }
     // Stage 4B finalization: query flags describe only the current composition.

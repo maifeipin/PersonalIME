@@ -40,9 +40,21 @@ public:
     STDMETHODIMP CreateRangeBackup(TfEditCookie, ITfRange*, ITfRangeBackup**) override { return E_NOTIMPL; }
 };
 int main() {
-    auto dir = std::filesystem::absolute("receipt-snapshot-" + std::to_string(GetCurrentProcessId()));
+    wchar_t oldTemp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, oldTemp);
+    auto dir = std::filesystem::temp_directory_path() / ("PersonalIME_snapshot_" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(dir);
     SetEnvironmentVariableW(L"TEMP", dir.c_str()); SetEnvironmentVariableW(L"TMP", dir.c_str());
+    struct Cleanup {
+        std::filesystem::path p;
+        std::wstring prev;
+        ~Cleanup() {
+            SetEnvironmentVariableW(L"TEMP", prev.c_str());
+            SetEnvironmentVariableW(L"TMP", prev.c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } cleanup{dir, oldTemp};
     std::wstring name = L"\\\\.\\pipe\\PersonalIME_Snapshot_" + std::to_wstring(GetCurrentProcessId());
     HANDLE pipe = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 16384, 16384, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) return 1;
