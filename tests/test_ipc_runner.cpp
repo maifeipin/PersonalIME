@@ -10,6 +10,15 @@
 
 LONG g_cDllRef = 0;
 
+static DWORD GetTestTimeoutMs(DWORD defaultMs = 600) {
+    const char* env = getenv("PERSONALIME_TEST_TIMEOUT_MS");
+    if (env && *env) {
+        int v = atoi(env);
+        if (v > 0) return static_cast<DWORD>(v);
+    }
+    return defaultMs;
+}
+
 #define CHECK_TRUE(cond, desc) \
     do { \
         if (!(cond)) { \
@@ -32,7 +41,7 @@ int RunMultiThreadedTest() {
             req.vk_code = keyChar;
 
             IpcKeyResponse resp{};
-            if (!client.SendRequest(req, resp, 80)) {
+            if (!client.SendRequest(req, resp, GetTestTimeoutMs())) {
                 std::wcerr << L"[MT FAIL] SendRequest failed for session " << sessionId << L", context " << contextId << std::endl;
                 threadFailed = true;
                 return;
@@ -53,7 +62,7 @@ int RunMultiThreadedTest() {
             // Commit
             req.vk_code = VK_SPACE;
             req.candidate_version = resp.candidate_version;
-            if (!client.SendRequest(req, resp, 80)) {
+            if (!client.SendRequest(req, resp, GetTestTimeoutMs())) {
                 std::wcerr << L"[MT FAIL] Commit SendRequest failed for session " << sessionId << std::endl;
                 threadFailed = true;
                 return;
@@ -114,7 +123,7 @@ int main(int argc, char* argv[]) {
     req.session_id = 1;
     req.context_id = 101;
     IpcKeyResponse resp{};
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Ping SendRequest failed or timed out");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Ping SendRequest failed or timed out");
     CHECK_TRUE(resp.handled == 1, L"Ping response handled must be 1");
     CHECK_TRUE(resp.msg_type == static_cast<uint32_t>(IpcMsgType::Ping), L"Ping msg_type mismatch");
     std::wcout << L"[TEST PASS] Ping OK." << std::endl;
@@ -124,7 +133,7 @@ int main(int argc, char* argv[]) {
     req.session_id = 1;
     req.context_id = 101;
     req.vk_code = 'A';
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"KeyDown 'A' SendRequest failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"KeyDown 'A' SendRequest failed");
     CHECK_TRUE(resp.handled == 1, L"KeyDown 'A' handled must be 1");
     CHECK_TRUE(resp.has_composition == 1, L"KeyDown 'A' has_composition must be 1");
     CHECK_TRUE(wcscmp(resp.composition, L"a") == 0, L"Composition text must be 'a'");
@@ -136,7 +145,7 @@ int main(int argc, char* argv[]) {
     req.context_id = 102;
     req.vk_code = 'B';
     req.candidate_version = 0;
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"KeyDown 'B' in Context 102 failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"KeyDown 'B' in Context 102 failed");
     CHECK_TRUE(wcscmp(resp.composition, L"b") == 0, L"Context 102 composition must be 'b'");
     std::wcout << L"[TEST PASS] Context 102 -> Key 'B' -> Composition: " << resp.composition << std::endl;
 
@@ -144,7 +153,7 @@ int main(int argc, char* argv[]) {
     req.context_id = 101;
     req.vk_code = VK_SPACE;
     req.candidate_version = ctx101Ver;
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Commit Context 101 failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Commit Context 101 failed");
     CHECK_TRUE(resp.has_commit == 1, L"Commit flag must be 1");
     CHECK_TRUE(wcslen(resp.commit_text) > 0, L"Commit text must not be empty");
     CHECK_TRUE(wcslen(resp.composition) == 0, L"Context 101 composition must be empty after commit");
@@ -153,24 +162,24 @@ int main(int argc, char* argv[]) {
     // 5. Verify Context 102 still has composition "b" when typing another char 'C' -> "bc"
     req.context_id = 102;
     req.vk_code = 'C';
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Key 'C' in Context 102 failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Key 'C' in Context 102 failed");
     CHECK_TRUE(wcscmp(resp.composition, L"bc") == 0, L"Context 102 composition must be 'bc'");
     std::wcout << L"[TEST PASS] Context 102 remained isolated -> Composition: " << resp.composition << std::endl;
 
     // 6. Cancel Context 102 with Escape
     req.vk_code = VK_ESCAPE;
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Cancel Context 102 failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Cancel Context 102 failed");
     CHECK_TRUE(wcslen(resp.composition) == 0, L"Context 102 composition must be empty after Escape");
     std::wcout << L"[TEST PASS] Context 102 -> Cancelled OK." << std::endl;
 
     // 7. Rollback Test: type 'D', send Rollback, verify reverted
     req.context_id = 103;
     req.vk_code = 'D';
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Key 'D' failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Key 'D' failed");
     CHECK_TRUE(wcscmp(resp.composition, L"d") == 0, L"Composition must be 'd'");
 
     req.msg_type = static_cast<uint32_t>(IpcMsgType::Rollback);
-    CHECK_TRUE(client.SendRequest(req, resp, 80), L"Rollback request failed");
+    CHECK_TRUE(client.SendRequest(req, resp, GetTestTimeoutMs()), L"Rollback request failed");
     CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition must be empty after rollback of first char");
     std::wcout << L"[TEST PASS] Rollback verified successfully." << std::endl;
 

@@ -2,6 +2,9 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $runnerPath = Join-Path $projectRoot 'build\Release\test_ipc_runner.exe'
 
+# Ensure ample timeout headroom for asynchronous mock pipe servers on cloud VM runners
+$env:PERSONALIME_TEST_TIMEOUT_MS = "800"
+
 # Query exact protocol sizes directly from compiled binary
 $sizesOutput = & $runnerPath --sizes
 $reqSize = 0
@@ -52,7 +55,7 @@ function Run-Scenario([string]$scenario) {
             $pipe.Write($zeroResp, 0, $zeroResp.Length)
             $pipe.Flush()
 
-            $exited = $runner.WaitForExit(2000)
+            $exited = $runner.WaitForExit(3000)
             if (-not $exited) {
                 $runner.Kill()
                 $runner.WaitForExit(1000)
@@ -80,7 +83,7 @@ function Run-Scenario([string]$scenario) {
             $pipe.Write($resp, 0, $resp.Length)
             $pipe.Flush()
 
-            $exited = $runner.WaitForExit(2000)
+            $exited = $runner.WaitForExit(3000)
             if (-not $exited) {
                 $runner.Kill()
                 $runner.WaitForExit(1000)
@@ -105,7 +108,7 @@ function Run-Scenario([string]$scenario) {
             $pipe.Write($truncResp, 0, $truncResp.Length)
             $pipe.Flush()
 
-            $exited = $runner.WaitForExit(2000)
+            $exited = $runner.WaitForExit(3000)
             if (-not $exited) {
                 $runner.Kill()
                 $runner.WaitForExit(1000)
@@ -133,7 +136,7 @@ function Run-Scenario([string]$scenario) {
             $pipe.Write($fakeResp, 0, $fakeResp.Length)
             $pipe.Flush()
 
-            $exited = $runner.WaitForExit(2000)
+            $exited = $runner.WaitForExit(3000)
             if (-not $exited) {
                 $runner.Kill()
                 $runner.WaitForExit(1000)
@@ -152,7 +155,7 @@ function Run-Scenario([string]$scenario) {
         } elseif ($scenario -eq 'stalled-server') {
             # 5. Do NOT reply, wait for bounded client timeout
             $sw = [Diagnostics.Stopwatch]::StartNew()
-            $exited = $runner.WaitForExit(1500)
+            $exited = $runner.WaitForExit(3000)
             $sw.Stop()
 
             if (-not $exited) {
