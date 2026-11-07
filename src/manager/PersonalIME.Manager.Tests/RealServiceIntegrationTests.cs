@@ -42,8 +42,14 @@ public class RealServiceIntegrationTests
         if (File.Exists(s_exportFilePath)) File.Delete(s_exportFilePath);
         Directory.CreateDirectory(Path.Combine(repoRoot, "out"));
 
-        // Locate ime-service.exe
-        string serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
+        // Locate ime-service.exe (respect PERSONALIME_BUILD_DIR if configured)
+        string buildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR") ?? "build";
+        string resolvedBuildDir = Path.IsPathRooted(buildDir) ? buildDir : Path.Combine(repoRoot, buildDir);
+        string serviceExe = Path.Combine(resolvedBuildDir, @"Release\ime-service.exe");
+        if (!File.Exists(serviceExe))
+        {
+            serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
+        }
         if (!File.Exists(serviceExe))
         {
             Assert.Inconclusive("ime-service.exe not found at " + serviceExe);

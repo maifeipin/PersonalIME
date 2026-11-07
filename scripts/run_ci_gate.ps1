@@ -178,6 +178,7 @@ if (-not $SkipWpf) {
     if (Test-Path $TrxPath) { Remove-Item -Path $TrxPath -Force }
 
     Write-Host "Running dotnet test with TRX logging..." -ForegroundColor Cyan
+    $env:PERSONALIME_BUILD_DIR = $resolvedBuildDir
     & dotnet test $managerTestProj -c Release --logger "trx;LogFileName=ci-manager-tests.trx" --results-directory $TrxDir
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet test exited with non-zero code $LASTEXITCODE"

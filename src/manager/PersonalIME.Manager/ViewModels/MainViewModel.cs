@@ -308,24 +308,44 @@ public class MainViewModel : ViewModelBase, IDisposable
 
     public static string? LocateServiceExecutable()
     {
-        var candidates = new List<string>
-        {
-            // 1. Same directory (portable / co-located)
-            Path.Combine(AppContext.BaseDirectory, "ime-service.exe"),
-            // 2. Parent directory (e.g. Program Files\PersonalIME\manager\..\ime-service.exe)
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "ime-service.exe")),
-            // 3. Program Files installed location
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PersonalIME", "ime-service.exe"),
-            // 4. Dev / build paths
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, @"..\..\..\..\..\build\Release\ime-service.exe")),
-            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, @"..\..\..\..\..\build\bin\Debug\ime-service.exe"))
-        };
+        var candidates = new List<string>();
 
         var envPath = Environment.GetEnvironmentVariable("PERSONAL_IME_SERVICE_PATH");
         if (!string.IsNullOrEmpty(envPath))
         {
-            candidates.Insert(0, envPath);
+            candidates.Add(envPath);
         }
+
+        // 1. Same directory (portable / co-located)
+        candidates.Add(Path.Combine(AppContext.BaseDirectory, "ime-service.exe"));
+        // 2. Parent directory (e.g. Program Files\PersonalIME\manager\..\ime-service.exe)
+        candidates.Add(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "ime-service.exe")));
+
+        // 3. Configured build directory (e.g. CI / dev override via PERSONALIME_BUILD_DIR)
+        var envBuildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR");
+        if (!string.IsNullOrEmpty(envBuildDir))
+        {
+            candidates.Add(Path.Combine(envBuildDir, "Release", "ime-service.exe"));
+            candidates.Add(Path.Combine(envBuildDir, "Debug", "ime-service.exe"));
+        }
+
+        // 4. Dev / CI build paths: walk up ancestor directories from AppContext.BaseDirectory
+        string? dir = Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory);
+        for (int depth = 0; depth < 8 && !string.IsNullOrEmpty(dir); depth++)
+        {
+            if (!string.IsNullOrEmpty(envBuildDir) && !Path.IsPathRooted(envBuildDir))
+            {
+                candidates.Add(Path.Combine(dir, envBuildDir, "Release", "ime-service.exe"));
+            }
+            candidates.Add(Path.Combine(dir, "build", "Release", "ime-service.exe"));
+            candidates.Add(Path.Combine(dir, "build_ci", "Release", "ime-service.exe"));
+            candidates.Add(Path.Combine(dir, "build", "bin", "Debug", "ime-service.exe"));
+            candidates.Add(Path.Combine(dir, "build", "Debug", "ime-service.exe"));
+            dir = Path.GetDirectoryName(dir);
+        }
+
+        // 5. Program Files installed location
+        candidates.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PersonalIME", "ime-service.exe"));
 
         foreach (var p in candidates)
         {
