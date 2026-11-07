@@ -28,6 +28,7 @@ bool ImeEngine::Initialize(const std::string& dbPath,
 
     m_repo = std::make_unique<EntryRepository>(m_db, m_clock);
     m_repo->SetBuiltinDictionary(&m_builtinDict);
+    m_pluginRepo = std::make_unique<PluginRepository>(m_db);
 
     if (!dictDir.empty()) {
         if (!m_builtinDict.Load(dictDir)) {

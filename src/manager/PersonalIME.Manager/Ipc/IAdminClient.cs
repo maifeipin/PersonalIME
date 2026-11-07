@@ -24,5 +24,12 @@ public interface IAdminClient
     Task ImportDataAsync(string filePath, string mode, CancellationToken ct = default);
     Task ResetStatsAsync(string? entryId = null, CancellationToken ct = default);
     Task<ReverseLookupResultItem> ReverseLookupAsync(string text, string targetMethod, string? shuangpinLayout = null, CancellationToken ct = default);
+    Task<List<PluginModel>> GetPluginsAsync(bool onlyEnabled = false, CancellationToken ct = default);
+    Task<long> AddPluginAsync(PluginModel plugin, CancellationToken ct = default);
+    Task UpdatePluginAsync(PluginModel plugin, CancellationToken ct = default);
+    Task DeletePluginAsync(long id, CancellationToken ct = default);
+    Task ExecutePluginAsync(long id, CancellationToken ct = default);
+    Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default);
+    Task ClearPluginLogsAsync(long? pluginId = null, CancellationToken ct = default);
 }
 

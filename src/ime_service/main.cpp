@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <shellapi.h>
 #include <sddl.h>
 #include <iostream>
 #include <string>
@@ -732,6 +733,71 @@ void HandleClient(HANDLE hPipe) {
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetMode)) {
             resp.status_flags = ComputeModeFlags(state);
             resp.handled = 1;
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::OpenManager)) {
+            HWND hMgr = FindWindowW(nullptr, L"人人 设置");
+            if (!hMgr) {
+                hMgr = FindWindowW(nullptr, L"PersonalIME 输入法设置");
+            }
+            if (!hMgr) {
+                hMgr = FindWindowW(nullptr, L"PersonalIME 管理器");
+            }
+            if (hMgr) {
+                if (IsIconic(hMgr)) {
+                    ShowWindowAsync(hMgr, SW_RESTORE);
+                } else {
+                    ShowWindowAsync(hMgr, SW_SHOW);
+                }
+                SetForegroundWindow(hMgr);
+                resp.handled = 1;
+            } else {
+                std::wstring managerPath;
+                char envBuf[MAX_PATH];
+                DWORD envLen = GetEnvironmentVariableA("PERSONALIME_MANAGER_PATH", envBuf, MAX_PATH);
+                if (envLen > 0 && envLen < MAX_PATH) {
+                    std::error_code ec;
+                    if (std::filesystem::exists(envBuf, ec)) {
+                        managerPath = std::filesystem::path(envBuf).wstring();
+                    }
+                }
+                if (managerPath.empty()) {
+                    wchar_t exeBuf[MAX_PATH];
+                    if (GetModuleFileNameW(nullptr, exeBuf, MAX_PATH) > 0) {
+                        std::filesystem::path servicePath(exeBuf);
+                        std::filesystem::path serviceDir = servicePath.parent_path();
+                        std::vector<std::filesystem::path> candPaths = {
+                            serviceDir / L"PersonalIME.Manager.exe",
+                            serviceDir / L"manager" / L"PersonalIME.Manager.exe",
+                            serviceDir / L"../../src/manager/PersonalIME.Manager/bin/Release/net10.0-windows/PersonalIME.Manager.exe",
+                            serviceDir / L"../../out/publish/manager/PersonalIME.Manager.exe",
+                            L"C:\\Program Files\\PersonalIME\\manager\\PersonalIME.Manager.exe"
+                        };
+                        for (const auto& p : candPaths) {
+                            std::error_code ec;
+                            if (std::filesystem::exists(p, ec)) {
+                                managerPath = p.wstring();
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!managerPath.empty()) {
+                    HINSTANCE hInst = ShellExecuteW(nullptr, L"open", managerPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    resp.handled = (reinterpret_cast<INT_PTR>(hInst) > 32) ? 1 : 0;
+                } else {
+                    resp.handled = 0;
+                }
+            }
+            resp.status_flags = ComputeModeFlags(state);
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::ExecutePlugin)) {
+            std::string outMsg;
+            bool ok = false;
+            if (g_engine.GetPluginRepo()) {
+                ok = g_engine.GetPluginRepo()->ExecutePlugin(req.vk_code, outMsg);
+            }
+            resp.handled = ok ? 1 : 0;
+            resp.status_flags = ComputeModeFlags(state);
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::NextDictionary)) {
             if (state.cached_coord_query.has_next_dictionary && g_engine.GetCoordinator()) {

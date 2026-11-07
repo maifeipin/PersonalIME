@@ -1,10 +1,13 @@
 #include "text_input_processor.h"
+#include "lang_bar_item.h"
 #include "edit_session.h"
 #include "globals.h"
 #include "../common/ime_guids.h"
 #include <wrl/client.h>
 #include <io.h>
 #include <sstream>
+#include <shellapi.h>
+#include <filesystem>
 #include "receipt_journal.h"
 #include "receipt_retry.h"
 
@@ -16,9 +19,65 @@ CTextInputProcessor::CTextInputProcessor() {
     uint64_t counter = static_cast<uint64_t>(InterlockedIncrement64(&s_sessionCounter));
     m_sessionId = (pid << 32) | (counter & 0xFFFFFFFF);
     DllAddRef();
+
+    m_candidateWindow.SetOnOpenManager([this]() {
+        // Cleanly terminate in-progress composition so host document has no stray underline
+        TerminateCompositionOnHost();
+        OpenManagerFromTray();
+    });
+
+    m_candidateWindow.SetOnExecutePlugin([this](const CandidatePluginItem& item) {
+        TerminateCompositionOnHost();
+        if (!m_ipcClient.ExecutePlugin(m_sessionId, 0, item.id)) {
+            // Direct launch fallback if background service is offline
+            ShellExecuteW(nullptr, L"open", item.exec_path.c_str(),
+                          item.arguments.empty() ? nullptr : item.arguments.c_str(),
+                          nullptr, SW_SHOWNORMAL);
+        }
+    });
+}
+
+void CTextInputProcessor::OpenManagerFromTray() {
+    // Grant permission for the manager to be brought to the foreground
+    AllowSetForegroundWindow(ASFW_ANY);
+
+    if (!m_ipcClient.OpenManager(m_sessionId, 0)) {
+        // Direct launch fallback if background IPC service is unavailable
+        wchar_t envBuf[MAX_PATH];
+        DWORD envLen = GetEnvironmentVariableW(L"PERSONALIME_MANAGER_PATH", envBuf, MAX_PATH);
+        if (envLen > 0 && envLen < MAX_PATH) {
+            std::error_code ec;
+            if (std::filesystem::exists(envBuf, ec)) {
+                ShellExecuteW(nullptr, L"open", envBuf, nullptr, nullptr, SW_SHOWNORMAL);
+                return;
+            }
+        }
+
+        wchar_t dllPath[MAX_PATH];
+        if (GetModuleFileNameW(g_hInst, dllPath, MAX_PATH) > 0) {
+            std::filesystem::path p(dllPath);
+            std::filesystem::path dir = p.parent_path();
+            std::vector<std::filesystem::path> cands = {
+                dir / L"manager" / L"PersonalIME.Manager.exe",
+                dir / L"PersonalIME.Manager.exe",
+                dir / L"../../src/manager/PersonalIME.Manager/bin/Release/net10.0-windows/PersonalIME.Manager.exe",
+                dir / L"../../out/publish/manager/PersonalIME.Manager.exe",
+                L"C:\\Program Files\\PersonalIME\\manager\\PersonalIME.Manager.exe"
+            };
+            for (const auto& c : cands) {
+                std::error_code ec;
+                if (std::filesystem::exists(c, ec)) {
+                    ShellExecuteW(nullptr, L"open", c.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 CTextInputProcessor::~CTextInputProcessor() {
+    m_candidateWindow.SetOnOpenManager(nullptr);
+    m_candidateWindow.SetOnExecutePlugin(nullptr);
     // Final Release must not create sessions that AddRef a TIP already being destroyed.
     DrainUnconfirmedCommits(false);
     for (const auto& c : m_unconfirmedCommits) {
@@ -30,6 +89,10 @@ CTextInputProcessor::~CTextInputProcessor() {
     SetComposition(nullptr, nullptr, CompositionState::None);
     m_pendingTerminations.clear();
 
+    if (m_pLangBarButton) {
+        m_pLangBarButton->Release();
+        m_pLangBarButton = nullptr;
+    }
     if (m_pThreadMgr) {
         m_pThreadMgr->Release();
         m_pThreadMgr = nullptr;
@@ -307,11 +370,29 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
         StartDrainTimer();
     }
 
+    // Dock Language Bar Item onto taskbar notification tray
+    ITfLangBarItemMgr* pLangBarItemMgr = nullptr;
+    if (m_pThreadMgr && SUCCEEDED(m_pThreadMgr->QueryInterface(IID_ITfLangBarItemMgr, (void**)&pLangBarItemMgr))) {
+        m_pLangBarButton = new CLangBarItemButton(this);
+        pLangBarItemMgr->AddItem(m_pLangBarButton);
+        pLangBarItemMgr->Release();
+    }
+
     return S_OK;
 }
 
 STDMETHODIMP CTextInputProcessor::Deactivate() {
     UninitKeyEventSink();
+
+    if (m_pLangBarButton) {
+        ITfLangBarItemMgr* pLangBarItemMgr = nullptr;
+        if (m_pThreadMgr && SUCCEEDED(m_pThreadMgr->QueryInterface(IID_ITfLangBarItemMgr, (void**)&pLangBarItemMgr))) {
+            pLangBarItemMgr->RemoveItem(m_pLangBarButton);
+            pLangBarItemMgr->Release();
+        }
+        m_pLangBarButton->Release();
+        m_pLangBarButton = nullptr;
+    }
 
     m_candidateWindow.Hide();
     m_candidateWindow.Destroy();

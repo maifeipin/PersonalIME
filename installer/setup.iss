@@ -1,5 +1,5 @@
 ; =====================================================================
-; Personal IME (私人输入法) - Inno Setup 6 Installation Script
+; 人人 - Inno Setup 6 Installation Script
 ; Stage 5 Production-Grade Machine Installer
 ; Target Architecture: Windows 10/11 x64 ONLY
 ; =====================================================================
@@ -8,8 +8,8 @@
 #define MyAppVersion "1.0.0"
 #endif
 
-#define MyAppName "Personal IME"
-#define MyAppPublisher "Personal IME Project"
+#define MyAppName "人人"
+#define MyAppPublisher "人人 项目组"
 #define MyAppURL "https://github.com/maifeipin/PersonalIME"
 #define MyAppExeName "PersonalIME.Manager.exe"
 #define MyServiceExeName "ime-service.exe"

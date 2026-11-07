@@ -358,6 +358,27 @@ bool IpcClient::GetScheme(uint64_t sessionId, uint64_t contextId, ime::InputSche
     return false;
 }
 
+bool IpcClient::OpenManager(uint64_t sessionId, uint64_t contextId) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::OpenManager);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    return SendRequest(req, resp, 100) && (resp.handled == 1);
+}
+
+bool IpcClient::ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::ExecutePlugin);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.vk_code = pluginId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    return SendRequest(req, resp, 200) && (resp.handled == 1);
+}
+
 bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs) {
     DrainOrphanQueue();
 

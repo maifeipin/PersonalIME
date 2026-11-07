@@ -166,6 +166,8 @@ public:
     void StartDrainTimer();
     void StopDrainTimer();
 
+    void OpenManagerFromTray();
+
 private:
     LONG m_cRef = 1;
     uint64_t m_sessionId = 0;
@@ -191,6 +193,9 @@ private:
 
     // Context-isolated candidate snapshot versions
     std::map<uint64_t, uint32_t> m_contextCandidateVersions;
+
+    // Taskbar Tray / Language Bar button
+    class CLangBarItemButton* m_pLangBarButton = nullptr;
 
     bool InitKeyEventSink();
     void UninitKeyEventSink();

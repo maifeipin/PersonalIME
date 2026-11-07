@@ -129,6 +129,21 @@ bool Migration::Migrate(SqliteDb& db) {
             return false;
         }
     }
+
+    bool needsV5 = (currentVer < 5);
+    if (!needsV5) {
+        auto stmt = db.Prepare("PRAGMA table_info(plugins);");
+        if (!stmt || !stmt->Step()) {
+            needsV5 = true;
+        }
+    }
+
+    if (needsV5) {
+        if (!ApplyVersion5(db)) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -441,6 +456,66 @@ bool Migration::ApplyVersion4(SqliteDb& db) {
         tx.Rollback();
         return false;
     }
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion5(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    const char* schemaV5 = R"SQL(
+        CREATE TABLE IF NOT EXISTS plugins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            icon TEXT NOT NULL,
+            exec_path TEXT NOT NULL,
+            arguments TEXT NOT NULL DEFAULT '',
+            is_enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS plugin_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plugin_id INTEGER,
+            plugin_name TEXT NOT NULL,
+            command_line TEXT NOT NULL,
+            executed_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            status TEXT NOT NULL,
+            message TEXT NOT NULL DEFAULT ''
+        );
+    )SQL";
+
+    if (!db.Execute(schemaV5)) {
+        tx.Rollback();
+        return false;
+    }
+
+    // Insert default presets if plugins table is empty
+    auto countStmt = db.Prepare("SELECT COUNT(*) FROM plugins;");
+    if (countStmt && countStmt->Step() && countStmt->ColumnInt(0) == 0) {
+        const char* presetsSql = R"SQL(
+            INSERT INTO plugins (name, icon, exec_path, arguments, is_enabled, sort_order) VALUES
+            ('计算器', '🧮', 'calc.exe', '', 1, 0),
+            ('画图', '🎨', 'mspaint.exe', '', 1, 1),
+            ('Edge浏览器', '🌐', 'msedge.exe', 'https://maifeipin.com', 1, 2);
+        )SQL";
+        if (!db.Execute(presetsSql)) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '5');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 5;")) {
+        tx.Rollback();
+        return false;
+    }
+
     return tx.Commit();
 }
 

@@ -34,6 +34,7 @@ add_library(ime-core STATIC
     src/core/storage/sqlite_db.cpp
     src/core/storage/migration.cpp
     src/core/storage/entry_repository.cpp
+    src/core/storage/plugin_repository.cpp
     src/core/storage/json_backup.cpp
     src/core/encoding/pinyin_segmenter.cpp
     src/core/encoding/shuangpin_decoder.cpp
@@ -76,8 +77,10 @@ add_library(PersonalIME SHARED
     src/tsf_client/class_factory.cpp
     src/tsf_client/text_input_processor.cpp
     src/tsf_client/candidate_window.cpp
+    src/tsf_client/lang_bar_item.cpp
     src/tsf_client/ipc_client.cpp
     src/tsf_client/PersonalIME.def
+    src/tsf_client/PersonalIME.rc
 )
 
 target_link_libraries(PersonalIME PRIVATE
@@ -86,6 +89,7 @@ target_link_libraries(PersonalIME PRIVATE
     advapi32
     user32
     gdi32
+    shell32
 )
 
 # 2. Local IME Background Service
@@ -98,6 +102,7 @@ target_link_libraries(ime-service PRIVATE
     ime-core
     advapi32
     user32
+    shell32
 )
 
 # Stage 3 End-to-End Integration Test Runner
@@ -106,6 +111,7 @@ add_executable(test_stage3_integration
     src/tsf_client/ipc_client.cpp
     src/tsf_client/text_input_processor.cpp
     src/tsf_client/candidate_window.cpp
+    src/tsf_client/lang_bar_item.cpp
 )
 
 target_link_libraries(test_stage3_integration PRIVATE
@@ -115,6 +121,7 @@ target_link_libraries(test_stage3_integration PRIVATE
     ole32
     oleaut32
     gdi32
+    shell32
 )
 
 # 3. IPC Automated Integration Test Runner
@@ -126,6 +133,7 @@ add_executable(test_ipc_runner
 target_link_libraries(test_ipc_runner PRIVATE
     advapi32
     user32
+    shell32
 )
 
 # 4. COM DLL Lifecycle Test Runner
@@ -146,6 +154,7 @@ add_executable(test_candidate_window
 target_link_libraries(test_candidate_window PRIVATE
     user32
     gdi32
+    shell32
 )
 
 # 6. Composition Lifecycle & Fault Injection Test
@@ -153,6 +162,7 @@ add_executable(test_composition_lifecycle
     tests/test_composition_lifecycle.cpp
     src/tsf_client/text_input_processor.cpp
     src/tsf_client/candidate_window.cpp
+    src/tsf_client/lang_bar_item.cpp
     src/tsf_client/ipc_client.cpp
 )
 
@@ -162,19 +172,20 @@ target_link_libraries(test_composition_lifecycle PRIVATE
     advapi32
     user32
     gdi32
+    shell32
 )
 
 add_executable(test_receipt_journal tests/test_receipt_journal.cpp)
 target_link_libraries(test_receipt_journal PRIVATE user32)
 
-add_executable(test_receipt_handover tests/test_receipt_handover.cpp src/tsf_client/text_input_processor.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
-target_link_libraries(test_receipt_handover PRIVATE ole32 oleaut32 advapi32 user32 gdi32)
+add_executable(test_receipt_handover tests/test_receipt_handover.cpp src/tsf_client/text_input_processor.cpp src/tsf_client/candidate_window.cpp src/tsf_client/lang_bar_item.cpp src/tsf_client/ipc_client.cpp)
+target_link_libraries(test_receipt_handover PRIVATE ole32 oleaut32 advapi32 user32 gdi32 shell32)
 
 add_executable(test_receipt_durability tests/test_receipt_durability.cpp)
 target_link_libraries(test_receipt_durability PRIVATE user32)
 
-add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/ipc_client.cpp)
-target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32)
+add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/lang_bar_item.cpp src/tsf_client/ipc_client.cpp)
+target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32 shell32)
 
 # Stage 4A: Input Policy & Shuangpin Test
 add_executable(test_input_policy tests/test_input_policy.cpp)

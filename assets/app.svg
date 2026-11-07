@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0078D4" />
+      <stop offset="100%" stop-color="#004E8C" />
+    </linearGradient>
+    <linearGradient id="backStroke" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7CE8FF" stop-opacity="0.7" />
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.45" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded Squircle Background -->
+  <rect x="8" y="8" width="240" height="240" rx="54" ry="54" fill="url(#bgGrad)" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="4"/>
+
+  <!-- Background Echo "人" (Offset top-right to symbolize "人人" with depth, never reading as "从") -->
+  <g fill="none" stroke="url(#backStroke)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" transform="translate(26, -16)">
+    <path d="M 128 56 C 122 108, 96 156, 54 196" />
+    <path d="M 116 108 C 138 142, 166 174, 202 196" />
+  </g>
+
+  <!-- Foreground Primary Bold "人" -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" transform="translate(-10, 8)">
+    <path d="M 128 56 C 122 108, 96 156, 54 196" />
+    <path d="M 116 108 C 138 142, 166 174, 202 196" />
+  </g>
+</svg>

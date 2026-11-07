@@ -1729,6 +1729,111 @@ static void TestInputMethodEnablingDisablingIpc(AdminServer& server, const std::
 
 // -----------------------------------------------------------------------------
 // Test 19: Stage 4C-2 Admin IPC ReverseLookup Action
+static void TestPluginManagement(AdminServer& server, const std::wstring& pipeName, ImeEngine& engine) {
+    std::cout << "[TEST 20] Testing Stage 5 Plugin Management & Logs IPC..." << std::endl;
+
+    AdminClient client;
+    AssertCondition(client.Connect(pipeName), "Connect client for Plugin Management test");
+
+    auto SendJson = [&](const nlohmann::json& req) -> nlohmann::json {
+        std::string respStr;
+        uint32_t reqId = req.value("request_id", 5000);
+        bool ok = client.SendFrame(reqId, req.dump(), respStr);
+        AssertCondition(ok, "SendFrame must succeed");
+        return nlohmann::json::parse(respStr);
+    };
+
+    // 1. GetPlugins (default presets)
+    nlohmann::json getReq;
+    getReq["action"] = "get_plugins";
+    getReq["request_id"] = 5001;
+    auto getResp = SendJson(getReq);
+    AssertCondition(getResp.value("success", false), "GetPlugins succeeded");
+    auto pluginsArr = getResp["data"]["plugins"];
+    AssertCondition(pluginsArr.size() == 3, "Initial default plugins count must be 3");
+    AssertCondition(pluginsArr[0]["name"] == "计算器", "Plugin 0 is 计算器");
+    AssertCondition(pluginsArr[1]["name"] == "画图", "Plugin 1 is 画图");
+    AssertCondition(pluginsArr[2]["name"] == "Edge浏览器", "Plugin 2 is Edge浏览器");
+
+    // 2. AddPlugin
+    nlohmann::json addReq;
+    addReq["action"] = "add_plugin";
+    addReq["request_id"] = 5002;
+    addReq["parameters"] = {
+        {"name", "截图"},
+        {"icon", "✂️"},
+        {"exec_path", "snippingtool.exe"},
+        {"arguments", "/clip"},
+        {"is_enabled", true},
+        {"sort_order", 3}
+    };
+    auto addResp = SendJson(addReq);
+    AssertCondition(addResp.value("success", false), "AddPlugin succeeded");
+    int64_t addedId = addResp["data"]["id"].get<int64_t>();
+    AssertCondition(addedId > 0, "Added plugin id must be > 0");
+
+    // 3. UpdatePlugin
+    nlohmann::json updateReq;
+    updateReq["action"] = "update_plugin";
+    updateReq["request_id"] = 5003;
+    updateReq["parameters"] = {
+        {"id", addedId},
+        {"name", "极速截图"},
+        {"is_enabled", false}
+    };
+    auto updateResp = SendJson(updateReq);
+    AssertCondition(updateResp.value("success", false), "UpdatePlugin succeeded");
+
+    // Verify only_enabled filter
+    nlohmann::json getEnabledReq;
+    getEnabledReq["action"] = "get_plugins";
+    getEnabledReq["request_id"] = 5004;
+    getEnabledReq["parameters"] = { {"only_enabled", true} };
+    auto getEnabledResp = SendJson(getEnabledReq);
+    AssertCondition(getEnabledResp["data"]["plugins"].size() == 3, "Only enabled plugins must exclude disabled 4th plugin");
+
+    // 4. ExecutePlugin (calc.exe)
+    nlohmann::json execReq;
+    execReq["action"] = "execute_plugin";
+    execReq["request_id"] = 5005;
+    execReq["parameters"] = { {"id", pluginsArr[0]["id"].get<int64_t>()} };
+    auto execResp = SendJson(execReq);
+    AssertCondition(execResp.value("success", false), "ExecutePlugin executed successfully");
+
+    // 5. GetPluginLogs
+    nlohmann::json logReq;
+    logReq["action"] = "get_plugin_logs";
+    logReq["request_id"] = 5006;
+    auto logResp = SendJson(logReq);
+    AssertCondition(logResp.value("success", false), "GetPluginLogs succeeded");
+    auto logsArr = logResp["data"]["logs"];
+    AssertCondition(!logsArr.empty(), "Logs must contain at least 1 record");
+    AssertCondition(logsArr[0]["status"] == "SUCCESS", "Latest execution status is SUCCESS");
+
+    // 6. ClearPluginLogs
+    nlohmann::json clearReq;
+    clearReq["action"] = "clear_plugin_logs";
+    clearReq["request_id"] = 5007;
+    auto clearResp = SendJson(clearReq);
+    AssertCondition(clearResp.value("success", false), "ClearPluginLogs succeeded");
+
+    auto logAfterResp = SendJson(logReq);
+    AssertCondition(logAfterResp["data"]["logs"].empty(), "Logs must be empty after clear");
+
+    // 7. DeletePlugin
+    nlohmann::json delReq;
+    delReq["action"] = "delete_plugin";
+    delReq["request_id"] = 5008;
+    delReq["parameters"] = { {"id", addedId} };
+    auto delResp = SendJson(delReq);
+    AssertCondition(delResp.value("success", false), "DeletePlugin succeeded");
+
+    auto getFinalResp = SendJson(getReq);
+    AssertCondition(getFinalResp["data"]["plugins"].size() == 3, "Plugins count restored to 3 after delete");
+
+    std::cout << "  [PASS] Stage 5 Plugin Management & Logs IPC verified!" << std::endl;
+}
+
 static void TestStage4C2ReverseLookupAdminIpc(AdminServer&, const std::wstring& pipeName, ImeEngine& engine) {
     std::cout << "[TEST 19] Testing Stage 4C-2 Admin IPC ReverseLookup..." << std::endl;
     AdminClient client;
@@ -1966,6 +2071,7 @@ int main() {
         TestBuiltinPinningAndLifecycle(server, testPipeName, engine);
         TestInputMethodEnablingDisablingIpc(server, testPipeName, engine);
         TestStage4C2ReverseLookupAdminIpc(server, testPipeName, engine);
+        TestPluginManagement(server, testPipeName, engine);
 
         server.Stop();
     }

@@ -180,6 +180,8 @@ public class SettingsViewModel : ViewModelBase
     public RelayCommand MoveDictUpCommand { get; }
     public RelayCommand MoveDictDownCommand { get; }
 
+    public event Action<InputPolicyConfig>? PolicySaved;
+
     public SettingsViewModel(IAdminClient client, NotificationBanner banner)
     {
         _client = client;
@@ -386,8 +388,10 @@ public class SettingsViewModel : ViewModelBase
 
             uint newRev = await _client.SavePolicyAsync(config, CurrentRevision);
             CurrentRevision = newRev;
+            config.Revision = newRev;
             IsLoaded = true;
             _banner.ShowSuccess($"输入设置保存成功 (更新至 rev.{CurrentRevision})");
+            PolicySaved?.Invoke(config);
         }
         catch (AdminException ex) when (ex.IsConflict)
         {

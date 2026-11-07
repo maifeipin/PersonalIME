@@ -1237,6 +1237,7 @@ int main(int argc, char* argv[]) {
             auto policy = *seed.GetPolicy();
             policy.primary_method = ime::InputScheme::Shuangpin;
             policy.shuangpin_layout = ime::ShuangpinLayout::Natural;
+            policy.mixed_input_enabled = false;
             CHECK_TRUE(seed.SavePolicy(policy), L"Persist shuangpin policy for real service flag test");
         }
         ServiceProcess flagService;
@@ -1783,8 +1784,198 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[PASS] Reverse lookup candidate hint display and pure text commit verified!" << std::endl;
     }
 
+    // -------------------------------------------------------------
+    // Test 19: Complete Cascading Fallback & Policy Persistence Verification
+    // -------------------------------------------------------------
+    std::wcout << L"\n[TEST 19] Testing Complete Fallback Chain & Persistence (Wubi -> Pinyin Cascading)..." << std::endl;
+    {
+        std::string fallbackDb = "fallback_chain_test.db";
+        std::error_code ec;
+        if (std::filesystem::exists(fallbackDb)) {
+            std::filesystem::remove(fallbackDb, ec);
+        }
+
+        // 1. Initial configuration: Chinese mode, mixed input enabled, Wubi86 primary, Pinyin enabled
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(fallbackDb, dictDir), L"Initialize fallback test DB");
+            ime::InputPolicy pol;
+            pol.primary_method = ime::InputScheme::Wubi86;
+            pol.mixed_input_enabled = true;
+            pol.input_method_order = {
+                ime::InputScheme::Wubi86,
+                ime::InputScheme::Pinyin,
+                ime::InputScheme::Shuangpin
+            };
+            pol.SetMethodEnabled(ime::InputScheme::Wubi86, true);
+            pol.SetMethodEnabled(ime::InputScheme::Pinyin, true);
+            pol.SetMethodEnabled(ime::InputScheme::Shuangpin, true);
+            pol.initial_mode.chinese = true;
+            CHECK_TRUE(seed.SavePolicy(pol), L"Save initial fallback policy");
+        }
+
+        ServiceProcess fbService;
+        CHECK_TRUE(fbService.Start(fallbackDb, dictDir), L"Start service for fallback chain test");
+        IpcClient fbClient;
+        IpcKeyRequest pingReq{};
+        pingReq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        pingReq.session_id = 999;
+        pingReq.context_id = 9901;
+        pingReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse pingResp{};
+        CHECK_TRUE(fbClient.SendRequest(pingReq, pingResp, 200), L"Ping fallback service");
+
+        uint64_t sid = 999;
+        uint64_t cid = 9901;
+        CHECK_TRUE(fbClient.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
+        CHECK_TRUE(fbClient.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+
+        // 2. Feed keystrokes q -> u -> a -> n
+        IpcKeyRequest keyReq{};
+        keyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        keyReq.session_id = sid;
+        keyReq.context_id = cid;
+        keyReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        IpcKeyResponse keyResp{};
+
+        // 'q'
+        keyReq.vk_code = 'Q';
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Send 'q'");
+        CHECK_TRUE(wcscmp(keyResp.composition, L"q") == 0, L"Composition is 'q'");
+
+        // 'u'
+        keyReq.vk_code = 'U';
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Send 'u'");
+        CHECK_TRUE(wcscmp(keyResp.composition, L"qu") == 0, L"Composition is 'qu'");
+
+        // 'a'
+        keyReq.vk_code = 'A';
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Send 'a'");
+        CHECK_TRUE(wcscmp(keyResp.composition, L"qua") == 0, L"Composition is 'qua'");
+
+        // 'n' -> 'quan'
+        keyReq.vk_code = 'N';
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Send 'n'");
+        CHECK_TRUE(wcscmp(keyResp.composition, L"quan") == 0, L"Composition is 'quan'");
+
+        // 3. Wubi has no match for 'quan', Pinyin retrieves candidates!
+        CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates must exist for 'quan' via pinyin fallback");
+        std::wcout << L"  'quan' candidate count: " << keyResp.candidate_count << L", top: " << keyResp.candidates[0] << std::endl;
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"全") != nullptr, L"Top candidate must contain '全'");
+
+        // 4. Space commits pure Chinese text
+        keyReq.vk_code = VK_SPACE;
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Press Space to commit candidate");
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit must be 1");
+        CHECK_TRUE(wcslen(keyResp.commit_text) > 0, L"Committed text must not be empty");
+        for (size_t i = 0; i < wcslen(keyResp.commit_text); ++i) {
+            wchar_t ch = keyResp.commit_text[i];
+            CHECK_TRUE((ch >= 0x4E00 && ch <= 0x9FFF) || (ch >= 0x3400 && ch <= 0x4DBF), L"Committed text must strictly be Chinese character");
+        }
+        std::wcout << L"  'quan' committed text: " << keyResp.commit_text << std::endl;
+
+        // 5. Mixed input disabled: no cross-scheme matching
+        fbClient.Disconnect();
+        fbService.Stop();
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(fallbackDb, dictDir), L"Reopen DB to disable mixed input");
+            auto pol = *seed.GetPolicy();
+            pol.mixed_input_enabled = false;
+            CHECK_TRUE(seed.SavePolicy(pol), L"Save policy with mixed_input_enabled = false");
+        }
+
+        CHECK_TRUE(fbService.Start(fallbackDb, dictDir), L"Restart service with mixed_input_enabled = false");
+        CHECK_TRUE(fbClient.SendRequest(pingReq, pingResp, 200), L"Ping service after disabling mixed input");
+        CHECK_TRUE(fbClient.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
+        CHECK_TRUE(fbClient.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+
+        for (char ch : { 'Q', 'U', 'A', 'N' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Type key in non-mixed mode");
+        }
+        CHECK_TRUE(wcscmp(keyResp.composition, L"quan") == 0, L"Composition is 'quan'");
+        CHECK_EQUAL(keyResp.candidate_count, 0u, L"No candidates should match 'quan' when mixed input is disabled");
+
+        keyReq.vk_code = VK_ESCAPE;
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Press Esc to cancel composition");
+        CHECK_TRUE(wcslen(keyResp.composition) == 0, L"Composition cleared after Esc");
+
+        // 6. Quanpin disabled: mixed input enabled but Pinyin disabled -> no fallback to Pinyin
+        fbClient.Disconnect();
+        fbService.Stop();
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(fallbackDb, dictDir), L"Reopen DB to disable Pinyin");
+            auto pol = *seed.GetPolicy();
+            pol.mixed_input_enabled = true;
+            pol.SetMethodEnabled(ime::InputScheme::Pinyin, false);
+            CHECK_TRUE(seed.SavePolicy(pol), L"Save policy with Pinyin disabled");
+        }
+
+        CHECK_TRUE(fbService.Start(fallbackDb, dictDir), L"Restart service with Pinyin disabled");
+        CHECK_TRUE(fbClient.SendRequest(pingReq, pingResp, 200), L"Ping service after disabling Pinyin");
+        CHECK_TRUE(fbClient.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
+        CHECK_TRUE(fbClient.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+
+        for (char ch : { 'Q', 'U', 'A', 'N' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Type key with Pinyin disabled");
+        }
+        CHECK_EQUAL(keyResp.candidate_count, 0u, L"No candidates should match 'quan' when Pinyin is disabled");
+
+        keyReq.vk_code = VK_ESCAPE;
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Press Esc");
+
+        // 7. Restart service and verify policy persistence + another valid pinyin code beyond 'quan' (e.g. 'zheng')
+        fbClient.Disconnect();
+        fbService.Stop();
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(fallbackDb, dictDir), L"Reopen DB to re-enable Pinyin");
+            auto pol = *seed.GetPolicy();
+            pol.mixed_input_enabled = true;
+            pol.SetMethodEnabled(ime::InputScheme::Pinyin, true);
+            CHECK_TRUE(seed.SavePolicy(pol), L"Save persisted policy");
+        }
+
+        CHECK_TRUE(fbService.Start(fallbackDb, dictDir), L"Restart service to test persistence");
+        CHECK_TRUE(fbClient.SendRequest(pingReq, pingResp, 200), L"Ping restarted service");
+
+        for (char ch : { 'Z', 'H', 'E', 'N', 'G' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Type 'zheng'");
+        }
+        CHECK_TRUE(wcscmp(keyResp.composition, L"zheng") == 0, L"Composition is 'zheng'");
+        CHECK_TRUE(keyResp.candidate_count > 0, L"Candidates exist for 'zheng' via Pinyin fallback");
+        std::wcout << L"  'zheng' candidate count: " << keyResp.candidate_count << L", top: " << keyResp.candidates[0] << std::endl;
+        // Verify top candidate has Chinese characters after the number prefix
+        wchar_t* dotPos = wcschr(keyResp.candidates[0], L'.');
+        CHECK_TRUE(dotPos != nullptr && *(dotPos + 1) == L' ' && (*(dotPos + 2) >= 0x4E00 && *(dotPos + 2) <= 0x9FFF), L"Top candidate for 'zheng' must be Chinese");
+
+        keyReq.vk_code = '1';
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200), L"Select candidate 1");
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit must be 1");
+        CHECK_TRUE(wcslen(keyResp.commit_text) > 0, L"commit_text non-empty");
+        std::wcout << L"  'zheng' committed text: " << keyResp.commit_text << std::endl;
+
+        fbClient.Disconnect();
+        fbService.Stop();
+        std::filesystem::remove(fallbackDb, ec);
+
+        std::wcout << L"[PASS] Fallback chain & persistence verified (mixed input cascading, scheme isolation, persistence, multi-code)!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 & 4C-2 End-to-End Tests PASSED! (18/18)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 End-to-End Tests PASSED! (19/19)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

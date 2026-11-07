@@ -1,0 +1,247 @@
+<UserControl x:Class="PersonalIME.Manager.Views.PluginsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" 
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008" 
+             xmlns:vm="clr-namespace:PersonalIME.Manager.ViewModels"
+             mc:Ignorable="d" 
+             d:DataContext="{d:DesignInstance Type=vm:PluginsViewModel}"
+             d:DesignHeight="600" d:DesignWidth="900">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/> <!-- Action toolbar -->
+            <RowDefinition Height="*"/>    <!-- Main content split -->
+        </Grid.RowDefinitions>
+
+        <!-- Top Action Toolbar -->
+        <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Padding="14,10" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="🧩 扩展插件列表" FontSize="15" FontWeight="Bold" Foreground="#111827" VerticalAlignment="Center"/>
+                    <TextBlock Text="（在候选词框末尾直接点击唤起应用，数据持久化于 SQLite）" FontSize="12" Foreground="#6B7280" VerticalAlignment="Center" Margin="8,0,0,0"/>
+                </StackPanel>
+
+                <Button Grid.Column="2" Content="+ 添加插件" Command="{Binding NewPluginCommand}" Background="#0066CC" Foreground="White" FontWeight="Bold" Padding="14,6" Height="30" Margin="0,0,8,0" Cursor="Hand"/>
+                <Button Grid.Column="3" Content="刷新" Command="{Binding RefreshCommand}" Padding="12,6" Height="30" Cursor="Hand"/>
+            </Grid>
+        </Border>
+
+        <!-- Main Body: Two Columns (Left: Plugin Grid & Actions, Right: Edit Form & Execution Logs) -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="3*"/>
+                <ColumnDefinition Width="12"/>
+                <ColumnDefinition Width="2*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Left: Plugins DataGrid -->
+            <Border Grid.Column="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Padding="12">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <DataGrid Grid.Row="0" ItemsSource="{Binding Plugins}" SelectedItem="{Binding SelectedPlugin}" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single" GridLinesVisibility="Horizontal" HeadersVisibility="Column" Background="White" RowHeight="40" BorderThickness="0">
+                        <DataGrid.Columns>
+                            <!-- Icon -->
+                            <DataGridTemplateColumn Header="图标" Width="55">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Border Width="28" Height="28" Background="#F3F4F6" CornerRadius="4" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding Icon}" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Name -->
+                            <DataGridTextColumn Header="名称" Binding="{Binding Name}" Width="110" FontWeight="SemiBold"/>
+
+                            <!-- ExecPath & Arguments -->
+                            <DataGridTemplateColumn Header="执行路径与参数" Width="*">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <StackPanel VerticalAlignment="Center" Margin="4,0">
+                                            <TextBlock Text="{Binding ExecPath}" Foreground="#1F2937" FontSize="12" TextTrimming="CharacterEllipsis"/>
+                                            <TextBlock Text="{Binding Arguments}" Foreground="#9CA3AF" FontSize="11" TextTrimming="CharacterEllipsis" Visibility="{Binding Arguments, Converter={x:Null}}"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Enabled State -->
+                            <DataGridTemplateColumn Header="状态" Width="70">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Border CornerRadius="4" Padding="6,2" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                            <Border.Style>
+                                                <Style TargetType="Border">
+                                                    <Setter Property="Background" Value="#DEF7EC"/>
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsEnabled}" Value="False">
+                                                            <Setter Property="Background" Value="#F3F4F6"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Border.Style>
+                                            <TextBlock FontSize="11" FontWeight="SemiBold">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Text" Value="已启用"/>
+                                                        <Setter Property="Foreground" Value="#03543F"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsEnabled}" Value="False">
+                                                                <Setter Property="Text" Value="已停用"/>
+                                                                <Setter Property="Foreground" Value="#6B7280"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </Border>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Actions -->
+                            <DataGridTemplateColumn Header="操作" Width="150">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                            <Button Content="▶ 运行" Command="{Binding DataContext.ExecutePluginCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" Background="#10B981" Foreground="White" Padding="6,2" FontSize="11" Margin="0,0,4,0" Cursor="Hand"/>
+                                            <Button Content="切换" Command="{Binding DataContext.ToggleEnabledCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" Padding="6,2" FontSize="11" Margin="0,0,4,0" Cursor="Hand"/>
+                                            <Button Content="删除" Command="{Binding DataContext.DeletePluginCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" Background="#EF4444" Foreground="White" Padding="6,2" FontSize="11" Cursor="Hand"/>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <TextBlock Grid.Row="1" Text="💡 提示：在候选词框中，点击齿轮右侧的插件图标即可秒开对应应用。" Foreground="#6B7280" FontSize="11" Margin="4,8,4,0"/>
+                </Grid>
+            </Border>
+
+            <!-- Right Column: Add/Edit Form & Logs Console -->
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/> <!-- Form Card -->
+                    <RowDefinition Height="12"/>
+                    <RowDefinition Height="*"/>    <!-- Logs Console -->
+                </Grid.RowDefinitions>
+
+                <!-- Plugin Edit Card -->
+                <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Padding="14">
+                    <StackPanel>
+                        <TextBlock Text="⚙ 插件配置" FontSize="14" FontWeight="Bold" Foreground="#111827" Margin="0,0,0,10"/>
+
+                        <!-- Name & Icon -->
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="60"/>
+                                <ColumnDefinition Width="8"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="图标 (Emoji)" FontSize="11" Foreground="#4B5563" Margin="0,0,0,3"/>
+                                <TextBox Text="{Binding FormIcon, UpdateSourceTrigger=PropertyChanged}" Height="28" HorizontalContentAlignment="Center" VerticalContentAlignment="Center" FontSize="14"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="插件名称" FontSize="11" Foreground="#4B5563" Margin="0,0,0,3"/>
+                                <TextBox Text="{Binding FormName, UpdateSourceTrigger=PropertyChanged}" Height="28" VerticalContentAlignment="Center" Padding="6,0"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Exec Path -->
+                        <TextBlock Text="可执行程序路径 (如 calc.exe, mspaint.exe)" FontSize="11" Foreground="#4B5563" Margin="0,0,0,3"/>
+                        <Grid Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0" Text="{Binding FormExecPath, UpdateSourceTrigger=PropertyChanged}" Height="28" VerticalContentAlignment="Center" Padding="6,0"/>
+                            <Button Grid.Column="1" Content="浏览..." Command="{Binding BrowsePathCommand}" Margin="6,0,0,0" Padding="8,2" Height="28" Cursor="Hand"/>
+                        </Grid>
+
+                        <!-- Arguments -->
+                        <TextBlock Text="执行参数 (如网址、命令行参数)" FontSize="11" Foreground="#4B5563" Margin="0,0,0,3"/>
+                        <TextBox Text="{Binding FormArguments, UpdateSourceTrigger=PropertyChanged}" Height="28" VerticalContentAlignment="Center" Padding="6,0" Margin="0,0,0,8"/>
+
+                        <!-- Enabled & Order -->
+                        <Grid Margin="0,0,0,12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <CheckBox Content="启用此插件并在候选框展示" IsChecked="{Binding FormIsEnabled}" VerticalAlignment="Center"/>
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="排序: " FontSize="11" Foreground="#4B5563" VerticalAlignment="Center"/>
+                                <TextBox Text="{Binding FormSortOrder, UpdateSourceTrigger=PropertyChanged}" Width="45" Height="24" HorizontalContentAlignment="Center" VerticalContentAlignment="Center"/>
+                            </StackPanel>
+                        </Grid>
+
+                        <!-- Form Action Buttons -->
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button Content="取消" Command="{Binding CancelFormCommand}" Padding="12,5" Margin="0,0,8,0" Cursor="Hand"/>
+                            <Button Content="保存插件" Command="{Binding SaveFormCommand}" Background="#0066CC" Foreground="White" FontWeight="Bold" Padding="14,5" Cursor="Hand"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- Execution Logs Console -->
+                <Border Grid.Row="2" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Padding="14">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <Grid Grid.Row="0" Margin="0,0,0,8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="📋 插件执行日志" FontSize="13" FontWeight="Bold" Foreground="#111827" VerticalAlignment="Center"/>
+                            <Button Grid.Column="1" Content="清空日志" Command="{Binding ClearLogsCommand}" Padding="8,3" FontSize="11" Cursor="Hand"/>
+                        </Grid>
+
+                        <DataGrid Grid.Row="1" ItemsSource="{Binding Logs}" AutoGenerateColumns="False" IsReadOnly="True" GridLinesVisibility="Horizontal" HeadersVisibility="Column" Background="#F9FAFB" RowHeight="26" BorderThickness="0" FontSize="11">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="时间" Binding="{Binding ExecutedAt}" Width="75"/>
+                                <DataGridTextColumn Header="插件" Binding="{Binding PluginName}" Width="70" FontWeight="SemiBold"/>
+                                <DataGridTemplateColumn Header="状态" Width="60">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Status}" FontWeight="Bold" HorizontalAlignment="Center">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground" Value="#059669"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Status}" Value="FAILED">
+                                                                <Setter Property="Foreground" Value="#DC2626"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                                <DataGridTextColumn Header="信息" Binding="{Binding ErrorMessage}" Width="*"/>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </Grid>
+                </Border>
+            </Grid>
+        </Grid>
+    </Grid>
+</UserControl>
+

@@ -7,30 +7,183 @@
         xmlns:views="clr-namespace:PersonalIME.Manager.Views"
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel}"
-        Title="PersonalIME 管理器" Height="700" Width="950" MinHeight="550" MinWidth="800"
-        WindowStartupLocation="CenterScreen">
+        Title="人人 设置" Height="720" Width="980" MinHeight="580" MinWidth="820"
+        WindowStartupLocation="CenterScreen"
+        Icon="Assets/app.ico"
+        Background="#F9FAFB">
+
+    <Window.Resources>
+        <!-- Modern Flat TabControl Style -->
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="#F9FAFB"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabControl">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="*"/>
+                            </Grid.RowDefinitions>
+                            <!-- Tab Header Strip -->
+                            <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+                                <TabPanel IsItemsHost="True" Margin="16,0,16,0"/>
+                            </Border>
+                            <!-- Tab Content -->
+                            <Border Grid.Row="1" Background="{TemplateBinding Background}">
+                                <ContentPresenter ContentSource="SelectedContent"/>
+                            </Border>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Modern Underlined TabItem Style -->
+        <Style TargetType="TabItem">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="Foreground" Value="#4B5563"/>
+            <Setter Property="Padding" Value="22,12"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="TabBorder" Background="Transparent" Padding="{TemplateBinding Padding}" BorderThickness="0,0,0,3" BorderBrush="Transparent">
+                            <ContentPresenter x:Name="TabContent" ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#F3F4F6"/>
+                                <Setter Property="Foreground" Value="#111827"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="BorderBrush" Value="#0066CC"/>
+                                <Setter TargetName="TabBorder" Property="Background" Value="Transparent"/>
+                                <Setter Property="Foreground" Value="#0066CC"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/> <!-- Modern Brand Header -->
+            <RowDefinition Height="Auto"/> <!-- Top Notification Banner -->
+            <RowDefinition Height="*"/>    <!-- Tab Views -->
+            <RowDefinition Height="Auto"/> <!-- Bottom Status Bar -->
         </Grid.RowDefinitions>
 
+        <!-- Modern Brand Header Bar -->
+        <Border Grid.Row="0" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="20,12">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- App Vector SVG Icon & Title -->
+                <Viewbox Grid.Column="0" Width="40" Height="40" Margin="0,0,12,0" VerticalAlignment="Center">
+                    <Canvas Width="256" Height="256">
+                        <Rectangle Canvas.Left="8" Canvas.Top="8" Width="240" Height="240" RadiusX="54" RadiusY="54" Stroke="#33FFFFFF" StrokeThickness="4">
+                            <Rectangle.Fill>
+                                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                                    <GradientStop Color="#0078D4" Offset="0.0"/>
+                                    <GradientStop Color="#004E8C" Offset="1.0"/>
+                                </LinearGradientBrush>
+                            </Rectangle.Fill>
+                        </Rectangle>
+                        <!-- Background Echo "人" -->
+                        <Canvas RenderTransform="1,0,0,1,26,-16">
+                            <Path Data="M 128,56 C 122,108 96,156 54,196" Stroke="#997CE8FF" StrokeThickness="24" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="M 116,108 C 138,142 166,174 202,196" Stroke="#997CE8FF" StrokeThickness="24" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Canvas>
+                        <!-- Foreground Primary Bold "人" -->
+                        <Canvas RenderTransform="1,0,0,1,-10,8">
+                            <Path Data="M 128,56 C 122,108 96,156 54,196" Stroke="#FFFFFF" StrokeThickness="26" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                            <Path Data="M 116,108 C 138,142 166,174 202,196" Stroke="#FFFFFF" StrokeThickness="26" StrokeStartLineCap="Round" StrokeEndLineCap="Round"/>
+                        </Canvas>
+                    </Canvas>
+                </Viewbox>
+
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="人人" FontSize="18" FontWeight="Bold" Foreground="#111827"/>
+                        <Border Margin="8,0,0,0" Background="#EEF2F6" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
+                            <TextBlock Text="人人 · 智能五笔 / 拼音混输" FontSize="11" Foreground="#4B5563" FontWeight="SemiBold"/>
+                        </Border>
+                    </StackPanel>
+                    <TextBlock Text="现代中文输入法与个性化词库管理" FontSize="11" Foreground="#6B7280" Margin="0,2,0,0"/>
+                </StackPanel>
+
+                <!-- Right Side: Unified Status Badge -->
+                <Border Grid.Column="2" VerticalAlignment="Center" CornerRadius="14" Padding="12,5" BorderThickness="1">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Background" Value="#ECFDF5"/>
+                            <Setter Property="BorderBrush" Value="#A7F3D0"/>
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IsConnected}" Value="False">
+                                    <Setter Property="Background" Value="#FEF2F2"/>
+                                    <Setter Property="BorderBrush" Value="#FECACA"/>
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <!-- Status Dot -->
+                        <Ellipse Width="8" Height="8" Margin="0,0,6,0">
+                            <Ellipse.Style>
+                                <Style TargetType="Ellipse">
+                                    <Setter Property="Fill" Value="#10B981"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsConnected}" Value="False">
+                                            <Setter Property="Fill" Value="#EF4444"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Ellipse.Style>
+                        </Ellipse>
+                        <TextBlock FontSize="12" FontWeight="SemiBold">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Text" Value="输入法就绪"/>
+                                    <Setter Property="Foreground" Value="#065F46"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsConnected}" Value="False">
+                                            <Setter Property="Text" Value="服务离线"/>
+                                            <Setter Property="Foreground" Value="#991B1B"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+
         <!-- Top Notification Banner -->
-        <Border Grid.Row="0" Visibility="{Binding Banner.IsVisible, Converter={StaticResource BooleanToVisibilityConverter}, FallbackValue=Collapsed}"
-                Padding="16,10" BorderThickness="0,0,0,1" BorderBrush="#CCCCCC">
+        <Border Grid.Row="1" Visibility="{Binding Banner.IsVisible, Converter={StaticResource BooleanToVisibilityConverter}, FallbackValue=Collapsed}"
+                Padding="16,10" BorderThickness="0,0,0,1" BorderBrush="#E5E7EB">
             <Border.Style>
                 <Style TargetType="Border">
-                    <Setter Property="Background" Value="#D1ECF1"/>
+                    <Setter Property="Background" Value="#EFF6FF"/>
                     <Style.Triggers>
                         <DataTrigger Binding="{Binding Banner.Type}" Value="Success">
-                            <Setter Property="Background" Value="#D4EDDA"/>
+                            <Setter Property="Background" Value="#ECFDF5"/>
                         </DataTrigger>
                         <DataTrigger Binding="{Binding Banner.Type}" Value="Warning">
-                            <Setter Property="Background" Value="#FFF3CD"/>
+                            <Setter Property="Background" Value="#FFFBEB"/>
                         </DataTrigger>
                         <DataTrigger Binding="{Binding Banner.Type}" Value="Error">
-                            <Setter Property="Background" Value="#F8D7DA"/>
+                            <Setter Property="Background" Value="#FEF2F2"/>
                         </DataTrigger>
                     </Style.Triggers>
                 </Style>
@@ -43,16 +196,16 @@
                 <TextBlock Grid.Column="0" Text="{Binding Banner.Message}" FontWeight="SemiBold" VerticalAlignment="Center">
                     <TextBlock.Style>
                         <Style TargetType="TextBlock">
-                            <Setter Property="Foreground" Value="#0C5460"/>
+                            <Setter Property="Foreground" Value="#1E40AF"/>
                             <Style.Triggers>
                                 <DataTrigger Binding="{Binding Banner.Type}" Value="Success">
-                                    <Setter Property="Foreground" Value="#155724"/>
+                                    <Setter Property="Foreground" Value="#065F46"/>
                                 </DataTrigger>
                                 <DataTrigger Binding="{Binding Banner.Type}" Value="Warning">
-                                    <Setter Property="Foreground" Value="#856404"/>
+                                    <Setter Property="Foreground" Value="#92400E"/>
                                 </DataTrigger>
                                 <DataTrigger Binding="{Binding Banner.Type}" Value="Error">
-                                    <Setter Property="Foreground" Value="#721C24"/>
+                                    <Setter Property="Foreground" Value="#991B1B"/>
                                 </DataTrigger>
                             </Style.Triggers>
                         </Style>
@@ -63,54 +216,104 @@
         </Border>
 
         <!-- Four Tab Views (Wordbook, Sorting, Settings, Maintenance) -->
-        <TabControl Grid.Row="1" SelectedIndex="{Binding SelectedTabIndex}" BorderThickness="0,1,0,0" BorderBrush="#E0E0E0">
-            <TabControl.Resources>
-                <Style TargetType="TabItem">
-                    <Setter Property="FontSize" Value="14"/>
-                    <Setter Property="FontWeight" Value="SemiBold"/>
-                    <Setter Property="Padding" Value="24,10"/>
-                </Style>
-            </TabControl.Resources>
-
-            <TabItem Header="词库">
+        <TabControl Grid.Row="2" SelectedIndex="{Binding SelectedTabIndex}">
+            <TabItem Header="词库管理">
                 <views:WordbookView DataContext="{Binding Wordbook}"/>
             </TabItem>
 
-            <TabItem Header="排序">
+            <TabItem Header="词条排序">
                 <views:SortingView DataContext="{Binding Sorting}"/>
             </TabItem>
 
-            <TabItem Header="设置">
+            <TabItem Header="输入设置">
                 <views:SettingsView DataContext="{Binding Settings}"/>
             </TabItem>
 
-            <TabItem Header="维护">
+            <TabItem Header="插件管理">
+                <views:PluginsView DataContext="{Binding Plugins}"/>
+            </TabItem>
+
+            <TabItem Header="系统与诊断">
                 <views:MaintenanceView DataContext="{Binding Maintenance}"/>
             </TabItem>
         </TabControl>
 
         <!-- Bottom Status Bar -->
-        <Border Grid.Row="2" Background="#F8F9FA" BorderBrush="#E0E0E0" BorderThickness="0,1,0,0" Padding="14,6">
+        <Border Grid.Row="3" Background="#FFFFFF" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Padding="16,10">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
-                <TextBlock Grid.Column="0" Text="{Binding ConnectionStatusText}" VerticalAlignment="Center" FontSize="12">
-                    <TextBlock.Style>
-                        <Style TargetType="TextBlock">
-                            <Setter Property="Foreground" Value="#28A745"/>
-                            <Style.Triggers>
-                                <DataTrigger Binding="{Binding IsConnected}" Value="False">
-                                    <Setter Property="Foreground" Value="#DC3545"/>
-                                </DataTrigger>
-                            </Style.Triggers>
-                        </Style>
-                    </TextBlock.Style>
-                </TextBlock>
+                <!-- Left Section: State Chips and Warning -->
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding ConnectionStatusText}" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="#059669"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsConnected}" Value="False">
+                                        <Setter Property="Foreground" Value="#DC2626"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
 
-                <Button Grid.Column="1" Content="测试连接" Command="{Binding CheckConnectionCommand}" Padding="8,2" FontSize="11"/>
+                    <!-- Offline hint if disconnected -->
+                    <TextBlock Text=" — " Foreground="#9CA3AF" Margin="6,0" Visibility="{Binding HasOfflineWarning, Converter={StaticResource BooleanToVisibilityConverter}, FallbackValue=Collapsed}" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding OfflineWarningText}" Foreground="#DC2626" FontSize="12" VerticalAlignment="Center"
+                               Visibility="{Binding HasOfflineWarning, Converter={StaticResource BooleanToVisibilityConverter}, FallbackValue=Collapsed}"/>
+
+                    <!-- Active Configuration Badges -->
+                    <Border Margin="14,0,0,0" Background="#F3F4F6" CornerRadius="6" Padding="10,4" VerticalAlignment="Center"
+                            Visibility="{Binding IsConnected, Converter={StaticResource BooleanToVisibilityConverter}}">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock Text="当前方案: " FontSize="11" Foreground="#6B7280"/>
+                            <TextBlock Text="{Binding ActiveSchemeText}" FontSize="11" FontWeight="SemiBold" Foreground="#1F2937"/>
+
+                            <TextBlock Text="  ·  混输: " FontSize="11" Foreground="#6B7280"/>
+                            <TextBlock Text="{Binding ActiveMixedInputText}" FontSize="11" FontWeight="SemiBold" Foreground="#1F2937"/>
+
+                            <TextBlock Text="  ·  初始模式: " FontSize="11" Foreground="#6B7280"/>
+                            <TextBlock Text="{Binding ActiveInitialModeText}" FontSize="11" FontWeight="SemiBold" Foreground="#1F2937"/>
+
+                            <TextBlock Text="  ·  配置: " FontSize="11" Foreground="#6B7280"/>
+                            <TextBlock Text="{Binding ConfigSavedStatusText}" FontSize="11" FontWeight="SemiBold" Foreground="#1F2937"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- Right Section: Reconnect / Refresh Action -->
+                <Button Grid.Column="1" Content="刷新连接" Command="{Binding CheckConnectionCommand}" 
+                        Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand">
+                    <Button.Style>
+                        <Style TargetType="Button">
+                            <Setter Property="Background" Value="#F9FAFB"/>
+                            <Setter Property="BorderBrush" Value="#D1D5DB"/>
+                            <Setter Property="Foreground" Value="#374151"/>
+                            <Setter Property="Template">
+                                <Setter.Value>
+                                    <ControlTemplate TargetType="Button">
+                                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
+                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter Property="Background" Value="#E5E7EB"/>
+                                                <Setter Property="BorderBrush" Value="#9CA3AF"/>
+                                            </Trigger>
+                                            <Trigger Property="IsPressed" Value="True">
+                                                <Setter Property="Background" Value="#D1D5DB"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Setter.Value>
+                            </Setter>
+                        </Style>
+                    </Button.Style>
+                </Button>
             </Grid>
         </Border>
     </Grid>

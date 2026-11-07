@@ -583,6 +583,11 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Field 'params' must be an object");
         }
         params = req["params"];
+    } else if (req.contains("parameters")) {
+        if (!req["parameters"].is_object()) {
+            return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Field 'parameters' must be an object");
+        }
+        params = req["parameters"];
     }
 
     try {
@@ -1355,6 +1360,205 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             data["all_codes"] = rl.all_codes;
             data["char_codes"] = rl.char_codes;
 
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 14. GetPlugins
+        if (action == "GetPlugins" || action == "get_plugins") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            bool onlyEnabled = false;
+            std::string err;
+            if (params.contains("only_enabled")) {
+                CheckBoolField(params, "only_enabled", onlyEnabled, false, false, err);
+            }
+            std::vector<PluginRecord> list;
+            if (!m_engine.GetPluginRepo()->GetAllPlugins(list, onlyEnabled)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to query plugins");
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& p : list) {
+                nlohmann::json item;
+                item["id"] = p.id;
+                item["name"] = p.name;
+                item["icon"] = p.icon;
+                item["exec_path"] = p.exec_path;
+                item["arguments"] = p.arguments;
+                item["is_enabled"] = p.is_enabled;
+                item["sort_order"] = p.sort_order;
+                item["created_at"] = p.created_at;
+                arr.push_back(item);
+            }
+            nlohmann::json data;
+            data["plugins"] = arr;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 15. AddPlugin
+        if (action == "AddPlugin" || action == "add_plugin") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            std::string name, icon, execPath, args, err;
+            if (!CheckStringField(params, "name", name, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            if (!CheckStringField(params, "icon", icon, false, err) || icon.empty()) {
+                icon = "🧩";
+            }
+            if (!CheckStringField(params, "exec_path", execPath, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            CheckStringField(params, "arguments", args, false, err);
+
+            bool isEnabled = true;
+            CheckBoolField(params, "is_enabled", isEnabled, false, true, err);
+            int sortOrder = 0;
+            CheckIntField(params, "sort_order", sortOrder, false, 0, err);
+
+            PluginRecord rec;
+            rec.name = name;
+            rec.icon = icon;
+            rec.exec_path = execPath;
+            rec.arguments = args;
+            rec.is_enabled = isEnabled;
+            rec.sort_order = sortOrder;
+
+            int64_t newId = 0;
+            if (!m_engine.GetPluginRepo()->AddPlugin(rec, newId)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to insert plugin");
+            }
+
+            nlohmann::json data;
+            data["success"] = true;
+            data["id"] = newId;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 16. UpdatePlugin
+        if (action == "UpdatePlugin" || action == "update_plugin") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            int id = 0;
+            std::string err;
+            if (!CheckIntField(params, "id", id, true, 0, err) || id <= 0) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Valid 'id' is required");
+            }
+
+            PluginRecord rec;
+            if (!m_engine.GetPluginRepo()->GetPluginById(id, rec)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Plugin not found");
+            }
+
+            if (params.contains("name")) CheckStringField(params, "name", rec.name, false, err);
+            if (params.contains("icon")) CheckStringField(params, "icon", rec.icon, false, err);
+            if (params.contains("exec_path")) CheckStringField(params, "exec_path", rec.exec_path, false, err);
+            if (params.contains("arguments")) CheckStringField(params, "arguments", rec.arguments, false, err);
+            if (params.contains("is_enabled")) CheckBoolField(params, "is_enabled", rec.is_enabled, false, rec.is_enabled, err);
+            if (params.contains("sort_order")) CheckIntField(params, "sort_order", rec.sort_order, false, rec.sort_order, err);
+
+            if (!m_engine.GetPluginRepo()->UpdatePlugin(rec)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to update plugin");
+            }
+
+            nlohmann::json data;
+            data["success"] = true;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 17. DeletePlugin
+        if (action == "DeletePlugin" || action == "delete_plugin") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            int id = 0;
+            std::string err;
+            if (!CheckIntField(params, "id", id, true, 0, err) || id <= 0) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Valid 'id' is required");
+            }
+
+            if (!m_engine.GetPluginRepo()->DeletePlugin(id)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to delete plugin");
+            }
+
+            nlohmann::json data;
+            data["success"] = true;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 18. ExecutePlugin
+        if (action == "ExecutePlugin" || action == "execute_plugin") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            std::string outMsg;
+            bool ok = false;
+            if (params.contains("id")) {
+                int id = 0;
+                std::string err;
+                if (!CheckIntField(params, "id", id, true, 0, err)) {
+                    return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+                }
+                ok = m_engine.GetPluginRepo()->ExecutePlugin(id, outMsg);
+            } else if (params.contains("exec_path")) {
+                std::string name = "自定义执行", path, args, err;
+                CheckStringField(params, "name", name, false, err);
+                CheckStringField(params, "exec_path", path, true, err);
+                CheckStringField(params, "arguments", args, false, err);
+                ok = m_engine.GetPluginRepo()->ExecuteCustom(name, path, args, outMsg);
+            } else {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::MissingParameter, "Either 'id' or 'exec_path' is required");
+            }
+
+            nlohmann::json data;
+            data["success"] = ok;
+            data["message"] = outMsg;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 19. GetPluginLogs
+        if (action == "GetPluginLogs" || action == "get_plugin_logs") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            int limit = 100;
+            std::string err;
+            if (params.contains("limit")) {
+                CheckIntField(params, "limit", limit, false, 100, err);
+            }
+            std::vector<PluginLogRecord> logs;
+            if (!m_engine.GetPluginRepo()->GetPluginLogs(logs, limit)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to query plugin logs");
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& l : logs) {
+                nlohmann::json item;
+                item["id"] = l.id;
+                item["plugin_id"] = l.plugin_id;
+                item["plugin_name"] = l.plugin_name;
+                item["command_line"] = l.command_line;
+                item["executed_at"] = l.executed_at;
+                item["status"] = l.status;
+                item["message"] = l.message;
+                arr.push_back(item);
+            }
+            nlohmann::json data;
+            data["logs"] = arr;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 20. ClearPluginLogs
+        if (action == "ClearPluginLogs" || action == "clear_plugin_logs") {
+            if (!m_engine.GetPluginRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Plugin repository unavailable");
+            }
+            if (!m_engine.GetPluginRepo()->ClearPluginLogs()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to clear plugin logs");
+            }
+            nlohmann::json data;
+            data["success"] = true;
             return MakeSuccessResponse(action, requestId, data);
         }
 

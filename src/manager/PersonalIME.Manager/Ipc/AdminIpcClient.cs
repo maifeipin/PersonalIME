@@ -376,4 +376,80 @@ public class AdminIpcClient : IAdminClient
         var data = await SendRequestAsync("ReverseLookup", p, ct);
         return JsonSerializer.Deserialize<ReverseLookupResultItem>(data.GetRawText()) ?? new();
     }
+
+    public async Task<List<PluginModel>> GetPluginsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+    {
+        var p = new JsonObject { ["only_enabled"] = onlyEnabled };
+        var data = await SendRequestAsync("GetPlugins", p, ct);
+        if (data.TryGetProperty("plugins", out var pluginsProp))
+        {
+            return JsonSerializer.Deserialize<List<PluginModel>>(pluginsProp.GetRawText()) ?? [];
+        }
+        return [];
+    }
+
+    public async Task<long> AddPluginAsync(PluginModel plugin, CancellationToken ct = default)
+    {
+        var p = new
+        {
+            name = plugin.Name,
+            icon = plugin.Icon,
+            exec_path = plugin.ExecPath,
+            arguments = plugin.Arguments,
+            is_enabled = plugin.IsEnabled,
+            sort_order = plugin.SortOrder
+        };
+        var data = await SendRequestAsync("AddPlugin", p, ct);
+        if (data.TryGetProperty("id", out var idProp))
+        {
+            return idProp.GetInt64();
+        }
+        throw new AdminException(AdminErrorCode.ValidationFailed, "服务端未返回插件 id");
+    }
+
+    public async Task UpdatePluginAsync(PluginModel plugin, CancellationToken ct = default)
+    {
+        var p = new
+        {
+            id = plugin.Id,
+            name = plugin.Name,
+            icon = plugin.Icon,
+            exec_path = plugin.ExecPath,
+            arguments = plugin.Arguments,
+            is_enabled = plugin.IsEnabled,
+            sort_order = plugin.SortOrder
+        };
+        await SendRequestAsync("UpdatePlugin", p, ct);
+    }
+
+    public async Task DeletePluginAsync(long id, CancellationToken ct = default)
+    {
+        var p = new { id };
+        await SendRequestAsync("DeletePlugin", p, ct);
+    }
+
+    public async Task ExecutePluginAsync(long id, CancellationToken ct = default)
+    {
+        var p = new { id };
+        await SendRequestAsync("ExecutePlugin", p, ct);
+    }
+
+    public async Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default)
+    {
+        var p = new JsonObject { ["limit"] = limit };
+        if (pluginId.HasValue) p["plugin_id"] = pluginId.Value;
+        var data = await SendRequestAsync("GetPluginLogs", p, ct);
+        if (data.TryGetProperty("logs", out var logsProp))
+        {
+            return JsonSerializer.Deserialize<List<PluginLogModel>>(logsProp.GetRawText()) ?? [];
+        }
+        return [];
+    }
+
+    public async Task ClearPluginLogsAsync(long? pluginId = null, CancellationToken ct = default)
+    {
+        var p = new JsonObject();
+        if (pluginId.HasValue) p["plugin_id"] = pluginId.Value;
+        await SendRequestAsync("ClearPluginLogs", p, ct);
+    }
 }

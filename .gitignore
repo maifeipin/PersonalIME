@@ -60,6 +60,8 @@ docs/*
 !docs/input-policy-design.md
 !docs/stage5-host-acceptance.md
 !docs/stage5-finalization.md
+!docs/plugin-architecture-design.md
+!docs/stage6-smart-input-design.md
 
 
 # Test output directories

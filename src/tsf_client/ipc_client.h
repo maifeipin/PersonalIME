@@ -23,6 +23,8 @@ public:
     bool GetMode(uint64_t sessionId, uint64_t contextId, uint32_t& outModeFlags, ime::InputScheme& outScheme);
     bool SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme);
     bool GetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme& outScheme);
+    bool OpenManager(uint64_t sessionId, uint64_t contextId);
+    bool ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId);
     void Disconnect();
 
     struct AsyncIoOperation {

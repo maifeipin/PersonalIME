@@ -447,6 +447,7 @@ static void TestShuangpinIncompleteAndIllegalValidation(InputCoordinator& coordi
     p.primary_method = InputScheme::Shuangpin;
     p.shuangpin_layout = ShuangpinLayout::Natural;
     p.dictionary_order = {{DICT_ID_BUILTIN_PINYIN, true}};
+    p.mixed_input_enabled = false;
     coordinator.SetPolicy(p);
 
     ShuangpinDecoder dec(ShuangpinLayout::Natural);

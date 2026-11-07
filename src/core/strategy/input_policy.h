@@ -19,7 +19,7 @@ struct InputPolicy {
 
     // 1. Input Methods (输入方式)
     InputScheme primary_method = InputScheme::Wubi86;
-    bool mixed_input_enabled = false;
+    bool mixed_input_enabled = true;
     std::vector<InputScheme> input_method_order = {
         InputScheme::Wubi86,
         InputScheme::Pinyin,

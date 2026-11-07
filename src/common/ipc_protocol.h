@@ -20,7 +20,10 @@ enum class IpcMsgType : uint32_t {
     GetMode        = 11, // Query mode flags
     NextDictionary = 12, // Step to next dictionary in priority order
     SetScheme      = 13, // Explicitly set input scheme (Stage 4)
-    GetScheme      = 14  // Query input scheme (Stage 4)
+    GetScheme      = 14, // Query input scheme (Stage 4)
+    OpenManager    = 15, // Open or activate Manager (Stage 5)
+    ExecutePlugin  = 16, // Execute a registered plugin by ID (Stage 5 Extension)
+    GetPlugins     = 17  // Fetch active plugins list (Stage 5 Extension)
 };
 
 // Independent Scheme Identifier (Wire Protocol Values)

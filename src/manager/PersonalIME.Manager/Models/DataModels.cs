@@ -178,10 +178,18 @@ public class InputPolicyConfig
     ];
 
     [JsonPropertyName("enabled_input_methods")]
-    public List<string>? EnabledInputMethods { get; set; }
+    public List<string>? EnabledInputMethods { get; set; } = [
+        InputSchemes.Wubi86,
+        InputSchemes.Pinyin,
+        InputSchemes.Shuangpin
+    ];
 
     [JsonPropertyName("input_methods")]
-    public List<InputMethodConfigItem>? InputMethods { get; set; }
+    public List<InputMethodConfigItem>? InputMethods { get; set; } = [
+        new() { Scheme = InputSchemes.Wubi86, Enabled = true },
+        new() { Scheme = InputSchemes.Pinyin, Enabled = true },
+        new() { Scheme = InputSchemes.Shuangpin, Enabled = true }
+    ];
 
     [JsonPropertyName("dictionary_order")]
     public List<DictionaryPriorityItem> DictionaryPriorities { get; set; } = [
@@ -325,5 +333,59 @@ public class GetPinnedResult
 
     [JsonPropertyName("entries")]
     public List<PinnedItem> Entries { get; set; } = [];
+}
+
+public class PluginModel
+{
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("icon")]
+    public string Icon { get; set; } = "🧩";
+
+    [JsonPropertyName("exec_path")]
+    public string ExecPath { get; set; } = string.Empty;
+
+    [JsonPropertyName("arguments")]
+    public string Arguments { get; set; } = string.Empty;
+
+    [JsonPropertyName("is_enabled")]
+    public bool IsEnabled { get; set; } = true;
+
+    [JsonPropertyName("sort_order")]
+    public int SortOrder { get; set; }
+
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = string.Empty;
+}
+
+public class PluginLogModel
+{
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
+
+    [JsonPropertyName("plugin_id")]
+    public long PluginId { get; set; }
+
+    [JsonPropertyName("plugin_name")]
+    public string PluginName { get; set; } = string.Empty;
+
+    [JsonPropertyName("exec_path")]
+    public string ExecPath { get; set; } = string.Empty;
+
+    [JsonPropertyName("arguments")]
+    public string Arguments { get; set; } = string.Empty;
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = string.Empty;
+
+    [JsonPropertyName("error_message")]
+    public string ErrorMessage { get; set; } = string.Empty;
+
+    [JsonPropertyName("executed_at")]
+    public string ExecutedAt { get; set; } = string.Empty;
 }
 

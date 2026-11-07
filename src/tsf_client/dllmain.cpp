@@ -1,3 +1,4 @@
+// Personal IME (人人输入法) - TSF In-proc Server
 #include <windows.h>
 #include <msctf.h>
 #include <strsafe.h>
@@ -104,6 +105,7 @@ STDAPI DllRegisterServer() {
         return hr;
     }
 
+    pProfiles->RemoveLanguageProfile(CLSID_PersonalIME, IME_LANGID, GUID_PersonalIME_Profile);
     hr = pProfiles->AddLanguageProfile(
         CLSID_PersonalIME,
         IME_LANGID,
@@ -120,6 +122,13 @@ STDAPI DllRegisterServer() {
         DllUnregisterServer();
         return hr;
     }
+
+    // Explicitly set Description and Display Description in CTF TIP registry
+    const wchar_t* tipProfileKey = L"SOFTWARE\\Microsoft\\CTF\\TIP\\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}\\LanguageProfile\\0x00000804\\{C7613511-92F2-436A-8A46-2BEF5036B959}";
+    SetRegString(HKEY_LOCAL_MACHINE, tipProfileKey, L"Description", IME_NAME);
+    SetRegString(HKEY_LOCAL_MACHINE, tipProfileKey, L"Display Description", IME_NAME);
+    SetRegString(HKEY_CURRENT_USER, tipProfileKey, L"Description", IME_NAME);
+    SetRegString(HKEY_CURRENT_USER, tipProfileKey, L"Display Description", IME_NAME);
 
     // Register Category
     ITfCategoryMgr* pCatMgr = nullptr;

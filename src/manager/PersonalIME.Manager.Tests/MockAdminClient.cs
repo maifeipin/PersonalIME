@@ -39,6 +39,14 @@ public class MockAdminClient : IAdminClient
     public Func<string, string, string?, CancellationToken, Task<ReverseLookupResultItem>>? OnReverseLookup { get; set; }
     public int ReverseLookupCallCount { get; private set; }
 
+    public List<PluginModel> MockPlugins { get; set; } = [
+        new() { Id = 1, Name = "计算器", Icon = "🧮", ExecPath = "calc.exe", Arguments = "", IsEnabled = true, SortOrder = 0 },
+        new() { Id = 2, Name = "画图", Icon = "🎨", ExecPath = "mspaint.exe", Arguments = "", IsEnabled = true, SortOrder = 1 },
+        new() { Id = 3, Name = "Edge浏览器", Icon = "🌐", ExecPath = "msedge.exe", Arguments = "https://maifeipin.com", IsEnabled = true, SortOrder = 2 }
+    ];
+    public List<PluginLogModel> MockLogs { get; set; } = [];
+    public int ExecutePluginCallCount { get; private set; }
+
     public Task<JsonElement> SendRequestAsync(string action, object? parameters = null, CancellationToken ct = default)
     {
         return Task.FromResult(default(JsonElement));
@@ -152,6 +160,63 @@ public class MockAdminClient : IAdminClient
             Code = "mock_code",
             AllCodes = ["mock_code"]
         };
+    }
+
+    public Task<List<PluginModel>> GetPluginsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+    {
+        var list = onlyEnabled ? MockPlugins.Where(p => p.IsEnabled).ToList() : MockPlugins.ToList();
+        return Task.FromResult(list);
+    }
+
+    public Task<long> AddPluginAsync(PluginModel plugin, CancellationToken ct = default)
+    {
+        long newId = MockPlugins.Count > 0 ? MockPlugins.Max(p => p.Id) + 1 : 1;
+        plugin.Id = newId;
+        MockPlugins.Add(plugin);
+        return Task.FromResult(newId);
+    }
+
+    public Task UpdatePluginAsync(PluginModel plugin, CancellationToken ct = default)
+    {
+        var idx = MockPlugins.FindIndex(p => p.Id == plugin.Id);
+        if (idx >= 0) MockPlugins[idx] = plugin;
+        return Task.CompletedTask;
+    }
+
+    public Task DeletePluginAsync(long id, CancellationToken ct = default)
+    {
+        MockPlugins.RemoveAll(p => p.Id == id);
+        return Task.CompletedTask;
+    }
+
+    public Task ExecutePluginAsync(long id, CancellationToken ct = default)
+    {
+        ExecutePluginCallCount++;
+        var p = MockPlugins.FirstOrDefault(x => x.Id == id);
+        MockLogs.Insert(0, new PluginLogModel
+        {
+            Id = MockLogs.Count + 1,
+            PluginId = id,
+            PluginName = p?.Name ?? "Unknown",
+            ExecPath = p?.ExecPath ?? "",
+            Arguments = p?.Arguments ?? "",
+            Status = "SUCCESS",
+            ExecutedAt = DateTime.Now.ToString("HH:mm:ss")
+        });
+        return Task.CompletedTask;
+    }
+
+    public Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default)
+    {
+        var list = pluginId.HasValue ? MockLogs.Where(l => l.PluginId == pluginId.Value).Take(limit).ToList() : MockLogs.Take(limit).ToList();
+        return Task.FromResult(list);
+    }
+
+    public Task ClearPluginLogsAsync(long? pluginId = null, CancellationToken ct = default)
+    {
+        if (pluginId.HasValue) MockLogs.RemoveAll(l => l.PluginId == pluginId.Value);
+        else MockLogs.Clear();
+        return Task.CompletedTask;
     }
 }
 

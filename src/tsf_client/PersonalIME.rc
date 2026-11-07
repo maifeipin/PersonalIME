@@ -1,0 +1,10 @@
+// ============================================================================
+// PersonalIME.rc - Win32 Resource Script
+// Defines the embedded application icon for Windows Taskbar & TSF Language Bar
+// ============================================================================
+
+#include <windows.h>
+
+// Icon resource: ID 1 maps to icon index 0 in TSF AddLanguageProfile
+1 ICON "app.ico"
+

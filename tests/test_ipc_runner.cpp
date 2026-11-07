@@ -4,6 +4,8 @@
 #include <vector>
 #include <cwchar>
 #include <cstring>
+#include <io.h>
+#include <fcntl.h>
 #include "../src/common/ime_guids.h"
 #include "../src/common/ipc_protocol.h"
 #include "../src/tsf_client/ipc_client.h"
@@ -113,6 +115,8 @@ int main(int argc, char* argv[]) {
     }
 
     SetConsoleOutputCP(CP_UTF8);
+    _setmode(_fileno(stdout), _O_U8TEXT);
+    _setmode(_fileno(stderr), _O_U8TEXT);
     std::wcout << L"[TEST] Connecting to PersonalIME IPC service..." << std::endl;
 
     IpcClient client;
@@ -186,6 +190,35 @@ int main(int argc, char* argv[]) {
     // 8. Run concurrent multi-threaded isolation test
     int mtResult = RunMultiThreadedTest();
     if (mtResult != 0) return mtResult;
+
+    // 9. OpenManager IPC Test: verify OpenManager IPC routing & window restore
+    {
+        HWND hDummyMgr = CreateWindowExW(
+            0, L"STATIC", L"PersonalIME 管理器",
+            WS_OVERLAPPEDWINDOW,
+            0, 0, 100, 100,
+            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr
+        );
+        CHECK_TRUE(hDummyMgr != nullptr, L"Create dummy manager window failed");
+        ShowWindow(hDummyMgr, SW_SHOWMINIMIZED);
+
+        bool openOk = client.OpenManager(100, 104);
+        CHECK_TRUE(openOk, L"OpenManager IPC call must succeed when manager window exists");
+
+        // Pump message queue to allow asynchronous show/restore to process
+        MSG msg;
+        for (int i = 0; i < 20 && IsIconic(hDummyMgr); ++i) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(10);
+        }
+        CHECK_TRUE(!IsIconic(hDummyMgr), L"Manager window must be restored from minimized by OpenManager");
+
+        DestroyWindow(hDummyMgr);
+        std::wcout << L"[TEST PASS] OpenManager IPC routing and window restore verified successfully." << std::endl;
+    }
 
     std::wcout << L"[TEST COMPLETE] All IPC pipe protocol & context isolation tests passed successfully!" << std::endl;
     return 0;

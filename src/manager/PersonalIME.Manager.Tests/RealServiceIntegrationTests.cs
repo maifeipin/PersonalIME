@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.Json;
 using PersonalIME.Manager.Ipc;
 using PersonalIME.Manager.Models;
+using PersonalIME.Manager.ViewModels;
 
 namespace PersonalIME.Manager.Tests;
 
@@ -429,5 +430,37 @@ public class RealServiceIntegrationTests
             }
             catch { }
         }
+    }
+
+    [TestMethod]
+    public async Task TestManagerAutoLaunchAndRecoveryLifecycle()
+    {
+        // 1. Verify LocateServiceExecutable returns a valid path
+        string? servicePath = MainViewModel.LocateServiceExecutable();
+        Assert.IsNotNull(servicePath, "LocateServiceExecutable must find a valid ime-service.exe");
+        Assert.IsTrue(File.Exists(servicePath), $"Service path does not exist: {servicePath}");
+
+        // 2. Connect to the test service running in this test class
+        var client = new AdminIpcClient(s_testPipeName);
+        using var vm = new MainViewModel(client);
+        await vm.CheckConnectionAsync();
+
+        Assert.IsTrue(vm.IsConnected);
+        Assert.IsFalse(vm.HasOfflineWarning);
+        Assert.AreEqual(ServiceConnectionState.Connected, vm.ServiceState);
+        Assert.IsNotNull(vm.ActiveSchemeText);
+        Assert.IsNotNull(vm.ActiveMixedInputText);
+        Assert.IsNotNull(vm.ActiveInitialModeText);
+
+        // 3. Verify saving in Settings updates Active display
+        vm.Settings.PrimaryInputMethod = InputSchemes.Wubi86;
+        vm.Settings.MixedInputEnabled = true;
+        vm.Settings.InitialChinese = true;
+        await vm.Settings.SavePolicyAsync();
+
+        Assert.AreEqual("五笔86", vm.ActiveSchemeText);
+        Assert.AreEqual("开启", vm.ActiveMixedInputText);
+        Assert.AreEqual("中文", vm.ActiveInitialModeText);
+        StringAssert.Contains(vm.ConfigSavedStatusText, "已保存生效");
     }
 }

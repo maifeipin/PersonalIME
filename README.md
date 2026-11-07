@@ -1,239 +1,190 @@
-# PersonalIME (私人输入法)
+# 人人 (RenRen IME)
 
-[![Windows 11](https://img.shields.io/badge/Platform-Windows%2011%20x64-blue.svg)](https://microsoft.com/windows)
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-purple.svg)](https://en.cppreference.com/w/cpp/20)
-[![Static CRT](https://img.shields.io/badge/CRT-%2FMT%20(Static)-success.svg)]()
+[![Windows 10/11 x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D4.svg)](https://microsoft.com/windows)
+[![C++20 Core](https://img.shields.io/badge/Core-C%2B%2B20%20%2FMT-purple.svg)](https://en.cppreference.com/w/cpp/20)
+[![WPF .NET 10](https://img.shields.io/badge/Manager-WPF%20.NET%2010-512BD4.svg)](https://dotnet.microsoft.com/)
+[![SQLite WAL](https://img.shields.io/badge/Storage-SQLite3%20WAL-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**PersonalIME** 是一款面向个人用户、注重隐私控制与高性能体验的 Windows 11 中文输入法。项目采用现代 Windows Text Services Framework (TSF) 架构，支持拼音、五笔以及完全自定义的编码词条，并通过本地自适应排序引擎记录用户的输入习惯，实现“越用越顺手、数据全在本地”。
+> **智能五笔 · 拼音混输 · 零打扰 · 数据全在本地的现代 Windows 中文输入法**
 
-当前进度：Stage 3 已接通真实引擎、TSF 服务、模式与全半角控制，并实现持久化事件和追加式回执日志。自动化包含 14 组核心测试、15 项服务集成及独立回执测试；完整入口为 `scripts/verify_stage3.ps1`。真实宿主 GUI 验收仍待完成，Stage 4 的 WPF 词库与设置管理器尚未实现。当前仅验证 Windows x64；回执契约见 [Stage 3 回执日志](docs/stage3-receipt-wal.md)。
+**人人** 是一款专为效率创作者、开发者与重度文字工作者打造的桌面中文输入法。我们摒弃了传统商业输入法“全家桶捆绑、弹窗广告、云端隐私上传、宿主卡死”的痛点，回归输入法最纯粹的本质：**极速上屏、肌肉记忆优先、词库完全可控、轻量插件即点即用**。
 
 ---
 
-## 架构设计
+## ✨ 核心产品价值
 
-PersonalIME 采用经典的 **“超薄宿主插件 + 独立后台服务”** 跨进程解耦架构，彻底隔离宿主进程与重型词库引擎：
+### 1. 🔒 100% 本地隐私与数据主权
+- **零云端上传**：不收集任何击键记录，无后台联网遥测，无广告推送。
+- **单文件透明存储**：所有自定义词条、个人词频习惯、置顶排序及插件配置统一存储于本地 `%APPDATA%\PersonalIME\user_dict.db`（SQLite WAL 模式）。
+- **一键迁移备份**：支持标准 UTF-8 JSON 格式全量导入/导出（合并或覆盖模式），换机无缝衔接。
+
+### 2. 🎯 五笔 · 全拼 · 双拼无感混输
+- **多方案自由组合**：内置 86 五笔（13.6 万词条）、全拼（6.5 万词条）与主流双拼方案（小鹤、自然码、微软、智能ABC、紫光、拼音加加）。
+- **无感混输与主辅协同**：以五笔为主方案时，遇到生僻字直接输入拼音即可出字；支持独立启停各输入方案与词典优先级。
+- **编码反查辅助**：在添加词条或日常输入时，自动提供精准的五笔拆字编码、拼音及双拼反查，彻底解决“提笔忘码”。
+
+### 3. 📌 确定性排序与肌肉记忆保护
+- **拒绝“词频乱跳”**：独创可解释的 4 级确定性排序机制：
+  1. **用户固定置顶 (Pinned)**：指定编码下的置顶词条拥有绝对最高优先级，支持可视化的上下拖拽调序，绝不被自动调频打乱肌肉记忆。
+  2. **编码匹配质量**：精确全码匹配 > 前缀完整匹配 > 前缀补全延伸。
+  3. **自适应习惯权重**：基于 30 天半衰期时间衰减算法，平滑融合个人高频习惯与近期使用加分。
+  4. **稳定平局兜底**：同分候选词严格保持稳定顺序。
+- **丰富词条形态**：支持单字、词组、快捷短语（如 `;dz` → 收货地址、`mail` → 邮箱）、Emoji 表情符号以及多行代码/文本模板一键上屏。
+
+### 4. 🧩 候选栏内嵌轻量级扩展插件
+- **即点即用，不抢焦点**：候选框右侧内嵌快捷设置按钮 `⚙` 与自定义插件图标栏（采用 `MA_NOACTIVATE` 原生浮窗技术，点击绝不破坏当前编辑器的输入焦点与光标）。
+- **开箱预置与自由扩展**：
+  - 默认预置：**计算器 (`🧮`)**、**画图 (`🎨`)**、**Edge 浏览器 (`🌐`)**。
+  - 灵活扩展：通过 SQLite 插件配置，可将 **截图 (`ms-screenclip:`)**、**天气查询**、**星座运势**、**本地脚本/开发工具** 直接挂载到候选栏。
+- **执行审计日志**：内置插件执行日志记录与状态追踪，每次唤起的时间、参数与成功/异常状态一目了然。
+
+### 5. ⚡ 工业级宿主隔离与亚毫秒响应
+- **宿主零崩溃承诺**：注入目标应用（记事本、VS Code、Office、浏览器）的 `PersonalIME.dll` 采用纯 `/MT` 静态编译，零第三方动态库依赖。
+- **极速检索与超时熔断**：核心词库内存检索耗时 **< 0.25 毫秒**；跨进程 IPC 严格设定 50ms 熔断保护，哪怕后台服务重启，输入框也绝不假死。
+- **静默一体化体验**：用户感知不到复杂的“客户端/服务端”概念——切出输入法自动就绪，任务栏托盘与候选框 `⚙` 按钮一键唤起设置中心。
+
+---
+
+## 🖥️ 产品功能全景
+
+### 1. 现代原生候选浮窗
+- 清晰展示当前输入编码、编号候选词（首选高亮徽标）、次选编码提示。
+- 尾部集成 **`⚙` 设置入口** 与 **动态插件图标栏**，统一视觉分隔线、圆角高光与手型光标交互。
+
+### 2. 图形化设置与管理中心 (`人人 设置`)
+提供五大核心管理模块：
+1. **词库管理**：按关键字与输入方案实时筛选词条，支持新增、编辑、删除自定义词条，内置实时编码反查器。
+2. **词条排序**：查询任意编码下的全部候选词（含系统内置词库与用户词库），一键置顶/取消置顶、可视化调整固定位次。
+3. **输入设置**：调整每页候选词数量（5~9）、主输入方案、双拼键位方案、混输开关、动态调频开关、中英/全半角初始状态。
+4. **插件管理**：可视化管理候选栏扩展插件（图标、名称、执行路径、启动参数、启用状态、排序），支持一键测试运行与查看/清空执行日志。
+5. **系统与诊断**：实时监控引擎连接状态、词库容量统计、JSON 数据导入导出、学习词频一键重置。
+
+---
+
+## 🚀 快速开始
+
+### 方式一：普通用户安装体验
+1. **安装包安装（推荐）**：
+   运行 `out\installer\PersonalIME-Setup-x64.exe`，向导将自动完成组件部署、TSF 输入法注册与开机静默自启配置。
+2. **便携版安装**：
+   解压 `PersonalIME-Portable-x64.zip`，右键以管理员身份运行根目录下的 `install.ps1`。
+3. **开始打字**：
+   打开任意编辑器（如记事本），按 `Win + 空格` 切换至 **人人** 即可开始输入；点击候选框右侧 `⚙` 或任务栏托盘图标可随时打开设置中心。
+
+### 方式二：开发者本地极速迭代 (`dev.ps1`)
+为方便日常开发与人工测试，项目提供了独立于 CI 的秒级开发脚本 `scripts/dev.ps1`：
+
+```powershell
+# 一键完成：释放进程锁 -> 增量编译 -> 注册并自动切换系统默认输入法为“人人” -> 静默启动服务 -> 打开记事本测试
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
+
+# 常用开发命令：
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action status   # 查看当前注册状态、服务进程与 DLL 加载宿主
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action manager  # 直接打开“人人 设置”图形管理界面
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action reload   # 不重新编译，快速重启后台服务与记事本
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action stop     # 停止测试环境
+```
+
+> **提示**：首次在系统注册 TSF 输入法或刷新 `Win + 空格` 系统级名称缓存时，请以管理员身份执行一次：
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File scripts\register.ps1
+> ```
+
+---
+
+## 🏗️ 系统架构概览
 
 ```mermaid
 flowchart LR
-    subgraph HostApp ["宿主进程 (Notepad / Edge / VS Code / Word)"]
+    subgraph Host ["目标应用进程 (Notepad / VS Code / Edge / Word)"]
         TSF["Windows TSF 框架"]
-        DLL["PersonalIME.dll (薄客户端)"]
-        UI["原生浮窗 (CandidateWindow)"]
-        TSF <--> DLL
-        DLL --> UI
+        TIP["PersonalIME.dll (超薄客户端)"]
+        CW["原生候选窗 + ⚙设置 + 🧩插件栏"]
+        TSF <--> TIP
+        TIP --> CW
     end
 
-    subgraph Service ["独立后台服务进程 (ime-service.exe)"]
-        IPC["命名管道服务端 (Named Pipe)"]
-        Engine["输入引擎 (拼音 / 五笔 / 自定义码)"]
-        DB[(本地 SQLite 词库 & 用户习惯)]
-        IPC <--> Engine
-        Engine <--> DB
+    subgraph Daemon ["静默后台引擎服务 (ime-service.exe)"]
+        FastPipe["高速输入管道 (50ms 熔断)"]
+        AdminPipe["管理配置管道 (PIMA 协议)"]
+        Engine["ime-core 核心引擎\n(五笔 / 全拼 / 双拼 / 4级排序 / 反查)"]
+        PluginMgr["插件执行器 & 审计日志"]
+        FastPipe <--> Engine
+        AdminPipe <--> Engine
+        AdminPipe <--> PluginMgr
     end
 
-    DLL <== "异步二进制协议 (\\.\\pipe\\PersonalIME_IpcPipe)\nStrict 50ms Timeout & CancelIoEx" ==> IPC
-```
+    subgraph Storage ["本地数据层 (%APPDATA%\\PersonalIME)"]
+        DB[("user_dict.db (SQLite WAL)\n词库 · 习惯 · 置顶 · 插件 · 日志")]
+        Dicts[("预编译词典\nwubi86.dict / pinyin.dict")]
+    end
 
-### 1. 超薄进程内 TSF 客户端 (`PersonalIME.dll`)
-- **注入最小化**：仅加载进入宿主进程处理基础按键分发（`ITfKeyEventSink`）与文本修改（`ITfEditSession`）。
-- **零外部动态依赖**：严格使用 MSVC `/MT` 静态链接 CRT，仅依赖系统级 Windows API（`kernel32.dll`、`user32.dll`、`gdi32.dll`、`advapi32.dll`、`ole32.dll`），杜绝因缺少 VC++ Runtime 导致的加载崩溃。
-- **内存与引用生命周期安全**：实现完善的 COM 引用计数配对机制与 RAII 管理，防止组件释放后引起的宿主进程崩溃。
+    subgraph UI ["图形管理中心 (PersonalIME.Manager.exe)"]
+        WPF["WPF 设置与词库/插件管理器"]
+    end
 
-### 2. 独立核心引擎 (`ime-core`) 与本地存储 (`personal_ime.db`)
-- **纯解耦 C++20 核心库**：`ime-core` 与 Windows TSF 框架和任何 UI 渲染完全解耦，既可作为静态库供后台输入法服务调用，也可由独立命令行工具 `ime-cli` 离线调试。
-- **三类输入能力全支持**：
-  - **86 五笔**：精确全码查询与前缀补全候选，严格区分全码匹配与前缀延伸。
-  - **全拼音**：支持 400+ 汉语拼音声母韵母回溯切词、词库已有字词连续匹配，以及显式音节分隔符（如 `xi'an` vs `xian`，`fang'an` vs `fangan`）。
-  - **自定义编码与快捷短语**：支持类似 `;dz` → `我的地址` 快捷短语，以及用户为任意词条自定义五笔或拼音编码。
-- **确定性、可解释的 4 级排序机制**：
-  1. *Level 1 固定置顶*：严格按用户指定顺序（`order_rank`）置顶，绝不被自动词频覆盖。
-  2. *Level 2 匹配质量*：分组排序（`ExactFull` > `PrefixFull` > `PrefixCompletion`）。
-  3. *Level 3 综合得分*：基础词典权重 + 个人频率加分（以 30 天为半衰期衰减累计有效频次）+ 近期使用时间加分。
-  4. *Level 4 稳定平局破除*：词条稳定 ID 升序排列。
-- **原子性提交学习与幂等防护**：
-  - 学习只在明确提交成功（Commit）后发生；查询、浏览与取消操作绝不增加词频。
-  - 支持唯一提交事件 ID（`event_id`），防止同一次提交重试被重复学习。
-- **真实基础词典与用户数据 JSON 导入导出**：
-  - 内置基于 Rime 开源社区整理的 86五笔（136,916 词条）和简体拼音（65,125 词条）高质量基础词典。
-  - 用户数据采用 UTF-8 JSON v1.0 备份，支持 `merge`（合并）与 `replace`（覆盖）双模式，校验失败时事务级回滚。
-
-### 3. 可靠跨进程通信 (IPC)
-- 基于 Windows 高性能命名管道（Named Pipe）实现。
-- **严格时延预算**：每次按键查询严格限制在 50ms 预算内，超时即刻调用 `CancelIoEx` 取消在途 I/O，绝不阻塞目标输入框。
-- **故障自愈与状态回滚**：当发生取消或网络阻滞时，向服务端发送 `Rollback` 保持宿主组合与引擎状态严格同步，坚决避免吞键或字符错乱。
-
----
-
-## 关键技术特性与稳定性保障
-
-- **组合生命周期完整性**：
-  - 严格支持 `StartComposition` 与 `EndComposition` 引用平衡与异常中断保护。
-  - 支持多 Context / 多线程独立隔离，当用户失焦或切换输入框时，在途组合安全终结（`TerminateCompositionOnHost`）。
-  - 针对宿主只读锁或无法即时终结的场景，引入未决终止（Pending Termination）跟踪与重试机制，防止新按键覆盖未结组合。
-- **候选窗幂等性与轻量渲染**：
-  - 原生 Win32 分层窗口（Layered Window）实现，单线程单例托管。
-  - 窗口类注册/反注册具备引用计数保护，多次调用 `Destroy()` 具备绝对幂等性。
-- **严格测试覆盖与故障注入验证**：
-  - [1/5] COM DLL 引用计数与卸载安全测试（验证 TIP 活跃时阻止卸载、完全释放后恢复卸载）。
-  - [2/5] 候选窗口类生命周期与多次销毁幂等性测试。
-  - [3/5] 组合生命周期、多 Context 隔离、失败注入与恢复回路测试（覆盖 13 项细分用例）。
-  - [4/5] 边界负向与故障注入测试（全零响应包拦截、格式畸形帧校验、管道阻塞保护、超时守护防护）。
-  - [5/5] 多上下文/多线程端到端 IPC 正向集成测试。
-
----
-
-## 项目结构
-
-```text
-PersonalIME/
-├── CMakeLists.txt              # CMake 顶层构建配置 (C++20, /MT 静态编译)
-├── README.md                   # 项目说明文档
-├── docs/                       # 设计与技术文档
-│   ├── design.md               # 产品架构与功能设计方案
-│   └── dictionary-info.md      # 基础词库来源、许可与转换步骤文档
-├── data/
-│   └── dictionaries/           # 预编译高速基础词典 (wubi86.dict, pinyin.dict)
-├── scripts/                    # 自动化脚本工具
-│   ├── build.ps1               # 编译 Release x64 二进制文件
-│   ├── run_test.ps1            # 执行 Stage 1 自动化测试套件
-│   ├── build_dictionaries.py   # Rime 开源词典清洗与二进制格式生成脚本
-│   ├── register.ps1            # 注册输入法到系统 TSF (需管理员权限)
-│   ├── unregister.ps1          # 从系统注销输入法
-│   └── verify_hashes.ps1       # 生成所有关键二进制与源码文件的 SHA256 清单
-├── src/
-│   ├── cli/                    # 独立命令行调试工具与 REPL (ime-cli)
-│   ├── common/                 # 跨模块公共头文件 (IPC 协议、GUID 定义)
-│   ├── core/                   # 独立输入核心引擎 (ime-core)
-│   │   ├── dictionary/         # 高速内存词典索引 (Multi-Map & 二分检索)
-│   │   ├── encoding/           # 拼音音节切分、五笔与自定义编码解析
-│   │   ├── engine/             # 统一门面 facade (ImeEngine)
-│   │   ├── ranking/            # 确定性 4 级排序机制与得分解释器
-│   │   └── storage/            # SQLite 数据库包装、版本迁移与 JSON 备份
-│   ├── service/                # 独立后台引擎服务源码 (ime-service)
-│   ├── third_party/            # 第三方轻量库 (SQLite3, nlohmann/json)
-│   └── tsf_client/             # TSF 输入法客户端插件源码 (PersonalIME.dll)
-└── tests/                      # 自动化测试与 Mock 宿主验证套件
-    └── test_ime_core.cpp       # Stage 2 核心引擎 10 大场景严密测试集
+    TIP <== "二进制命名管道" ==> FastPipe
+    WPF <== "JSON 管理管道" ==> AdminPipe
+    Engine <--> DB
+    Engine <--> Dicts
+    PluginMgr <--> DB
 ```
 
 ---
 
-## 命令行调试工具 (`ime-cli`)
-
-Stage 2 提供了功能完备的交互式命令行调试器，用于完全独立于系统 TSF 环境验证分词、编码匹配、排序权重、习惯学习及词库导入导出。
-
-### 启动方式
-```powershell
-# 启动交互式 REPL 终端
-.\build\Release\ime-cli.exe
-
-# 或直接通过命令行参数执行单次操作 (支持 --db 与 --dict 指定路径)
-.\build\Release\ime-cli.exe <command> [args...]
-```
-
-### 命令语法与示例
-
-| 命令类别 | 语法 | 示例 | 说明 |
-| :--- | :--- | :--- | :--- |
-| **拼音查询** | `query \| q pinyin <code>` | `.\build\Release\ime-cli.exe query pinyin zhongwen` | 查询候选词，区分完全匹配与前缀补全 |
-| **音节分隔** | `q pinyin <code>` | `.\build\Release\ime-cli.exe query pinyin "xi'an"` | 显式音节切分，精确消除歧义 |
-| **五笔查询** | `q wubi <code>` | `.\build\Release\ime-cli.exe query wubi aaaa` | 支持 86 五笔单字、词组全码与前缀检索 |
-| **快捷短语** | `q custom <code>` | `.\build\Release\ime-cli.exe query custom ";dz"` | 查询自定义编码与短语 |
-| **得分解释** | `explain <scheme> <code>` | `.\build\Release\ime-cli.exe explain pinyin zhongwen` | 打印各候选词的置顶状态、质量等级、频次得分与总分 |
-| **新增词条** | `add <text> <scheme:code>...` | `.\build\Release\ime-cli.exe add 我的地址 "custom:;dz" pinyin:wodedizhi` | 支持单个词条同时绑定多个输入方案与编码 |
-| **词条修改** | `edit <id> <new_text>` | `.\build\Release\ime-cli.exe edit u_6ae85... "北京市海淀区中关村"` | 修改自定义词条正文 |
-| **删除词条** | `del <id>` | `.\build\Release\ime-cli.exe del u_6ae85...` | 删除指定词条及其全部编码绑定与统计 |
-| **置顶候选** | `pin <scheme> <code> <id> [rank]` | `.\build\Release\ime-cli.exe pin custom ";dz" u_6ae85... 1` | 固定候选词在特定编码下的展示顺序（不影响其他编码） |
-| **取消置顶** | `unpin <scheme> <code> <id>` | `.\build\Release\ime-cli.exe unpin custom ";dz" u_6ae85...` | 解除置顶，回归自适应动态排序 |
-| **模拟提交** | `commit <scheme> <code> <id> [evt_id]` | `.\build\Release\ime-cli.exe commit pinyin zhongwen b_py_1` | 模拟按键上屏成功，触发学习（支持幂等 event_id） |
-| **重置统计** | `reset-stats [id]` | `.\build\Release\ime-cli.exe reset-stats` | 重置指定词条或全库的学习频次与时间戳 |
-| **导出词库** | `export <file.json>` | `.\build\Release\ime-cli.exe export my_backup.json` | 导出 UTF-8 JSON v1.0 格式用户数据 |
-| **导入词库** | `import <file.json> [merge\|replace]` | `.\build\Release\ime-cli.exe import my_backup.json merge` | 导入数据，支持合并或覆盖模式，错误全事务回滚 |
-| **性能基准** | `bench` | `.\build\Release\ime-cli.exe bench` | 评测 1,000 次高频检索延迟与词库加载性能 |
-
-### 性能基准指标 (Benchmark)
-- **内存词典容量**：内置 202,041 条真实开源基础词库（86五笔 136,916 词条 + 简体拼音 65,125 词条）。
-- **加载启动耗时**：全库加载并构建内存索引耗时 **< 150 ms**。
-- **单次检索延迟**：平均查询响应时延 **< 250 微秒 (0.25 ms)**，远低于 50ms IPC 预算。
-
----
-
-## 构建与运行
+## 📦 完整构建、测试与打包发布
 
 ### 环境要求
-- **操作系统**：Windows 11 (x64)
-- **编译工具**：Visual Studio 2022+（安装了“使用 C++ 的桌面开发”工作负载）
-- **构建系统**：CMake 3.20+
-- **SDK**：Windows 11 SDK (10.0.22000.0 或更高版本)
+- **操作系统**：Windows 10 / 11 (x64)
+- **编译环境**：Visual Studio 2022+（C++ 桌面开发工作负载）、CMake 3.20+、.NET 10.0 SDK
 
-### 1. 编译项目
-在 PowerShell 中运行构建脚本：
+### 全流程命令
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+# 1. 编译全部 C++ 核心、服务、TSF 客户端与 12 组原生测试套件
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action build -BuildTests
+
+# 2. 运行 C++ 管理管道与插件集成测试
+.\build\Release\test_admin_ipc.exe
+
+# 3. 运行 C++ 候选窗与插件交互测试
+.\build\Release\test_candidate_window.exe
+
+# 4. 运行 WPF 管理器 .NET 单元测试 (50 项用例)
+dotnet test src\manager\PersonalIME.Manager.Tests
+
+# 5. 一键生成发布包 (Portable ZIP + SHA256 清单 + Inno Setup 安装包)
+powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
-编译产物将输出至 `build\Release\` 目录：
-- `PersonalIME.dll` (TSF 客户端输入法 DLL)
-- `ime-service.exe` (本地后台服务)
-- `ime-cli.exe` (输入法核心引擎命令行调试器)
-- `test_ime_core.exe` (Stage 2 核心引擎自动化测试集)
-- `test_composition_lifecycle.exe` 等 (Stage 1 稳定性测试集)
-
-### 2. 执行自动化测试套件
-```powershell
-# 运行 Stage 1 TSF + IPC 稳定性回归套件
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_test.ps1
-
-# 运行 Stage 2 核心输入引擎、排序算法与存储持久化套件
-.\build\Release\test_ime_core.exe
-```
-
-### 3. 安装与体验 (本地调试)
-1. 启动本地后台服务：
-   ```powershell
-   .\build\Release\ime-service.exe
-   ```
-2. 以管理员权限运行注册脚本，将 `PersonalIME.dll` 注册至系统 TSF 输入法列表：
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register.ps1
-   ```
-3. 在任意文本编辑框（记事本、Edge、VS Code 等）中按下 `Win + 空格` 即可切换到 **Personal IME (私人输入法)**。
-4. 调试结束后注销输入法：
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\unregister.ps1
-   ```
 
 ---
 
-## 阶段规划 (Roadmap)
+## 🗺️ 产品演进路线图 (Roadmap)
 
-- [x] **Stage 1: TSF + IPC 极小原型 Spike**
-  - [x] 实现最小可工作的 TSF `ITfTextInputProcessor` 框架。
-  - [x] 完成命名管道跨进程通信，实现 50ms 严格超时与异步取消。
-  - [x] 实现轻量级候选浮窗与按键上屏。
-  - [x] 完成 8 轮严格复核，闭环 COM 引用配对、多 Context 隔离与恢复保护。
-- [x] **Stage 2: 独立核心输入引擎与命令行调试器 (已完成)**
-  - [x] 86 五笔编码匹配引擎（精确匹配与前缀补全）。
-  - [x] 全拼切词引擎（400+ 音节集回溯切词、显式音节分隔符 `'` 消除歧义）。
-  - [x] 自定义编码与快捷短语（类似 `;dz` → `我的地址`，多方案自由绑定）。
-  - [x] SQLite 持久化存储（版本化迁移、事务隔离、WAL 模式、线程安全）。
-  - [x] 确定性、可解释的 4 级候选排序机制（置顶、匹配质量、30天半衰期频次衰减、近期加分、稳定 ID 破平局）。
-  - [x] 严谨的学习与提交防护（仅在 Commit 发生、幂等 event_id 防重试干扰）。
-  - [x] 真实大规模词典（202,041 条目，Rime 开源协议合规）。
-  - [x] 用户词库 UTF-8 JSON v1.0 导入/导出与事务回滚保障。
-  - [x] 交互式 REPL 命令行调试工具 `ime-cli` 与 10 大场景自动化测试套件。
-- [ ] **Stage 3: 引擎接入后台服务与端到端输入打通**
-  - [ ] 将 `ime-core` 与 `ime-service` 命名管道协议对接。
-  - [ ] 键盘事件与候选词翻页、数字选词映射。
-  - [ ] 宿主候选窗多行/单行展示与高分词即时上屏。
-- [ ] **Stage 4: 桌面宿主兼容性打磨与设置界面**
-  - [ ] 复杂场景（Chrome/Edge 沙盒环境、VS Code 协同编辑、终端环境）兼容性优化。
-  - [ ] 独立的配置与词库管理器前端页面。
-  - [ ] 独立的配置与词库管理器前端页面。
+### 已交付里程碑 (Stage 1 ~ Stage 5)
+- [x] **Stage 1：TSF 宿主安全与跨进程通信基座**（COM 引用安全、多 Context 隔离、50ms 超时保护、原生候选浮窗）
+- [x] **Stage 2：多方案核心引擎与本地持久化**（86 五笔、全拼、自定义短语、4 级确定性排序、SQLite WAL、20万+ 词典、`ime-cli`）
+- [x] **Stage 3：端到端输入闭环与回执可靠性**（中英/全半角/标点转换、WAL 持久化回执日志、无感进程守护）
+- [x] **Stage 4：现代化 WPF 管理中心与高阶特性**（词库 CRUD、内置词条置顶调序、双拼多方案支持、编码反查、系统诊断）
+- [x] **Stage 5：产品化重塑“人人”与轻量插件生态**（全链路品牌升级、SVG 矢量图标、候选栏插件矩阵与日志审计、一键安装包与 `dev.ps1` 工作流）
+
+### 下一阶段规划 (Stage 6：智能辅助与交互体验全面升级)
+- [ ] **1. 智能跨方案反查补全（少候选自动兜底 + 编码提示）**
+  - 当主输入方案（如五笔）匹配结果少于阈值（默认 `< 3` 个，可在设置中配置 `0~9`）时，自动调用次级输入方案（如拼音/双拼）检索补充候选词。
+  - 对次级方案补充的候选词，在候选框内附带显示其对应的主方案编码（例如打拼音 `quanpin` 出 `全屏 [wgu]`），实现“边打字边学码”。
+- [ ] **2. 候选浮窗深度交互（方向键导航与鼠标直选）**
+  - 支持键盘 `↑`/`↓` 或 `←`/`→` 在当前页候选词间移动高亮选中项，`Space`/`Enter` 直接上屏当前高亮候选词。
+  - 支持鼠标悬停（Hover）候选词实时高亮反馈、鼠标左键单击任意候选词直接上屏、鼠标滚轮上下翻页。
+- [ ] **3. 长词组与短句整句输入引擎**
+  - **多音节/多字根动态规划切分 (DAG + Viterbi)**：构建拼音音节图与五笔四码连打切分器，支持连续输入长词组与完整短句（如 `renrenshurufa` → `人人输入法`）。
+  - **智能造词与二元语言模型 (Bigram)**：结合本地轻量级词频转移权重与用户历史短句，自动组合未登录长词，并在首次组句上屏后自动沉淀为用户长词记忆。
+
+> 详细技术设计请参阅：
+> - [插件化架构演进设计 (天气/星座/截图方案对比)](docs/plugin-architecture-design.md)
+> - [Stage 6 智能反查、交互选词与整句输入架构方案](docs/stage6-smart-input-design.md)
 
 ---
 
-## 开源协议
+## 📄 开源协议
 
-本项目采用 [MIT License](LICENSE) 开源协议。
+本项目基于 [MIT License](LICENSE) 开源发布。内置词典数据源自 Rime 开源社区，遵循其开源许可协议。
