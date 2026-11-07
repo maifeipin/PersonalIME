@@ -366,7 +366,7 @@ bool IpcClient::OpenManager(uint64_t sessionId, uint64_t contextId) {
     req.context_id = contextId;
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
     IpcKeyResponse resp{};
-    return SendRequest(req, resp, 100) && (resp.handled == 1);
+    return SendRequest(req, resp, 1000) && (resp.handled == 1);
 }
 
 bool IpcClient::ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId, uint32_t* outExecStatus) {

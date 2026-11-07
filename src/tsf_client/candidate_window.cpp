@@ -651,11 +651,23 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         RECT btnInner = { pThis->m_rcMgrBtn.left + 2, 4, pThis->m_rcMgrBtn.right - 2, clientRc.bottom - 4 };
         if (pThis->m_isPressedMgrBtn) {
             HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-            FillRect(memDC, &btnInner, hPressBg);
+            HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
+            HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
+            HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
+            RoundRect(memDC, btnInner.left, btnInner.top, btnInner.right, btnInner.bottom, 6, 6);
+            SelectObject(memDC, hOld);
+            SelectObject(memDC, hOldB);
+            DeleteObject(hPressPen);
             DeleteObject(hPressBg);
         } else if (pThis->m_isHoveringMgrBtn) {
-            HBRUSH hHoverBg = CreateSolidBrush(RGB(242, 244, 247));
-            FillRect(memDC, &btnInner, hHoverBg);
+            HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
+            HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
+            HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
+            HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
+            RoundRect(memDC, btnInner.left, btnInner.top, btnInner.right, btnInner.bottom, 6, 6);
+            SelectObject(memDC, hOld);
+            SelectObject(memDC, hOldB);
+            DeleteObject(hHoverPen);
             DeleteObject(hHoverBg);
         }
 
@@ -675,19 +687,32 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             MoveToEx(memDC, p.rcBtn.left, clientRc.top + 7, nullptr);
             LineTo(memDC, p.rcBtn.left, clientRc.bottom - 7);
 
-            // Background
+            // Background with independent rounded highlight
             RECT pInner = { p.rcBtn.left + 2, 4, p.rcBtn.right - 2, clientRc.bottom - 4 };
             if (p.isPressed) {
                 HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-                FillRect(memDC, &pInner, hPressBg);
+                HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
+                HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
+                RoundRect(memDC, pInner.left, pInner.top, pInner.right, pInner.bottom, 6, 6);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hPressPen);
                 DeleteObject(hPressBg);
             } else if (p.isHovered) {
-                HBRUSH hHoverBg = CreateSolidBrush(RGB(242, 244, 247));
-                FillRect(memDC, &pInner, hHoverBg);
+                HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
+                HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
+                HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
+                RoundRect(memDC, pInner.left, pInner.top, pInner.right, pInner.bottom, 6, 6);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hHoverPen);
                 DeleteObject(hHoverBg);
             }
 
-            // Draw plugin icon (Emoji or symbol)
+            // Draw plugin icon (Emoji or symbol) with independent hover text color
+            SetTextColor(memDC, p.isHovered ? RGB(0, 102, 204) : RGB(140, 146, 156));
             DrawTextW(memDC, p.icon.c_str(), static_cast<int>(p.icon.length()), &pInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             pLeft += PLUGIN_BTN_WIDTH;
         }

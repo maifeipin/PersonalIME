@@ -813,8 +813,11 @@ void HandleClient(HANDLE hPipe) {
                     }
                 }
                 if (!managerPath.empty()) {
-                    HINSTANCE hInst = ShellExecuteW(nullptr, L"open", managerPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-                    resp.handled = (reinterpret_cast<INT_PTR>(hInst) > 32) ? 1 : 0;
+                    std::wstring targetPath = managerPath;
+                    std::thread([targetPath]() {
+                        ShellExecuteW(nullptr, L"open", targetPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }).detach();
+                    resp.handled = 1;
                 } else {
                     resp.handled = 0;
                 }
