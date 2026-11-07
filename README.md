@@ -78,11 +78,13 @@
 
 ### 方式一：普通用户安装体验
 1. **安装包安装（推荐）**：
-   运行 `out\installer\PersonalIME-Setup-x64.exe`，向导将自动完成组件部署、TSF 输入法注册与开机静默自启配置。
-2. **便携版安装**：
-   解压 `PersonalIME-Portable-x64.zip`，右键以管理员身份运行根目录下的 `install.ps1`。
+   下载并运行 `PersonalIME-Setup-x64.exe`，向导将自动完成组件部署、TSF 输入法注册与开机静默自启配置。
+2. **绿色便携版免安装体验**：
+   下载并解压 `PersonalIME-v*-portable-x64.zip` 到任意目录（如 `D:\PersonalIME`）：
+   - 双击运行 **`start.bat`**：一键注册 TSF 输入法、静默启动后台服务并拉起设置中心。
+   - 双击运行 **`stop.bat`**：一键反注册并安全停止后台服务，实现无残留彻底卸载。
 3. **开始打字**：
-   打开任意编辑器（如记事本），按 `Win + 空格` 切换至 **人人** 即可开始输入；点击候选框右侧 `⚙` 或任务栏托盘图标可随时打开设置中心。
+   打开任意文本框或编辑器（如记事本），按 `Win + 空格` 切换至 **人人** 即可开始输入；点击候选框右侧 `⚙` 或任务栏托盘图标可随时打开设置中心。
 
 ### 方式二：开发者本地极速迭代 (`dev.ps1`)
 为方便日常开发与人工测试，项目提供了独立于 CI 的秒级开发脚本 `scripts/dev.ps1`：
@@ -166,7 +168,7 @@ powershell -ExecutionPolicy Bypass -File scripts\dev.ps1 -Action build -BuildTes
 dotnet test src\manager\PersonalIME.Manager.Tests
 
 # 5. 一键生成发布包 (Portable ZIP + SHA256 清单 + Inno Setup 安装包)
-powershell -ExecutionPolicy Bypass -File scripts\package.ps1
+powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 ```
 
 ---
@@ -188,9 +190,10 @@ powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 - [x] **2. 候选浮窗深度交互（方向键导航与鼠标直选）**
   - 支持键盘 `↑`/`↓` 或 `←`/`→` 在当前页候选词间移动高亮选中项（到页首/页尾自动触发上/下翻页），`Space`/`Enter` 直接上屏当前高亮候选词。
   - 支持鼠标悬停（Hover）候选词实时切换高亮选中项、鼠标左键单击任意候选词直接上屏、鼠标滚轮上下翻页。
-- [ ] **3. 长词组与短句整句输入引擎**
+- [x] **3. 长词组与短句整句输入引擎与动态宏扩展**
   - **多音节/多字根动态规划切分 (DAG + Viterbi)**：构建拼音音节图与五笔四码连打切分器，支持连续输入长词组与完整短句（如 `renrenshurufa` → `人人输入法`）。
-  - **智能造词与二元语言模型 (Bigram)**：结合本地轻量级词频转移权重与用户历史短句，自动组合未登录长词，并在首次组句上屏后自动沉淀为用户长词记忆。
+  - **智能造词与短句记忆**：自动组合未登录长词短句，在整句上屏确认后自动沉淀并记录至用户学习词库。
+  - **动态智能宏扩展**：支持日期（`rq`/`date`）、时间（`sj`/`time`）、星期（`xq`/`week`）及数字金额大写转换（`v12345` → `壹万贰仟叁佰肆拾伍`）实时动态生成候选。
 
 > 详细技术设计请参阅：
 > - [插件化架构演进设计 (天气/星座/截图方案对比)](docs/plugin-architecture-design.md)
