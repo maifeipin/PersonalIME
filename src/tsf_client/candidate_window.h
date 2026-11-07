@@ -62,7 +62,7 @@ public:
     int GetCandidateCount() const { return static_cast<int>(m_candidates.size()); }
     const std::vector<RECT>& GetCandidateRects() const { return m_candidateRects; }
 
-    void SetPlugins(const std::vector<CandidatePluginItem>& plugins) { m_plugins = plugins; }
+    void SetPlugins(const std::vector<CandidatePluginItem>& plugins);
     const std::vector<CandidatePluginItem>& GetPlugins() const { return m_plugins; }
 
     RECT GetManagerButtonRect() const { return m_rcMgrBtn; }
@@ -83,6 +83,7 @@ private:
     HFONT m_hSubFont = nullptr;
     bool m_hasRegisteredClassRef = false;
     CandidateDisplaySnapshot m_snapshot;
+    POINT m_lastShowPt{0, 0};
     std::vector<std::wstring> m_candidates;
     std::vector<RECT> m_candidateRects;
     int m_selectedIndex = 0;

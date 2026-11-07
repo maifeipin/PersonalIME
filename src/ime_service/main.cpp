@@ -12,6 +12,7 @@
 #include <chrono>
 #include "../common/ime_guids.h"
 #include "../common/ipc_protocol.h"
+#include "../common/plugin_ipc_codec.h"
 #include "../core/engine/ime_engine.h"
 #include "../core/strategy/input_coordinator.h"
 #include "../core/types.h"
@@ -148,6 +149,11 @@ static uint32_t ComputeModeFlags(const ContextState& st) {
     // Encode independent scheme_id in bits 16..23 using wire protocol value
     IpcSchemeId wireScheme = InputSchemeToIpcSchemeId(st.scheme);
     flags |= (static_cast<uint32_t>(wireScheme) & 0xFF) << IPC_SCHEME_SHIFT;
+    if (g_engine.GetPluginRepo()) {
+        uint32_t pluginRev = g_engine.GetPluginRepo()->GetRevision();
+        flags |= IPC_STATUS_HAS_PLUGINS_REV;
+        flags |= (pluginRev & 0xFFu) << IPC_PLUGINS_REV_SHIFT;
+    }
     return flags;
 }
 
@@ -799,11 +805,24 @@ void HandleClient(HANDLE hPipe) {
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::ExecutePlugin)) {
             std::string outMsg;
             bool ok = false;
+            ime::PluginExecStatus execStatus = ime::PluginExecStatus::LaunchFailed;
             if (g_engine.GetPluginRepo()) {
-                ok = g_engine.GetPluginRepo()->ExecutePlugin(req.vk_code, outMsg);
+                ok = g_engine.GetPluginRepo()->ExecutePlugin(req.vk_code, outMsg, &execStatus);
+                resp.candidate_version = g_engine.GetPluginRepo()->GetRevision();
             }
+            resp.page_index = static_cast<uint32_t>(execStatus);
+            SafeCopyCommitText(resp, ime::Utf8ToWide(outMsg));
             resp.handled = ok ? 1 : 0;
             resp.status_flags = ComputeModeFlags(state);
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetPlugins)) {
+            resp.status_flags = ComputeModeFlags(state);
+            if (g_engine.GetPluginRepo()) {
+                std::vector<ime::PluginRecord> plugins;
+                if (g_engine.GetPluginRepo()->GetAllPlugins(plugins, true)) {
+                    ime::EncodePluginsToIpcResponse(plugins, g_engine.GetPluginRepo()->GetRevision(), resp);
+                }
+            }
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::NextDictionary)) {
             if (state.cached_coord_query.has_next_dictionary && g_engine.GetCoordinator()) {

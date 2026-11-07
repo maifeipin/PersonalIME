@@ -77,13 +77,18 @@ enum IpcModeFlags : uint32_t {
     IPC_MODE_FULL_WIDTH      = 1 << 2, // 1 = Full-width (全角), 0 = Half-width (半角)
     IPC_MODE_CHINESE_PUNCT   = 1 << 3, // 1 = Chinese punctuation, 0 = English punctuation
     IPC_STATUS_HAS_NEXT_DICT = 1 << 4, // 1 = Next dictionary fallback available
-    IPC_STATUS_TRUNCATED     = 1 << 5, // 1 = Ambiguity exploration / candidate budget truncated
-    IPC_STATUS_ERROR         = 1 << 6  // 1 = Query encountered storage / internal error
+    IPC_STATUS_TRUNCATED     = 1 << 5, // 1 = Ambiguity exploration / candidate / plugin budget truncated
+    IPC_STATUS_ERROR         = 1 << 6, // 1 = Query encountered storage / internal error
+    IPC_STATUS_HAS_PLUGINS_REV = 1 << 7 // 1 = status_flags bits 24..31 carry 8-bit plugins revision tag
 };
 
 // Scheme encoding in status_flags (bits 16..23)
 constexpr uint32_t IPC_SCHEME_SHIFT = 16;
 constexpr uint32_t IPC_SCHEME_MASK  = 0x00FF0000;
+
+// Plugins revision tag encoding in status_flags (bits 24..31)
+constexpr uint32_t IPC_PLUGINS_REV_SHIFT = 24;
+constexpr uint32_t IPC_PLUGINS_REV_MASK  = 0xFF000000;
 
 // Update mask for SetMode / SetScheme
 enum IpcUpdateMask : uint32_t {

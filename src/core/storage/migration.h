@@ -17,6 +17,8 @@ private:
     static bool ApplyVersion3(SqliteDb& db);
     static bool ApplyVersion4(SqliteDb& db);
     static bool ApplyVersion5(SqliteDb& db);
+    static bool EnsureDefaultPluginsSeeded(SqliteDb& db);
+    static bool SeedDefaultPluginsInTransaction(SqliteDb& db);
 };
 
 } // namespace ime

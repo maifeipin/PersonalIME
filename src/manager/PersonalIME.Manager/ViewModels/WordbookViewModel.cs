@@ -395,7 +395,24 @@ public class WordbookViewModel : ViewModelBase
             return;
         }
         string text = EditorText;
-        if (EditorCodes.Count == 0)
+        string pendingCode = NewCodeText.Trim();
+        string pendingScheme = NewCodeScheme;
+
+        var codesToSave = new List<EntryCodeItem>(EditorCodes);
+        bool hasNewPendingCode = false;
+        if (!string.IsNullOrEmpty(pendingCode))
+        {
+            bool alreadyExists = codesToSave.Any(item =>
+                item.Scheme == pendingScheme &&
+                item.Code.Equals(pendingCode, StringComparison.OrdinalIgnoreCase));
+            if (!alreadyExists)
+            {
+                codesToSave.Add(new EntryCodeItem { Scheme = pendingScheme, Code = pendingCode });
+                hasNewPendingCode = true;
+            }
+        }
+
+        if (codesToSave.Count == 0)
         {
             _banner.ShowWarning("必须至少指定一个编码");
             return;
@@ -407,13 +424,23 @@ public class WordbookViewModel : ViewModelBase
         {
             if (string.IsNullOrEmpty(EditorEntryId))
             {
-                await _client.AddEntryAsync(text, EditorCodes);
+                await _client.AddEntryAsync(text, codesToSave);
                 _banner.ShowSuccess($"成功添加词条: {text}");
             }
             else
             {
-                await _client.UpdateEntryAsync(EditorEntryId, text, EditorCodes);
+                await _client.UpdateEntryAsync(EditorEntryId, text, codesToSave);
                 _banner.ShowSuccess($"成功更新词条: {text}");
+            }
+
+            if (hasNewPendingCode &&
+                !EditorCodes.Any(item => item.Scheme == pendingScheme && item.Code.Equals(pendingCode, StringComparison.OrdinalIgnoreCase)))
+            {
+                EditorCodes.Add(new EntryCodeItem { Scheme = pendingScheme, Code = pendingCode });
+            }
+            if (!string.IsNullOrEmpty(pendingCode))
+            {
+                NewCodeText = string.Empty;
             }
 
             if (Interlocked.Read(ref _editorSessionToken) == session)

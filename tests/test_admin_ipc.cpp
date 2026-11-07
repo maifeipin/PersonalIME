@@ -8,7 +8,9 @@
 #include <filesystem>
 #include "../src/common/admin_protocol.h"
 #include "../src/common/ipc_protocol.h"
+#include "../src/common/plugin_ipc_codec.h"
 #include "../src/core/engine/ime_engine.h"
+#include "../src/core/storage/migration.h"
 #include "../src/ime_service/admin_server.h"
 #include "../src/core/strategy/input_policy_json.h"
 
@@ -434,7 +436,7 @@ static void TestPolicyManagement(AdminServer& server, const std::wstring& pipeNa
 // -----------------------------------------------------------------------------
 // Test 4: User Dictionary CRUD (Multi-code, Special Chars, Emoji, Multi-line)
 // -----------------------------------------------------------------------------
-static void TestUserDictionaryCrud(AdminServer& server, const std::wstring& pipeName) {
+static void TestUserDictionaryCrud(AdminServer& server, const std::wstring& pipeName, ImeEngine& engine) {
     std::cout << "[TEST 4] Testing User Dictionary CRUD (Multi-code, Emoji, Multi-line)..." << std::endl;
 
     AdminClient client;
@@ -534,6 +536,127 @@ static void TestUserDictionaryCrud(AdminServer& server, const std::wstring& pipe
     auto jBadDel = nlohmann::json::parse(resp);
     AssertCondition(jBadDel["success"] == false, "Deleting non-existent entry fails");
     AssertCondition(jBadDel["error"]["code"] == static_cast<int>(AdminErrorCode::EntryNotFound), "Error is EntryNotFound (2001)");
+
+    // 7. Custom Extended Wubi86 Code Contract ("人人输入法" -> "rrsyf", boundaries, normalization, fallback, edit, pin, reverse lookup, learning, export/import, restart)
+    {
+        // 7a. Standard vs Custom Wubi validator distinction & length/character boundaries (1, 4, 5, 64 valid; 0, 65, 'z', '1' rejected)
+        AssertCondition(WubiEncoder::IsValidWubiCode("a") && WubiEncoder::IsValidWubiCode("aaaa"), "Standard Wubi validator accepts 1..4 chars a-y");
+        AssertCondition(!WubiEncoder::IsValidWubiCode("rrsyf"), "Standard Wubi validator rejects 5-char code (preserves standard builtin rule)");
+        AssertCondition(WubiEncoder::IsValidCustomWubiCode("a") && WubiEncoder::IsValidCustomWubiCode("aaaa") &&
+                        WubiEncoder::IsValidCustomWubiCode("rrsyf") && WubiEncoder::IsValidCustomWubiCode(std::string(64, 'y')),
+                        "Custom Wubi validator accepts 1, 4, 5, 64 chars a-y");
+        AssertCondition(!WubiEncoder::IsValidCustomWubiCode("") && !WubiEncoder::IsValidCustomWubiCode(std::string(65, 'a')) &&
+                        !WubiEncoder::IsValidCustomWubiCode("rrsyz") && !WubiEncoder::IsValidCustomWubiCode("rrsy1"),
+                        "Custom Wubi validator rejects empty, 65-char, 'z', and digits");
+
+        // Reject 65-char and invalid-char Wubi86 codes over Admin IPC
+        nlohmann::json req65 = {
+            {"action", "AddEntry"},
+            {"params", {{"text", "超长五笔码"}, {"codes", {{{"scheme", "wubi86"}, {"code", std::string(65, 'a')}}}}}}
+        };
+        AssertCondition(client.SendFrame(3080, req65.dump(), resp), "Send AddEntry with 65-char Wubi86 code");
+        AssertCondition(nlohmann::json::parse(resp)["success"] == false, "65-char Wubi86 code rejected");
+
+        nlohmann::json reqBadZ = {
+            {"action", "AddEntry"},
+            {"params", {{"text", "非法五笔Z"}, {"codes", {{{"scheme", "wubi86"}, {"code", "rrsyz"}}}}}}
+        };
+        AssertCondition(client.SendFrame(3081, reqBadZ.dump(), resp), "Send AddEntry with invalid 'z' Wubi86 code");
+        AssertCondition(nlohmann::json::parse(resp)["success"] == false, "Wubi86 code with 'z' rejected");
+
+        // 7b. Uppercase normalization ("RRSYF" -> "rrsyf") & 1/4/5/64 boundary save
+        nlohmann::json reqUpper = {
+            {"action", "AddEntry"},
+            {"params", {
+                {"text", "人人输入法"},
+                {"codes", {
+                    {{"scheme", "wubi86"}, {"code", "RRSYF"}},
+                    {{"scheme", "wubi86"}, {"code", std::string(64, 'w')}}
+                }}
+            }}
+        };
+        AssertCondition(client.SendFrame(308, reqUpper.dump(), resp), "Send AddEntry for 人人输入法 with uppercase RRSYF and 64-char code");
+        auto jLongWb = nlohmann::json::parse(resp);
+        AssertCondition(jLongWb["success"] == true, "AddEntry with RRSYF and 64-char Wubi86 code succeeded");
+        std::string longWbId = jLongWb["data"]["entry_id"];
+        AssertCondition(!longWbId.empty(), "Received non-empty entry_id for rrsyf");
+
+        // Verify prefix ('rrsy', 'RRSY') and exact ('rrsyf', 'RRSYF', 64-char) recall via Coordinator
+        auto qPrefixRrsy = engine.GetCoordinator()->Query("RRSY");
+        bool foundRrsyPrefix = false;
+        for (const auto& c : qPrefixRrsy.candidates) {
+            if (c.entry_id == longWbId && c.text == L"人人输入法" && c.quality == MatchQuality::PrefixCompletion) foundRrsyPrefix = true;
+        }
+        AssertCondition(foundRrsyPrefix, "4-char prefix 'RRSY' recalls 5-char custom Wubi86 entry '人人输入法'");
+
+        auto qExactRrsyf = engine.GetCoordinator()->Query("RRSYF");
+        bool foundRrsyfExact = false;
+        Candidate rrsyfCand;
+        for (const auto& c : qExactRrsyf.candidates) {
+            if (c.entry_id == longWbId && c.text == L"人人输入法" && c.quality == MatchQuality::ExactFull) {
+                foundRrsyfExact = true;
+                rrsyfCand = c;
+            }
+        }
+        AssertCondition(foundRrsyfExact, "5-char exact code 'RRSYF' recalls custom Wubi86 entry '人人输入法' as ExactFull");
+
+        auto qExact64 = engine.GetCoordinator()->Query(std::string(64, 'w'));
+        AssertCondition(!qExact64.candidates.empty() && qExact64.candidates[0].entry_id == longWbId, "64-char Wubi86 boundary code recalls entry");
+
+        // 7c. Mixed-input fallback when 5+ char code has no Wubi match (e.g. 'zhongwen' falls back to Pinyin)
+        auto qFallback = engine.GetCoordinator()->Query("zhongwen");
+        AssertCondition(!qFallback.candidates.empty() && qFallback.candidates[0].scheme == InputScheme::Pinyin,
+                        "Unmatched 8-char code 'zhongwen' cleanly falls back to secondary Pinyin input method");
+
+        // 7d. ReverseLookup returns normalized 'rrsyf'
+        nlohmann::json reqRev = {{"action", "ReverseLookup"}, {"params", {{"text", "人人输入法"}, {"target_method", "wubi86"}}}};
+        AssertCondition(client.SendFrame(3082, reqRev.dump(), resp), "Send ReverseLookup for 人人输入法");
+        auto jRev = nlohmann::json::parse(resp);
+        AssertCondition(jRev["success"] == true && jRev["data"]["found"] == true && jRev["data"]["primary_code"] == "rrsyf",
+                        "ReverseLookup returns normalized custom 5-char Wubi86 code 'rrsyf'");
+
+        // 7e. Scope & Pinning affiliation verification ('rrsy' and 'rrsyf')
+        nlohmann::json reqScope = {{"action", "GetScopeCandidates"}, {"params", {{"scheme", "wubi86"}, {"code", "rrsyf"}}}};
+        AssertCondition(client.SendFrame(3083, reqScope.dump(), resp), "GetScopeCandidates for rrsyf");
+        AssertCondition(!nlohmann::json::parse(resp)["data"]["candidates"].empty(), "GetScopeCandidates finds rrsyf");
+
+        nlohmann::json reqPin = {
+            {"action", "SetPin"},
+            {"params", {{"scheme", "wubi86"}, {"code", "rrsyf"}, {"entry_id", longWbId}, {"is_pinned", true}, {"order_rank", 1}}}
+        };
+        AssertCondition(client.SendFrame(3084, reqPin.dump(), resp), "SetPin for rrsyf");
+        AssertCondition(nlohmann::json::parse(resp)["success"] == true, "SetPin affiliation verification accepts 5-char Wubi86 code rrsyf");
+
+        // 7f. Learning progression via CommitCandidate
+        AssertCondition(engine.GetCoordinator()->CommitCandidate(rrsyfCand, "ev_rrsyf_learn_1", 1, 1),
+                        "CommitCandidate learning succeeds for 5-char Wubi86 code rrsyf");
+        auto statAfter = engine.GetRepo()->GetStat(InputScheme::Wubi86, "rrsyf", longWbId);
+        AssertCondition(statAfter.has_value() && statAfter->selected_count == 1, "Learning stat recorded under 'rrsyf'");
+
+        // 7g. Edit entry ('rrsyf' -> 'rrsyfa') and Export/Import + Restart persistence
+        nlohmann::json reqEdit = {
+            {"action", "UpdateEntry"},
+            {"params", {
+                {"entry_id", longWbId},
+                {"text", "人人输入法Pro"},
+                {"codes", {{{"scheme", "wubi86"}, {"code", "rrsyfa"}}}}
+            }}
+        };
+        AssertCondition(client.SendFrame(3085, reqEdit.dump(), resp), "UpdateEntry to 6-char Wubi86 code rrsyfa");
+        AssertCondition(nlohmann::json::parse(resp)["success"] == true, "UpdateEntry to rrsyfa succeeded");
+
+        std::string backupPath = "out/stage4b_long_wubi_backup.json";
+        std::string backupErr;
+        AssertCondition(engine.ExportData(backupPath, &backupErr), "ExportData with 6-char custom Wubi86 entry succeeded");
+        AssertCondition(engine.ImportData(backupPath, false, &backupErr), "ImportData with 6-char custom Wubi86 entry succeeded");
+        std::filesystem::remove(backupPath);
+
+        auto qEdited = engine.GetCoordinator()->Query("rrsyfa");
+        AssertCondition(!qEdited.candidates.empty() && qEdited.candidates[0].text == L"人人输入法Pro",
+                        "Edited & re-imported 6-char Wubi86 entry recalled cleanly");
+
+        engine.DeleteUserEntry(longWbId);
+    }
 
     std::cout << "  [PASS] User dictionary CRUD verified!" << std::endl;
 }
@@ -1792,13 +1915,58 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     auto getEnabledResp = SendJson(getEnabledReq);
     AssertCondition(getEnabledResp["data"]["plugins"].size() == 3, "Only enabled plugins must exclude disabled 4th plugin");
 
-    // 4. ExecutePlugin (execute headless addedId -> cmd.exe /c exit 0 instead of GUI calc.exe)
+    // Inject mock process launcher so tests never launch real OS apps and can verify exact arguments & failure modes
+    int launcherCalls = 0;
+    std::string lastLaunchPath;
+    std::string lastLaunchArgs;
+    bool injectLaunchFail = false;
+    engine.GetPluginRepo()->SetProcessLauncher([&](const std::string& path, const std::string& args, uint32_t& outPid, uint32_t& outErr) -> bool {
+        launcherCalls++;
+        lastLaunchPath = path;
+        lastLaunchArgs = args;
+        if (injectLaunchFail) {
+            outErr = 2; // ERROR_FILE_NOT_FOUND
+            return false;
+        }
+        outPid = 4242;
+        return true;
+    });
+
+    // 4. ExecutePlugin on disabled plugin MUST be rejected (P1: disabled plugin cannot be launched)
     nlohmann::json execReq;
     execReq["action"] = "execute_plugin";
     execReq["request_id"] = 5005;
     execReq["parameters"] = { {"id", addedId} };
+    auto execDisabledResp = SendJson(execReq);
+    AssertCondition(execDisabledResp.value("success", false), "ExecutePlugin IPC call returned response");
+    AssertCondition(execDisabledResp["data"]["success"] == false, "Disabled plugin execution MUST return data.success=false");
+    AssertCondition(execDisabledResp["data"]["exec_status"] == "DISABLED", "Disabled plugin execution returns exec_status=DISABLED");
+    AssertCondition(launcherCalls == 0, "Disabled plugin MUST NOT invoke process launcher");
+
+    // Re-enable plugin and update exec_path & arguments -> verify ExecutePlugin uses updated DB record
+    nlohmann::json reenableReq;
+    reenableReq["action"] = "update_plugin";
+    reenableReq["request_id"] = 50051;
+    reenableReq["parameters"] = {
+        {"id", addedId},
+        {"exec_path", "updated_tool.exe"},
+        {"arguments", "--updated-flag"},
+        {"is_enabled", true}
+    };
+    AssertCondition(SendJson(reenableReq).value("success", false), "Re-enable and update plugin config");
+
     auto execResp = SendJson(execReq);
-    AssertCondition(execResp.value("success", false), "ExecutePlugin executed successfully");
+    AssertCondition(execResp.value("success", false) && execResp["data"]["success"] == true, "Enabled plugin executed successfully");
+    AssertCondition(execResp["data"]["exec_status"] == "SUCCESS", "Enabled plugin returns exec_status=SUCCESS");
+    AssertCondition(launcherCalls == 1 && lastLaunchPath == "updated_tool.exe" && lastLaunchArgs == "--updated-flag",
+                    "ExecutePlugin launched authoritative updated DB exec_path and arguments");
+
+    // Inject process launcher failure -> verify LAUNCH_FAILED status
+    injectLaunchFail = true;
+    auto execFailResp = SendJson(execReq);
+    injectLaunchFail = false;
+    AssertCondition(execFailResp["data"]["success"] == false && execFailResp["data"]["exec_status"] == "LAUNCH_FAILED",
+                    "Process launch failure returns exec_status=LAUNCH_FAILED");
 
     // 5. GetPluginLogs
     nlohmann::json logReq;
@@ -1807,8 +1975,10 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     auto logResp = SendJson(logReq);
     AssertCondition(logResp.value("success", false), "GetPluginLogs succeeded");
     auto logsArr = logResp["data"]["logs"];
-    AssertCondition(!logsArr.empty(), "Logs must contain at least 1 record");
-    AssertCondition(logsArr[0]["status"] == "SUCCESS", "Latest execution status is SUCCESS");
+    AssertCondition(logsArr.size() >= 3, "Logs contain disabled, success, and launch_failed records");
+    AssertCondition(logsArr[0]["status"] == "FAILED", "Latest execution status is FAILED (from injected launch failure)");
+    AssertCondition(logsArr[1]["status"] == "SUCCESS" && logsArr[1]["plugin_id"] == addedId,
+                    "Previous execution status is SUCCESS with authoritative plugin_id");
 
     // 6. ClearPluginLogs
     nlohmann::json clearReq;
@@ -1820,7 +1990,8 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     auto logAfterResp = SendJson(logReq);
     AssertCondition(logAfterResp["data"]["logs"].empty(), "Logs must be empty after clear");
 
-    // 7. DeletePlugin
+    // 7. DeletePlugin & verify executing deleted plugin ID is rejected with NOT_FOUND
+    int callsBeforeDelExec = launcherCalls;
     nlohmann::json delReq;
     delReq["action"] = "delete_plugin";
     delReq["request_id"] = 5008;
@@ -1828,10 +1999,113 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     auto delResp = SendJson(delReq);
     AssertCondition(delResp.value("success", false), "DeletePlugin succeeded");
 
+    auto execDeletedResp = SendJson(execReq);
+    AssertCondition(execDeletedResp["data"]["success"] == false && execDeletedResp["data"]["exec_status"] == "NOT_FOUND",
+                    "Deleted plugin execution MUST return exec_status=NOT_FOUND");
+    AssertCondition(launcherCalls == callsBeforeDelExec, "Deleted plugin MUST NOT invoke process launcher");
+
     auto getFinalResp = SendJson(getReq);
     AssertCondition(getFinalResp["data"]["plugins"].size() == 3, "Plugins count restored to 3 after delete");
+    engine.GetPluginRepo()->SetProcessLauncher(nullptr);
 
-    std::cout << "  [PASS] Stage 5 Plugin Management & Logs IPC verified!" << std::endl;
+    // 8. Migration Default Plugins Seeding Contract (empty, pre-existing custom, partial defaults, fault injection rollback/retry, user delete non-resurrection)
+    {
+        std::string seedDbPath = "out/stage5_plugin_seed_test.db";
+        std::error_code ec;
+        std::filesystem::remove(seedDbPath, ec);
+
+        // 8a. Pre-existing custom plugin + 1 partial default plugin ('计算器') before seeding
+        {
+            SqliteDb db;
+            AssertCondition(db.Open(seedDbPath), "Open seed test DB");
+            AssertCondition(db.Execute("CREATE TABLE meta_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"), "Create meta_settings");
+            AssertCondition(db.Execute("CREATE TABLE plugins (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, icon TEXT NOT NULL, exec_path TEXT NOT NULL, arguments TEXT NOT NULL DEFAULT '', is_enabled INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);"), "Create plugins");
+            AssertCondition(db.Execute("INSERT INTO plugins (name, icon, exec_path, arguments, is_enabled, sort_order) VALUES ('用户已有插件', '🚀', 'custom.exe', '', 1, 10);"), "Insert pre-existing custom plugin");
+            AssertCondition(db.Execute("INSERT INTO plugins (name, icon, exec_path, arguments, is_enabled, sort_order) VALUES ('计算器', '🧮', 'calc.exe', '', 1, 0);"), "Insert partial default plugin 计算器");
+
+            // 8b. Fault injection: deny INSERT on meta_settings so default_plugins_seeded write fails -> entire seeding transaction must roll back!
+            sqlite3_set_authorizer(db.GetHandle(), [](void*, int action, const char* arg1, const char*, const char*, const char*) -> int {
+                if (action == SQLITE_INSERT && arg1 && std::string(arg1) == "meta_settings") {
+                    return SQLITE_DENY;
+                }
+                return SQLITE_OK;
+            }, nullptr);
+
+            AssertCondition(!Migration::Migrate(db), "Migration::Migrate fails when default_plugins_seeded write is denied");
+            sqlite3_set_authorizer(db.GetHandle(), nullptr, nullptr);
+
+            PluginRepository repo(db);
+            std::vector<PluginRecord> afterRollback;
+            AssertCondition(repo.GetAllPlugins(afterRollback, false) && afterRollback.size() == 2,
+                            "Failed seeding rolled back cleanly: still only 2 plugins (custom + 计算器)");
+
+            // 8c. Retry Migration::Migrate after clearing fault -> seeds missing '画图' and 'Edge浏览器' without duplicating '计算器' (total 4)!
+            AssertCondition(Migration::Migrate(db), "Migration::Migrate succeeds on retry");
+            std::vector<PluginRecord> afterRetry;
+            AssertCondition(repo.GetAllPlugins(afterRetry, false) && afterRetry.size() == 4,
+                            "After retry, all 3 default plugins + 1 custom plugin exist without duplicates (total 4)");
+
+            // 8d. User deletes default plugin '画图' -> subsequent Migrate / restart must NOT resurrect '画图'!
+            for (const auto& p : afterRetry) {
+                if (p.name == "画图") {
+                    AssertCondition(repo.DeletePlugin(p.id), "User deletes default plugin 画图");
+                }
+            }
+            AssertCondition(Migration::Migrate(db), "Subsequent Migrate after user deletion succeeds");
+            std::vector<PluginRecord> afterRestart;
+            AssertCondition(repo.GetAllPlugins(afterRestart, false) && afterRestart.size() == 3,
+                            "Deleted default plugin 画图 is NOT resurrected on restart/re-migration");
+        }
+        std::filesystem::remove(seedDbPath, ec);
+    }
+
+    // 9. Plugin IPC Codec: control character escaping (\t, \n, \r, quotes, backslashes) and explicit truncation status
+    {
+        std::vector<PluginRecord> testList;
+        PluginRecord pCtrl;
+        pCtrl.id = 77;
+        pCtrl.name = "带控制符\t换行\n回车\r引号\"反斜杠\\插件";
+        pCtrl.icon = "🧪";
+        pCtrl.exec_path = "C:\\Program Files\\Test\tApp\\run.exe";
+        pCtrl.arguments = "--msg=\"line1\nline2\tval\"";
+        testList.push_back(pCtrl);
+
+        IpcKeyResponse codecResp{};
+        EncodePluginsToIpcResponse(testList, 12, codecResp);
+        std::vector<DecodedPluginItem> decoded;
+        bool truncated = true;
+        uint32_t rev = 0;
+        AssertCondition(DecodePluginsFromIpcResponse(codecResp, decoded, &truncated, &rev), "Decode control-char plugin response");
+        AssertCondition(!truncated && rev == 12 && decoded.size() == 1, "Non-truncated revision 12 decoded 1 item");
+        AssertCondition(WideToUtf8(decoded[0].name) == pCtrl.name &&
+                        WideToUtf8(decoded[0].exec_path) == pCtrl.exec_path &&
+                        WideToUtf8(decoded[0].arguments) == pCtrl.arguments,
+                        "Control characters (\\t, \\n, \\r, quotes, backslashes) round-tripped with zero field corruption");
+
+        // Now add oversized plugins to exceed 1023 wchar_t buffer -> verify explicit truncation flag + valid partial JSON
+        for (int i = 0; i < 20; ++i) {
+            PluginRecord big;
+            big.id = 100 + i;
+            big.name = "超长插件_" + std::to_string(i);
+            big.icon = "📦";
+            big.exec_path = "C:\\Path\\" + std::string(60, 'x') + ".exe";
+            big.arguments = std::string(60, 'a');
+            testList.push_back(big);
+        }
+        IpcKeyResponse truncResp{};
+        EncodePluginsToIpcResponse(testList, 13, truncResp);
+        std::vector<DecodedPluginItem> truncDecoded;
+        bool isTrunc = false;
+        uint32_t truncRev = 0;
+        AssertCondition(DecodePluginsFromIpcResponse(truncResp, truncDecoded, &isTrunc, &truncRev),
+                        "Decode truncated plugin response succeeds with valid prefix items");
+        AssertCondition(isTrunc && (truncResp.status_flags & IPC_STATUS_TRUNCATED) != 0,
+                        "Oversized plugin list explicitly sets IPC_STATUS_TRUNCATED and outTruncated=true");
+        AssertCondition(!truncDecoded.empty() && truncDecoded.size() < testList.size(),
+                        "Truncated response preserves valid fit prefix items");
+    }
+
+    std::cout << "  [PASS] Stage 5 Plugin Management, Execution Guard, Seed Transaction & Codec IPC verified!" << std::endl;
 }
 
 static void TestStage4C2ReverseLookupAdminIpc(AdminServer&, const std::wstring& pipeName, ImeEngine& engine) {
@@ -2056,7 +2330,7 @@ int main() {
         TestGoldenFrameAndHeader(server, testPipeName);
         TestNegativeFramingAndFaultInjection(server, testPipeName);
         TestPolicyManagement(server, testPipeName);
-        TestUserDictionaryCrud(server, testPipeName);
+        TestUserDictionaryCrud(server, testPipeName, engine);
         TestPinningAndBatchReorder(server, testPipeName, engine);
         TestLearningResetAndLateAck(server, testPipeName, engine);
         TestExportImportAndBusyProtection(server, testPipeName, engine);

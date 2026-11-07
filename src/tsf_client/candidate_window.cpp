@@ -20,6 +20,16 @@ void CCandidateWindow::InitDefaultPlugins() {
     };
 }
 
+void CCandidateWindow::SetPlugins(const std::vector<CandidatePluginItem>& plugins) {
+    m_plugins = plugins;
+    if (!m_candidates.empty() && m_hWnd && IsWindow(m_hWnd) && IsWindowVisible(m_hWnd)) {
+        int savedSel = m_selectedIndex;
+        CandidateDisplaySnapshot snap = m_snapshot;
+        snap.initial_selected_index = savedSel;
+        Show(snap, m_lastShowPt);
+    }
+}
+
 void CCandidateWindow::TriggerPluginButton(uint32_t pluginId) {
     for (const auto& p : m_plugins) {
         if (p.id == pluginId) {
@@ -193,6 +203,7 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     }
 
     m_snapshot = snapshot;
+    m_lastShowPt = pt;
     m_candidates = snapshot.candidates;
     int initSel = snapshot.initial_selected_index;
     if (initSel < 0) initSel = 0;

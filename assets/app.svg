@@ -1,26 +1,41 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
+    <!-- Background Squircle Gradient (Rich Deep Brand Blue) -->
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0078D4" />
-      <stop offset="100%" stop-color="#004E8C" />
+      <stop offset="0%" stop-color="#0A85EA" />
+      <stop offset="50%" stop-color="#0066B8" />
+      <stop offset="100%" stop-color="#004080" />
     </linearGradient>
+
+    <!-- Background "人" Stroke Gradient (Atmospheric perspective / depth of field) -->
     <linearGradient id="backStroke" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#7CE8FF" stop-opacity="0.7" />
-      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.45" />
+      <stop offset="0%" stop-color="#60D5FF" stop-opacity="0.65" />
+      <stop offset="100%" stop-color="#1E90FF" stop-opacity="0.30" />
     </linearGradient>
+
+    <!-- Background Subtle Blur for Camera Bokeh / Depth of Field Effect -->
+    <filter id="bokehBlur" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2.2" />
+    </filter>
+
+    <!-- Foreground Floating Drop Shadow (Heightens 3D elevation between foreground and background) -->
+    <filter id="foreDropShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="-3" dy="5" stdDeviation="4.5" flood-color="#001833" flood-opacity="0.6" />
+    </filter>
   </defs>
 
-  <!-- Rounded Squircle Background -->
-  <rect x="8" y="8" width="240" height="240" rx="54" ry="54" fill="url(#bgGrad)" stroke="#FFFFFF" stroke-opacity="0.2" stroke-width="4"/>
+  <!-- Rounded Squircle Background Canvas -->
+  <rect x="8" y="8" width="240" height="240" rx="54" ry="54" fill="url(#bgGrad)" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="3"/>
 
-  <!-- Background Echo "人" (Offset top-right to symbolize "人人" with depth, never reading as "从") -->
-  <g fill="none" stroke="url(#backStroke)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" transform="translate(26, -16)">
+  <!-- Background "人" (Distant layer: scaled down to 82%, pushed up-right, bokeh lens blur + softer opacity) -->
+  <!-- Center of scaling around (128, 128) -> scale(0.82) translate(182, -32) -->
+  <g filter="url(#bokehBlur)" fill="none" stroke="url(#backStroke)" stroke-width="21" stroke-linecap="round" stroke-linejoin="round" transform="matrix(0.82 0 0 0.82 58 -28)">
     <path d="M 128 56 C 122 108, 96 156, 54 196" />
     <path d="M 116 108 C 138 142, 166 174, 202 196" />
   </g>
 
-  <!-- Foreground Primary Bold "人" -->
-  <g fill="none" stroke="#FFFFFF" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" transform="translate(-10, 8)">
+  <!-- Foreground Primary "人" (Prominent layer: scaled up to 104%, moved down-left, crisp pure white with 3D drop shadow) -->
+  <g filter="url(#foreDropShadow)" fill="none" stroke="#FFFFFF" stroke-width="27" stroke-linecap="round" stroke-linejoin="round" transform="matrix(1.04 0 0 1.04 -20 8)">
     <path d="M 128 56 C 122 108, 96 156, 54 196" />
     <path d="M 116 108 C 138 142, 166 174, 202 196" />
   </g>

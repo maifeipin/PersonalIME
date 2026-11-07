@@ -66,6 +66,7 @@ bool PluginRepository::AddPlugin(const PluginRecord& plugin, int64_t& outId) {
 
     if (!stmt->Execute()) return false;
     outId = m_db.LastInsertRowId();
+    m_revision.fetch_add(1, std::memory_order_acq_rel);
     return true;
 }
 
@@ -81,7 +82,9 @@ bool PluginRepository::UpdatePlugin(const PluginRecord& plugin) {
     stmt->BindInt(6, plugin.sort_order);
     stmt->BindInt64(7, plugin.id);
 
-    return stmt->Execute();
+    if (!stmt->Execute()) return false;
+    m_revision.fetch_add(1, std::memory_order_acq_rel);
+    return true;
 }
 
 bool PluginRepository::DeletePlugin(int64_t id) {
@@ -89,7 +92,9 @@ bool PluginRepository::DeletePlugin(int64_t id) {
     if (!stmt) return false;
 
     stmt->BindInt64(1, id);
-    return stmt->Execute();
+    if (!stmt->Execute()) return false;
+    m_revision.fetch_add(1, std::memory_order_acq_rel);
+    return true;
 }
 
 bool PluginRepository::AddPluginLog(int64_t pluginId, const std::string& pluginName, const std::string& commandLine,
@@ -131,45 +136,71 @@ bool PluginRepository::ClearPluginLogs() {
     return m_db.Execute("DELETE FROM plugin_logs;");
 }
 
-bool PluginRepository::ExecutePlugin(int64_t pluginId, std::string& outMessage) {
+bool PluginRepository::ExecutePlugin(int64_t pluginId, std::string& outMessage, PluginExecStatus* outStatus) {
     PluginRecord rec;
     if (!GetPluginById(pluginId, rec)) {
         outMessage = "Plugin not found";
+        if (outStatus) *outStatus = PluginExecStatus::NotFound;
+        AddPluginLog(pluginId, "(deleted)", "", "FAILED", outMessage);
         return false;
     }
 
-    return ExecuteCustom(rec.name, rec.exec_path, rec.arguments, outMessage);
+    if (!rec.is_enabled) {
+        outMessage = "Plugin is disabled";
+        if (outStatus) *outStatus = PluginExecStatus::Disabled;
+        std::string cmdLine = rec.exec_path + (rec.arguments.empty() ? "" : (" " + rec.arguments));
+        AddPluginLog(rec.id, rec.name, cmdLine, "FAILED", outMessage);
+        return false;
+    }
+
+    return ExecuteCustom(rec.name, rec.exec_path, rec.arguments, outMessage, rec.id, outStatus);
 }
 
-bool PluginRepository::ExecuteCustom(const std::string& name, const std::string& execPath, const std::string& args, std::string& outMessage) {
-    std::wstring wPath = Utf8ToWide(execPath);
-    std::wstring wArgs = Utf8ToWide(args);
+bool PluginRepository::ExecuteCustom(const std::string& name, const std::string& execPath, const std::string& args,
+                                     std::string& outMessage, int64_t pluginId, PluginExecStatus* outStatus) {
     std::string cmdLine = execPath + (args.empty() ? "" : (" " + args));
 
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
-    sei.lpVerb = L"open";
-    sei.lpFile = wPath.c_str();
-    sei.lpParameters = wArgs.empty() ? nullptr : wArgs.c_str();
-    sei.nShow = SW_SHOWNORMAL;
+    uint32_t pid = 0;
+    uint32_t win32Err = 0;
+    bool ok = false;
 
-    BOOL ok = ShellExecuteExW(&sei);
+    if (m_processLauncher) {
+        ok = m_processLauncher(execPath, args, pid, win32Err);
+    } else {
+        std::wstring wPath = Utf8ToWide(execPath);
+        std::wstring wArgs = Utf8ToWide(args);
+
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        sei.lpVerb = L"open";
+        sei.lpFile = wPath.c_str();
+        sei.lpParameters = wArgs.empty() ? nullptr : wArgs.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+
+        BOOL shellOk = ShellExecuteExW(&sei);
+        if (!shellOk) {
+            win32Err = GetLastError();
+            ok = false;
+        } else {
+            ok = true;
+            if (sei.hProcess) {
+                pid = GetProcessId(sei.hProcess);
+                CloseHandle(sei.hProcess);
+            }
+        }
+    }
+
     if (!ok) {
-        DWORD err = GetLastError();
-        outMessage = "Failed to launch process (Windows error code: " + std::to_string(err) + ")";
-        AddPluginLog(0, name, cmdLine, "FAILED", outMessage);
+        if (outStatus) *outStatus = PluginExecStatus::LaunchFailed;
+        outMessage = "Failed to launch process (Windows error code: " + std::to_string(win32Err) + ")";
+        AddPluginLog(pluginId, name, cmdLine, "FAILED", outMessage);
         return false;
     }
 
-    DWORD pid = 0;
-    if (sei.hProcess) {
-        pid = GetProcessId(sei.hProcess);
-        CloseHandle(sei.hProcess);
-    }
-
+    if (outStatus) *outStatus = PluginExecStatus::Success;
     outMessage = "Process launched successfully" + (pid > 0 ? " (PID: " + std::to_string(pid) + ")" : "");
-    AddPluginLog(0, name, cmdLine, "SUCCESS", outMessage);
+    AddPluginLog(pluginId, name, cmdLine, "SUCCESS", outMessage);
     return true;
 }
 

@@ -49,7 +49,6 @@ inline bool IsValidCode(InputScheme scheme, const std::string& code) {
     if (code.empty() || code.length() > 64) return false;
     switch (scheme) {
         case InputScheme::Wubi86: {
-            if (code.length() > 4) return false;
             for (char c : code) {
                 char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 if (lower < 'a' || lower > 'y') return false;

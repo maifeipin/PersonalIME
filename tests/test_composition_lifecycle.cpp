@@ -1291,6 +1291,7 @@ public:
     std::atomic<int> m_learnedCount{0};
     std::atomic<int> m_resetCount{0};
     std::atomic<uint32_t> m_lastSelectVersion{0};
+    std::atomic<uint32_t> m_pluginsRevTag{0}; // If > 0, sets IPC_STATUS_HAS_PLUGINS_REV in status_flags
     std::wstring m_lastSelectedText;
 
     SnapshotMockIpcServer(const std::wstring& pipeName) : m_pipeName(pipeName) {
@@ -1417,6 +1418,10 @@ public:
                 resp.context_id = req.context_id;
                 resp.protocol_version = req.protocol_version;
                 resp.handled = 1;
+                uint32_t pRev = pThis->m_pluginsRevTag.load();
+                if (pRev > 0) {
+                    resp.status_flags |= IPC_STATUS_HAS_PLUGINS_REV | ((pRev & 0xFFu) << IPC_PLUGINS_REV_SHIFT);
+                }
 
                 EnterCriticalSection(&pThis->m_cs);
                 auto& st = pThis->m_ctxStates[req.context_id];
@@ -1882,6 +1887,94 @@ int TestSnapshotBoundMouseSelectionAndLatePaging() {
     return 0;
 }
 
+int TestPluginSyncNonBlockingAndDisabledClickRejection() {
+    std::wcout << L"[TEST 18] Testing Plugin Sync Non-Blocking, Fault Resilience & Disabled Click Rejection..." << std::endl;
+
+    const std::wstring testPipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_T18_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(testPipeName);
+    server.m_pluginsRevTag.store(5); // Advertise plugins revision tag = 5
+    CHECK_TRUE(server.Start(3), L"Snapshot mock server must start");
+    IpcClient::SetPipeNameForTest(testPipeName.c_str());
+
+    CTextInputProcessor tip;
+    tip.SetClientIdForTest(1);
+    MockContext ctx;
+    auto& wnd = tip.GetCandidateWindowForTest();
+
+    // 1. Inject plugin query failure/delay during keystroke -> verify composition, commit, and receipt still succeed!
+    int pluginQueryCalls = 0;
+    bool injectQueryFailure = true;
+    std::vector<CandidatePluginItem> serverPlugins = {
+        { 10, L"数据库计算器", L"🧮", L"calc.exe", L"" },
+        { 20, L"数据库笔记", L"📝", L"notepad.exe", L"" }
+    };
+    tip.SetPluginQueryOverrideForTest([&](std::vector<CandidatePluginItem>& outPlugins, bool* outTrunc, uint32_t* outRev) -> bool {
+        pluginQueryCalls++;
+        // Verify that host composition has ALREADY been updated BEFORE plugin sync runs!
+        if (ctx.m_activeCompRange.empty() && pluginQueryCalls == 1) {
+            return false; // Would fail if plugin sync ran before RequestEditSession!
+        }
+        if (injectQueryFailure) {
+            return false; // Simulate DB busy / plugin query failure
+        }
+        outPlugins = serverPlugins;
+        if (outTrunc) *outTrunc = false;
+        if (outRev) *outRev = server.m_pluginsRevTag.load();
+        return true;
+    });
+
+    BOOL eaten = FALSE;
+    tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+    CHECK_EQUAL(eaten, TRUE, L"Key 'A' eaten even when plugin query fails");
+    CHECK_EQUAL(ctx.m_activeCompRange, L"a", L"Host composition updated to 'a' despite plugin query failure");
+    CHECK_EQUAL(wnd.GetCandidateCount(), 5, L"Candidate window displayed 5 candidates despite plugin query failure");
+    CHECK_EQUAL(pluginQueryCalls, 1, L"Real plugin sync branch executed without test-pipe bypass");
+
+    // Commit with VK_SPACE while plugin query is still failing -> commit and receipt MUST succeed!
+    int commitsBefore = server.m_commitSuccessCount.load();
+    tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+    CHECK_EQUAL(eaten, TRUE, L"VK_SPACE commit eaten");
+    CHECK_EQUAL(ctx.m_activeCompRange, L"工", L"Committed '工' to host document cleanly");
+    CHECK_EQUAL(server.m_commitSuccessCount.load(), commitsBefore + 1, L"CommitSuccess receipt delivered cleanly despite plugin query failure");
+
+    // 2. Now allow plugin query to succeed -> next composition syncs revision 5 plugins into CandidateWindow!
+    injectQueryFailure = false;
+    tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+    CHECK_EQUAL(tip.GetSyncedPluginsRevisionForTest(), 5u, L"Synced plugins revision 5 after recovery");
+    CHECK_EQUAL(wnd.GetPlugins().size(), size_t(2), L"CandidateWindow updated to 2 DB plugins");
+    CHECK_EQUAL(wnd.GetPlugins()[0].name, L"数据库计算器", L"Plugin 0 is 数据库计算器");
+
+    // 3. Subsequent keystroke with unchanged revision tag (5) uses revision cache without re-querying!
+    int callsAfterSync = pluginQueryCalls;
+    tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+    CHECK_EQUAL(pluginQueryCalls, callsAfterSync, L"Revision cache hit: no redundant GetPlugins call when revision unchanged");
+
+    // 4. Clicking a disabled/deleted plugin button (ExecutePlugin returns false) MUST NOT launch local cached exec_path,
+    //    and MUST refresh CandidateWindow plugins from server!
+    int execCalls = 0;
+    tip.SetPluginExecuteOverrideForTest([&](uint32_t pluginId, uint32_t* outStatus) -> bool {
+        execCalls++;
+        if (outStatus) *outStatus = 2; // PluginExecStatus::Disabled
+        // Server disabled plugin 10, so only plugin 20 remains enabled on server
+        serverPlugins = {
+            { 20, L"数据库笔记", L"📝", L"notepad.exe", L"" }
+        };
+        server.m_pluginsRevTag.store(6);
+        return false; // Rejected by server!
+    });
+
+    wnd.TriggerPluginButton(10);
+    CHECK_EQUAL(execCalls, 1, L"ExecutePlugin called on server");
+    CHECK_EQUAL(wnd.GetPlugins().size(), size_t(1), L"Rejected plugin click refreshed CandidateWindow plugins from server (removed disabled plugin 10)");
+    CHECK_EQUAL(wnd.GetPlugins()[0].id, 20u, L"Remaining plugin is id 20");
+
+    tip.Deactivate();
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Plugin sync non-blocking post-edit, fault resilience, revision cache & disabled click rejection verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -1902,6 +1995,7 @@ int main() {
     if (TestDeactivateFailureRemainsRecoverable() != 0) return 1;
     if (TestAsyncQueuedEditSessionCommitAndFailureMatrix() != 0) return 1;
     if (TestSnapshotBoundMouseSelectionAndLatePaging() != 0) return 1;
+    if (TestPluginSyncNonBlockingAndDisabledClickRejection() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

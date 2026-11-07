@@ -1,6 +1,7 @@
 #include "ipc_client.h"
 #include "globals.h"
 #include "../common/ime_guids.h"
+#include "../common/plugin_ipc_codec.h"
 #include <algorithm>
 #include <new>
 
@@ -368,7 +369,7 @@ bool IpcClient::OpenManager(uint64_t sessionId, uint64_t contextId) {
     return SendRequest(req, resp, 100) && (resp.handled == 1);
 }
 
-bool IpcClient::ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId) {
+bool IpcClient::ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId, uint32_t* outExecStatus) {
     IpcKeyRequest req{};
     req.msg_type = static_cast<uint32_t>(IpcMsgType::ExecutePlugin);
     req.session_id = sessionId;
@@ -376,7 +377,43 @@ bool IpcClient::ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t p
     req.vk_code = pluginId;
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
     IpcKeyResponse resp{};
-    return SendRequest(req, resp, 200) && (resp.handled == 1);
+    if (!SendRequest(req, resp, 200)) {
+        if (outExecStatus) *outExecStatus = static_cast<uint32_t>(ime::PluginExecStatus::LaunchFailed);
+        return false;
+    }
+    if (outExecStatus) *outExecStatus = resp.page_index;
+    return (resp.handled == 1);
+}
+
+bool IpcClient::GetPlugins(uint64_t sessionId, uint64_t contextId, std::vector<CandidatePluginItem>& outPlugins,
+                           bool* outTruncated, uint32_t* outRevision) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::GetPlugins);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+    IpcKeyResponse resp{};
+    if (!SendRequest(req, resp, 30) || resp.handled != 1) {
+        return false;
+    }
+
+    std::vector<ime::DecodedPluginItem> decoded;
+    if (!ime::DecodePluginsFromIpcResponse(resp, decoded, outTruncated, outRevision)) {
+        return false;
+    }
+
+    outPlugins.clear();
+    outPlugins.reserve(decoded.size());
+    for (auto& d : decoded) {
+        CandidatePluginItem item{};
+        item.id = d.id;
+        item.name = std::move(d.name);
+        item.icon = std::move(d.icon);
+        item.exec_path = std::move(d.exec_path);
+        item.arguments = std::move(d.arguments);
+        outPlugins.push_back(std::move(item));
+    }
+    return true;
 }
 
 bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs) {

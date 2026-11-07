@@ -48,12 +48,14 @@ void InputCoordinator::UpdatePolicy(const InputPolicy& policy) {
 std::string InputCoordinator::BuildScopedCode(InputScheme scheme,
                                               const std::string& layoutId,
                                               const std::string& code) {
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
     if (scheme == InputScheme::Shuangpin && !layoutId.empty()) {
         ShuangpinLayout lay = ShuangpinLayoutFromString(layoutId);
         std::string canonical = ShuangpinLayoutToString(lay);
-        return canonical + ":" + code;
+        return canonical + ":" + lowerCode;
     }
-    return code;
+    return lowerCode;
 }
 
 bool InputCoordinator::SetPinPreference(InputScheme scheme,
@@ -107,13 +109,15 @@ InputCoordinator::ResolveInputMethods(const std::string& rawCode,
         int methodPriority = static_cast<int>(i);
 
         if (method == InputScheme::Wubi86) {
+            std::string clean = rawCode;
+            std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
             MethodResolution res;
             res.scheme = InputScheme::Wubi86;
-            res.raw_code = rawCode;
-            res.resolved_code = rawCode;
+            res.raw_code = clean;
+            res.resolved_code = clean;
             res.layout_id = "";
             res.method_priority = methodPriority;
-            res.is_valid = IsValidCode(InputScheme::Wubi86, rawCode);
+            res.is_valid = IsValidCode(InputScheme::Wubi86, clean);
             res.is_complete = true;
             if (res.is_valid) resList.push_back(res);
         } else if (method == InputScheme::Pinyin) {

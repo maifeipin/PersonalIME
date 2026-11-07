@@ -28,11 +28,17 @@ CTextInputProcessor::CTextInputProcessor() {
 
     m_candidateWindow.SetOnExecutePlugin([this](const CandidatePluginItem& item) {
         TerminateCompositionOnHost();
-        if (!m_ipcClient.ExecutePlugin(m_sessionId, 0, item.id)) {
-            // Direct launch fallback if background service is offline
-            ShellExecuteW(nullptr, L"open", item.exec_path.c_str(),
-                          item.arguments.empty() ? nullptr : item.arguments.c_str(),
-                          nullptr, SW_SHOWNORMAL);
+        uint32_t execStatus = 0;
+        bool ok = false;
+        if (m_pluginExecuteOverride) {
+            ok = m_pluginExecuteOverride(item.id, &execStatus);
+        } else {
+            ok = m_pluginIpcClient.ExecutePlugin(m_sessionId, 0, item.id, &execStatus);
+        }
+        // Do NOT fall back to local ShellExecuteW on cached item.exec_path!
+        // If server rejected (e.g. plugin disabled or deleted), refresh plugin metadata from server.
+        if (!ok) {
+            TrySyncPluginsFromServer(0, 0, true);
         }
     });
 
@@ -43,6 +49,30 @@ CTextInputProcessor::CTextInputProcessor() {
     m_candidateWindow.SetOnPageScrollSnapshot([this](const CandidateDisplaySnapshot& snap, bool nextPage) {
         SubmitPageScrollFromSnapshot(snap, nextPage);
     });
+}
+
+bool CTextInputProcessor::TrySyncPluginsFromServer(uint64_t contextId, uint32_t advRevTag, bool force) {
+    if (!force && m_hasSyncedPlugins && advRevTag == m_syncedPluginsRevTag) {
+        return true;
+    }
+    std::vector<CandidatePluginItem> dbPlugins;
+    bool truncated = false;
+    uint32_t fullRev = 0;
+    bool ok = false;
+    if (m_pluginQueryOverride) {
+        ok = m_pluginQueryOverride(dbPlugins, &truncated, &fullRev);
+    } else {
+        ok = m_pluginIpcClient.GetPlugins(m_sessionId, contextId, dbPlugins, &truncated, &fullRev);
+    }
+    if (!ok) {
+        return false;
+    }
+    m_hasSyncedPlugins = true;
+    m_syncedPluginsRevTag = (fullRev != 0) ? (fullRev & 0xFFu) : advRevTag;
+    m_syncedPluginsFullRevision = fullRev;
+    m_lastPluginsTruncated = truncated;
+    m_candidateWindow.SetPlugins(dbPlugins);
+    return true;
 }
 
 void CTextInputProcessor::OpenManagerFromTray() {
@@ -1196,6 +1226,15 @@ bool CTextInputProcessor::ProcessKeyInternal(
             cands.push_back(resp.candidates[i]);
         }
 
+        auto syncPluginsPostEditIfNeeded = [&]() {
+            if (!cands.empty() && (resp.status_flags & IPC_STATUS_HAS_PLUGINS_REV) != 0) {
+                uint32_t advRevTag = (resp.status_flags & IPC_PLUGINS_REV_MASK) >> IPC_PLUGINS_REV_SHIFT;
+                if (!m_hasSyncedPlugins || advRevTag != m_syncedPluginsRevTag) {
+                    TrySyncPluginsFromServer(contextId, advRevTag, false);
+                }
+            }
+        };
+
         if (resp.has_composition || resp.has_commit) {
             if (resp.has_commit && resp.commit_event_id != 0 &&
                 !receipt_journal::Prepare({m_sessionId, contextId, resp.commit_event_id, 0, 0})) {
@@ -1272,6 +1311,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 pSession->Release();
                 if (asyncResult == EditSessionResult::Success || asyncResult == EditSessionResult::PartiallyModified) {
                     *pfEaten = TRUE;
+                    syncPluginsPostEditIfNeeded();
                     return true;
                 }
                 *pfEaten = FALSE;
@@ -1290,9 +1330,11 @@ bool CTextInputProcessor::ProcessKeyInternal(
 
             if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && result == EditSessionResult::Success) {
                 *pfEaten = TRUE;
+                syncPluginsPostEditIfNeeded();
                 return true;
             } else if (result == EditSessionResult::PartiallyModified) {
                 *pfEaten = TRUE;
+                syncPluginsPostEditIfNeeded();
                 return true;
             } else {
                 *pfEaten = FALSE;

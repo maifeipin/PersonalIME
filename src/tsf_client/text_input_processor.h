@@ -218,6 +218,14 @@ public:
     CCandidateWindow& GetCandidateWindowForTest() { return m_candidateWindow; }
     uint64_t GetSessionIdForTest() const { return m_sessionId; }
 
+    using PluginQueryOverrideFunc = std::function<bool(std::vector<CandidatePluginItem>& outPlugins, bool* outTruncated, uint32_t* outRevision)>;
+    using PluginExecuteOverrideFunc = std::function<bool(uint32_t pluginId, uint32_t* outExecStatus)>;
+    void SetPluginQueryOverrideForTest(PluginQueryOverrideFunc fn) { m_pluginQueryOverride = std::move(fn); }
+    void SetPluginExecuteOverrideForTest(PluginExecuteOverrideFunc fn) { m_pluginExecuteOverride = std::move(fn); }
+    bool TrySyncPluginsFromServer(uint64_t contextId, uint32_t advRevTag, bool force = false);
+    uint32_t GetSyncedPluginsRevisionForTest() const { return m_syncedPluginsFullRevision; }
+    bool WasLastPluginsQueryTruncatedForTest() const { return m_lastPluginsTruncated; }
+
     void SetClientIdForTest(TfClientId id) { m_tfClientId = id; }
     IpcClient& GetIpcClient() { return m_ipcClient; }
 
@@ -295,6 +303,14 @@ private:
 
     // Per-instance IPC Client (dedicated pipe connection per TIP thread)
     IpcClient m_ipcClient;
+    // Separate IPC Client for non-critical plugin metadata queries/executions so keystroke pipe is never blocked or disconnected
+    IpcClient m_pluginIpcClient;
+    PluginQueryOverrideFunc m_pluginQueryOverride;
+    PluginExecuteOverrideFunc m_pluginExecuteOverride;
+    bool m_hasSyncedPlugins = false;
+    uint32_t m_syncedPluginsRevTag = 0;
+    uint32_t m_syncedPluginsFullRevision = 0;
+    bool m_lastPluginsTruncated = false;
 
     // Context-isolated candidate snapshot versions
     std::map<uint64_t, uint32_t> m_contextCandidateVersions;

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace PersonalIME.Manager.Models;
@@ -338,6 +339,35 @@ public class GetPinnedResult
     public List<PinnedItem> Entries { get; set; } = [];
 }
 
+public sealed class FlexibleStringOrTimestampConverter : JsonConverter<string>
+{
+    public override string Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            return reader.GetString() ?? string.Empty;
+        }
+        if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt64(out long unixSeconds))
+        {
+            if (unixSeconds <= 0) return string.Empty;
+            try
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(unixSeconds).ToLocalTime().ToString("HH:mm:ss");
+            }
+            catch
+            {
+                return unixSeconds.ToString();
+            }
+        }
+        return string.Empty;
+    }
+
+    public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options)
+    {
+        writer.WriteStringValue(value ?? string.Empty);
+    }
+}
+
 public class PluginModel
 {
     [JsonPropertyName("id")]
@@ -362,6 +392,7 @@ public class PluginModel
     public int SortOrder { get; set; }
 
     [JsonPropertyName("created_at")]
+    [JsonConverter(typeof(FlexibleStringOrTimestampConverter))]
     public string CreatedAt { get; set; } = string.Empty;
 }
 
@@ -376,6 +407,9 @@ public class PluginLogModel
     [JsonPropertyName("plugin_name")]
     public string PluginName { get; set; } = string.Empty;
 
+    [JsonPropertyName("command_line")]
+    public string CommandLine { get; set; } = string.Empty;
+
     [JsonPropertyName("exec_path")]
     public string ExecPath { get; set; } = string.Empty;
 
@@ -385,10 +419,18 @@ public class PluginLogModel
     [JsonPropertyName("status")]
     public string Status { get; set; } = string.Empty;
 
+    [JsonPropertyName("message")]
+    public string Message
+    {
+        get => ErrorMessage;
+        set => ErrorMessage = value;
+    }
+
     [JsonPropertyName("error_message")]
     public string ErrorMessage { get; set; } = string.Empty;
 
     [JsonPropertyName("executed_at")]
+    [JsonConverter(typeof(FlexibleStringOrTimestampConverter))]
     public string ExecutedAt { get; set; } = string.Empty;
 }
 

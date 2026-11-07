@@ -4,6 +4,7 @@
 #include <atomic>
 #include "../common/ipc_protocol.h"
 #include "../core/types.h"
+#include "candidate_window.h"
 
 // Non-singleton, per-TIP instance IPC client
 class IpcClient {
@@ -24,7 +25,9 @@ public:
     bool SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme);
     bool GetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme& outScheme);
     bool OpenManager(uint64_t sessionId, uint64_t contextId);
-    bool ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId);
+    bool ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId, uint32_t* outExecStatus = nullptr);
+    bool GetPlugins(uint64_t sessionId, uint64_t contextId, std::vector<CandidatePluginItem>& outPlugins,
+                    bool* outTruncated = nullptr, uint32_t* outRevision = nullptr);
     void Disconnect();
 
     struct AsyncIoOperation {

@@ -786,10 +786,19 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
                 if (sch == InputScheme::Unknown) {
                     return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Unknown scheme: " + sStr);
                 }
+                if (!IsValidCode(sch, cStr)) {
+                    return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed,
+                        "无效编码 '" + cStr + "' (方案: " + sStr + "): 五笔86仅支持字母 a-y，全拼/双拼支持 a-z");
+                }
                 parsedCodes.emplace_back(sch, cStr);
             }
 
-            std::string id = m_engine.AddUserEntry(Utf8ToWide(text), parsedCodes);
+            std::wstring wText = Utf8ToWide(text);
+            if (!IsValidText(wText)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "词条正文格式无效或超出最大长度限制 (512字符)");
+            }
+
+            std::string id = m_engine.AddUserEntry(wText, parsedCodes);
             if (id.empty()) {
                 return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to insert user entry");
             }
@@ -841,13 +850,22 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
                     if (sch == InputScheme::Unknown) {
                         return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Unknown scheme: " + sStr);
                     }
+                    if (!IsValidCode(sch, cStr)) {
+                        return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed,
+                            "无效编码 '" + cStr + "' (方案: " + sStr + "): 五笔86仅支持字母 a-y，全拼/双拼支持 a-z");
+                    }
                     parsedCodes.emplace_back(sch, cStr);
                 }
             } else {
                 parsedCodes = existing->codes;
             }
 
-            bool ok = m_engine.EditUserEntry(entryId, Utf8ToWide(text), parsedCodes);
+            std::wstring wText = Utf8ToWide(text);
+            if (!IsValidText(wText)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "词条正文格式无效或超出最大长度限制 (512字符)");
+            }
+
+            bool ok = m_engine.EditUserEntry(entryId, wText, parsedCodes);
             if (!ok) {
                 if (m_engine.GetRepo() && m_engine.GetRepo()->HasPendingCommitsForEntry(entryId)) {
                     return MakeErrorResponse(action, requestId, AdminErrorCode::Busy, "Entry has unconfirmed pending commits in flight; cannot update");
@@ -1495,25 +1513,27 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             }
             std::string outMsg;
             bool ok = false;
+            PluginExecStatus execStatus = PluginExecStatus::LaunchFailed;
             if (params.contains("id")) {
                 int id = 0;
                 std::string err;
                 if (!CheckIntField(params, "id", id, true, 0, err)) {
                     return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
                 }
-                ok = m_engine.GetPluginRepo()->ExecutePlugin(id, outMsg);
+                ok = m_engine.GetPluginRepo()->ExecutePlugin(id, outMsg, &execStatus);
             } else if (params.contains("exec_path")) {
                 std::string name = "自定义执行", path, args, err;
                 CheckStringField(params, "name", name, false, err);
                 CheckStringField(params, "exec_path", path, true, err);
                 CheckStringField(params, "arguments", args, false, err);
-                ok = m_engine.GetPluginRepo()->ExecuteCustom(name, path, args, outMsg);
+                ok = m_engine.GetPluginRepo()->ExecuteCustom(name, path, args, outMsg, 0, &execStatus);
             } else {
                 return MakeErrorResponse(action, requestId, AdminErrorCode::MissingParameter, "Either 'id' or 'exec_path' is required");
             }
 
             nlohmann::json data;
             data["success"] = ok;
+            data["exec_status"] = PluginExecStatusToString(execStatus);
             data["message"] = outMsg;
             return MakeSuccessResponse(action, requestId, data);
         }
@@ -1542,6 +1562,7 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
                 item["executed_at"] = l.executed_at;
                 item["status"] = l.status;
                 item["message"] = l.message;
+                item["error_message"] = l.message;
                 arr.push_back(item);
             }
             nlohmann::json data;

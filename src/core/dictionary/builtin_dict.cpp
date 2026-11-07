@@ -1,5 +1,6 @@
 #include "builtin_dict.h"
 #include "../encoding/shuangpin_decoder.h"
+#include "../encoding/wubi_encoder.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -37,6 +38,8 @@ bool BuiltinDictionary::LoadWubi(const std::string& filePath) {
         std::stringstream ss(line);
         std::string textStr, code, weightStr;
         if (std::getline(ss, textStr, '\t') && std::getline(ss, code, '\t')) {
+            code = WubiEncoder::Normalize(code);
+            if (!WubiEncoder::IsValidWubiCode(code)) continue;
             double weight = 10.0;
             if (std::getline(ss, weightStr, '\t')) {
                 try { weight = std::stod(weightStr); } catch (...) {}

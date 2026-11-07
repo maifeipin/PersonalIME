@@ -431,7 +431,12 @@ public class AdminIpcClient : IAdminClient
     public async Task ExecutePluginAsync(long id, CancellationToken ct = default)
     {
         var p = new { id };
-        await SendRequestAsync("ExecutePlugin", p, ct);
+        var data = await SendRequestAsync("ExecutePlugin", p, ct);
+        if (data.TryGetProperty("success", out var okProp) && okProp.ValueKind == JsonValueKind.False)
+        {
+            string msg = data.TryGetProperty("message", out var msgProp) ? (msgProp.GetString() ?? "插件执行失败") : "插件执行失败";
+            throw new AdminException(AdminErrorCode.ValidationFailed, msg);
+        }
     }
 
     public async Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default)

@@ -395,10 +395,10 @@ public class MainViewModel : ViewModelBase, IDisposable
                 }
                 break;
             case 3:
-                _ = Maintenance.RefreshStatusAsync();
+                _ = Plugins.LoadDataAsync();
                 break;
             case 4:
-                _ = Plugins.LoadDataAsync();
+                _ = Maintenance.RefreshStatusAsync();
                 break;
         }
     }

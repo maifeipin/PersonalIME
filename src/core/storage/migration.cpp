@@ -144,6 +144,10 @@ bool Migration::Migrate(SqliteDb& db) {
         }
     }
 
+    if (!EnsureDefaultPluginsSeeded(db)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -459,6 +463,92 @@ bool Migration::ApplyVersion4(SqliteDb& db) {
     return tx.Commit();
 }
 
+bool Migration::SeedDefaultPluginsInTransaction(SqliteDb& db) {
+    auto seededStmt = db.Prepare("SELECT value FROM meta_settings WHERE key = 'default_plugins_seeded';");
+    if (!seededStmt) {
+        return false;
+    }
+    bool hasRow = seededStmt->Step();
+    if (seededStmt->HasError()) {
+        return false;
+    }
+    if (hasRow && seededStmt->ColumnText(0) == "1") {
+        return true;
+    }
+
+    struct DefaultPreset {
+        const char* name;
+        const char* icon;
+        const char* exec_path;
+        const char* arguments;
+        int sort_order;
+    };
+    static const DefaultPreset kPresets[] = {
+        {"计算器", "🧮", "calc.exe", "", 0},
+        {"画图", "🎨", "mspaint.exe", "", 1},
+        {"Edge浏览器", "🌐", "msedge.exe", "https://maifeipin.com", 2}
+    };
+
+    for (const auto& preset : kPresets) {
+        auto checkStmt = db.Prepare("SELECT 1 FROM plugins WHERE name = ? LIMIT 1;");
+        if (!checkStmt) {
+            return false;
+        }
+        checkStmt->BindText(1, preset.name);
+        bool exists = checkStmt->Step();
+        if (checkStmt->HasError()) {
+            return false;
+        }
+        if (!exists) {
+            auto insStmt = db.Prepare(
+                "INSERT INTO plugins (name, icon, exec_path, arguments, is_enabled, sort_order) "
+                "VALUES (?, ?, ?, ?, 1, ?);"
+            );
+            if (!insStmt) {
+                return false;
+            }
+            insStmt->BindText(1, preset.name);
+            insStmt->BindText(2, preset.icon);
+            insStmt->BindText(3, preset.exec_path);
+            insStmt->BindText(4, preset.arguments);
+            insStmt->BindInt(5, preset.sort_order);
+            if (!insStmt->Execute()) {
+                return false;
+            }
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('default_plugins_seeded', '1');")) {
+        return false;
+    }
+    return true;
+}
+
+bool Migration::EnsureDefaultPluginsSeeded(SqliteDb& db) {
+    auto seededStmt = db.Prepare("SELECT value FROM meta_settings WHERE key = 'default_plugins_seeded';");
+    if (!seededStmt) {
+        return false;
+    }
+    bool hasRow = seededStmt->Step();
+    if (seededStmt->HasError()) {
+        return false;
+    }
+    if (hasRow && seededStmt->ColumnText(0) == "1") {
+        return true;
+    }
+    seededStmt.reset();
+
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) {
+        return false;
+    }
+    if (!SeedDefaultPluginsInTransaction(db)) {
+        tx.Rollback();
+        return false;
+    }
+    return tx.Commit();
+}
+
 bool Migration::ApplyVersion5(SqliteDb& db) {
     SqliteDb::Transaction tx(db);
     if (!tx.IsStarted()) return false;
@@ -491,19 +581,9 @@ bool Migration::ApplyVersion5(SqliteDb& db) {
         return false;
     }
 
-    // Insert default presets if plugins table is empty
-    auto countStmt = db.Prepare("SELECT COUNT(*) FROM plugins;");
-    if (countStmt && countStmt->Step() && countStmt->ColumnInt(0) == 0) {
-        const char* presetsSql = R"SQL(
-            INSERT INTO plugins (name, icon, exec_path, arguments, is_enabled, sort_order) VALUES
-            ('计算器', '🧮', 'calc.exe', '', 1, 0),
-            ('画图', '🎨', 'mspaint.exe', '', 1, 1),
-            ('Edge浏览器', '🌐', 'msedge.exe', 'https://maifeipin.com', 1, 2);
-        )SQL";
-        if (!db.Execute(presetsSql)) {
-            tx.Rollback();
-            return false;
-        }
+    if (!SeedDefaultPluginsInTransaction(db)) {
+        tx.Rollback();
+        return false;
     }
 
     if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '5');")) {

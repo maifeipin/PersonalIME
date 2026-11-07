@@ -13,8 +13,8 @@ function New-RenRenIconBitmap {
 
     # Gradient background
     $rect = New-Object System.Drawing.RectangleF(0, 0, $Size, $Size)
-    $cTop = [System.Drawing.Color]::FromArgb(255, 0, 120, 212)
-    $cBottom = [System.Drawing.Color]::FromArgb(255, 0, 78, 140)
+    $cTop = [System.Drawing.Color]::FromArgb(255, 10, 133, 234)
+    $cBottom = [System.Drawing.Color]::FromArgb(255, 0, 64, 128)
     $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $cTop, $cBottom, 45.0)
 
     # Rounded rectangle path (squircle)
@@ -34,54 +34,108 @@ function New-RenRenIconBitmap {
     $g.FillPath($brush, $path)
 
     # Subtle inner border
-    $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(50, 255, 255, 255), [Math]::Max(1.0, 2.0 * $scale))
+    $borderPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(46, 255, 255, 255), [Math]::Max(1.0, 2.0 * $scale))
     $g.DrawPath($borderPen, $path)
 
-    # Layered "人人" Design:
-    # 1. Background echo "人" (offset top-right, translucent cyan)
-    $backStrokeW = [Math]::Max(1.8, [float](24.0 * $scale))
-    $backPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(150, 124, 232, 255), $backStrokeW)
+    # Helper function to compute transformed coordinates
+    # transform: matrix(sx 0 0 sy tx ty)
+    $calcX = { param($x, $sx, $tx) [float](($x * $sx + $tx) * $scale) }
+    $calcY = { param($y, $sy, $ty) [float](($y * $sy + $ty) * $scale) }
+
+    # 1. Background echo "人" (Distant layer: scaled down to 0.82, shifted up-right, softer depth-of-field effect)
+    $bsx = 0.82
+    $bsy = 0.82
+    $btx = 58.0
+    $bty = -28.0
+
+    # Multi-pass soft glow/bokeh simulation
+    if ($Size -ge 48) {
+        $haloStrokeW = [float](26.0 * $scale)
+        $haloPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(40, 96, 213, 255), $haloStrokeW)
+        $haloPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $haloPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $haloPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+
+        $g.DrawBezier($haloPen,
+            (& $calcX 128 $bsx $btx), (& $calcY 56 $bsy $bty),
+            (& $calcX 122 $bsx $btx), (& $calcY 108 $bsy $bty),
+            (& $calcX 96  $bsx $btx), (& $calcY 156 $bsy $bty),
+            (& $calcX 54  $bsx $btx), (& $calcY 196 $bsy $bty))
+        $g.DrawBezier($haloPen,
+            (& $calcX 116 $bsx $btx), (& $calcY 108 $bsy $bty),
+            (& $calcX 138 $bsx $btx), (& $calcY 142 $bsy $bty),
+            (& $calcX 166 $bsx $btx), (& $calcY 174 $bsy $bty),
+            (& $calcX 202 $bsx $btx), (& $calcY 196 $bsy $bty))
+        $haloPen.Dispose()
+    }
+
+    $backStrokeW = [Math]::Max(1.6, [float](21.0 * $scale))
+    $backPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(145, 96, 213, 255), $backStrokeW)
     $backPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
     $backPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
     $backPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
 
-    $bx = 26.0
-    $by = -16.0
     $g.DrawBezier($backPen,
-        [float]((128 + $bx) * $scale), [float]((56 + $by) * $scale),
-        [float]((122 + $bx) * $scale), [float]((108 + $by) * $scale),
-        [float]((96 + $bx) * $scale),  [float]((156 + $by) * $scale),
-        [float]((54 + $bx) * $scale),  [float]((196 + $by) * $scale))
+        (& $calcX 128 $bsx $btx), (& $calcY 56 $bsy $bty),
+        (& $calcX 122 $bsx $btx), (& $calcY 108 $bsy $bty),
+        (& $calcX 96  $bsx $btx), (& $calcY 156 $bsy $bty),
+        (& $calcX 54  $bsx $btx), (& $calcY 196 $bsy $bty))
     $g.DrawBezier($backPen,
-        [float]((116 + $bx) * $scale), [float]((108 + $by) * $scale),
-        [float]((138 + $bx) * $scale), [float]((142 + $by) * $scale),
-        [float]((166 + $bx) * $scale), [float]((174 + $by) * $scale),
-        [float]((202 + $bx) * $scale), [float]((196 + $by) * $scale))
+        (& $calcX 116 $bsx $btx), (& $calcY 108 $bsy $bty),
+        (& $calcX 138 $bsx $btx), (& $calcY 142 $bsy $bty),
+        (& $calcX 166 $bsx $btx), (& $calcY 174 $bsy $bty),
+        (& $calcX 202 $bsx $btx), (& $calcY 196 $bsy $bty))
+    $backPen.Dispose()
 
-    # 2. Foreground bold primary "人" (crisp white)
-    $frontStrokeW = [Math]::Max(2.2, [float](26.0 * $scale))
+    # 2. Foreground 3D Drop Shadow (simulating elevation above background "人")
+    $fsx = 1.04
+    $fsy = 1.04
+    $ftx = -20.0
+    $fty = 8.0
+
+    if ($Size -ge 32) {
+        $shadowStrokeW = [float](27.0 * $scale)
+        $shadowPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110, 0, 24, 51), $shadowStrokeW)
+        $shadowPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $shadowPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $shadowPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+
+        $sdx = -2.5
+        $sdy = 4.5
+        $g.DrawBezier($shadowPen,
+            (& $calcX 128 $fsx ($ftx + $sdx)), (& $calcY 56 $fsy ($fty + $sdy)),
+            (& $calcX 122 $fsx ($ftx + $sdx)), (& $calcY 108 $fsy ($fty + $sdy)),
+            (& $calcX 96  $fsx ($ftx + $sdx)), (& $calcY 156 $fsy ($fty + $sdy)),
+            (& $calcX 54  $fsx ($ftx + $sdx)), (& $calcY 196 $fsy ($fty + $sdy)))
+        $g.DrawBezier($shadowPen,
+            (& $calcX 116 $fsx ($ftx + $sdx)), (& $calcY 108 $fsy ($fty + $sdy)),
+            (& $calcX 138 $fsx ($ftx + $sdx)), (& $calcY 142 $fsy ($fty + $sdy)),
+            (& $calcX 166 $fsx ($ftx + $sdx)), (& $calcY 174 $fsy ($fty + $sdy)),
+            (& $calcX 202 $fsx ($ftx + $sdx)), (& $calcY 196 $fsy ($fty + $sdy)))
+        $shadowPen.Dispose()
+    }
+
+    # 3. Foreground bold primary "人" (crisp pure white)
+    $frontStrokeW = [Math]::Max(2.2, [float](27.0 * $scale))
     $frontPen = New-Object System.Drawing.Pen([System.Drawing.Color]::White, $frontStrokeW)
     $frontPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
     $frontPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
     $frontPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
 
-    $fx = -10.0
-    $fy = 8.0
     $g.DrawBezier($frontPen,
-        [float]((128 + $fx) * $scale), [float]((56 + $fy) * $scale),
-        [float]((122 + $fx) * $scale), [float]((108 + $fy) * $scale),
-        [float]((96 + $fx) * $scale),  [float]((156 + $fy) * $scale),
-        [float]((54 + $fx) * $scale),  [float]((196 + $fy) * $scale))
+        (& $calcX 128 $fsx $ftx), (& $calcY 56 $fsy $fty),
+        (& $calcX 122 $fsx $ftx), (& $calcY 108 $fsy $fty),
+        (& $calcX 96  $fsx $ftx), (& $calcY 156 $fsy $fty),
+        (& $calcX 54  $fsx $ftx), (& $calcY 196 $fsy $fty))
     $g.DrawBezier($frontPen,
-        [float]((116 + $fx) * $scale), [float]((108 + $fy) * $scale),
-        [float]((138 + $fx) * $scale), [float]((142 + $fy) * $scale),
-        [float]((166 + $fx) * $scale), [float]((174 + $fy) * $scale),
-        [float]((202 + $fx) * $scale), [float]((196 + $fy) * $scale))
+        (& $calcX 116 $fsx $ftx), (& $calcY 108 $fsy $fty),
+        (& $calcX 138 $fsx $ftx), (& $calcY 142 $fsy $fty),
+        (& $calcX 166 $fsx $ftx), (& $calcY 174 $fsy $fty),
+        (& $calcX 202 $fsx $ftx), (& $calcY 196 $fsy $fty))
+    $frontPen.Dispose()
 
     $brush.Dispose()
     $borderPen.Dispose()
-    $backPen.Dispose()
-    $frontPen.Dispose()
     $path.Dispose()
     $g.Dispose()
 
@@ -152,4 +206,4 @@ foreach ($s in $sizes) {
     $bmps[$s].Dispose()
 }
 
-Write-Host "Icons generated successfully." -ForegroundColor Green
+Write-Host "Icons regenerated successfully with 3D depth and bokeh effect." -ForegroundColor Green
