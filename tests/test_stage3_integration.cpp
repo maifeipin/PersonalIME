@@ -1912,6 +1912,37 @@ int main(int argc, char* argv[]) {
             CHECK_TRUE((ch >= 0x4E00 && ch <= 0x9FFF) || (ch >= 0x3400 && ch <= 0x4DBF), L"Committed text must strictly be Chinese character");
         }
         std::wcout << L"  'quan' committed text: " << keyResp.commit_text << std::endl;
+        if (keyResp.commit_event_id != 0) {
+            CHECK_TRUE(fbClient.NotifyCommitSuccess(sid, cid, keyResp.commit_event_id), L"Confirm 'quan' commit receipt");
+        }
+
+        // 4b. Verify financial macro v12345.67 keystroke-by-keystroke via TestKeyDown + KeyDown in real service
+        const uint32_t vMacroKeys[] = { 'V', '1', '2', '3', '4', '5', VK_OEM_PERIOD, '6', '7' };
+        for (uint32_t vk : vMacroKeys) {
+            IpcKeyRequest tkReq = keyReq;
+            tkReq.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
+            tkReq.vk_code = vk;
+            IpcKeyResponse tkResp{};
+            CHECK_TRUE(fbClient.SendRequest(tkReq, tkResp, 200) && tkResp.handled == 1, L"v12345.67 TestKeyDown must be eaten");
+
+            keyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+            keyReq.vk_code = vk;
+            CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200) && keyResp.handled == 1, L"v12345.67 KeyDown must be handled");
+        }
+        CHECK_TRUE(wcscmp(keyResp.composition, L"v12345.67") == 0, L"Composition must be 'v12345.67'");
+        CHECK_TRUE(keyResp.candidate_count >= 3, L"v12345.67 must return >= 3 financial macro candidates");
+        CHECK_TRUE(wcsstr(keyResp.candidates[0], L"壹万贰仟叁佰肆拾伍元陆角柒分") != nullptr, L"Top candidate for v12345.67 must be 壹万贰仟叁佰肆拾伍元陆角柒分");
+
+        // Select 2nd candidate explicitly via IPC_KEYDOWN_EXPLICIT_SELECT (simulating UI/arrow selection)
+        keyReq.vk_code = '2';
+        keyReq.mode_arg = IPC_KEYDOWN_EXPLICIT_SELECT;
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(fbClient.SendRequest(keyReq, keyResp, 200) && keyResp.handled == 1, L"Explicit select 2nd candidate on v12345.67");
+        keyReq.mode_arg = 0;
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"v12345.67 explicit select committed");
+        CHECK_TRUE(wcscmp(keyResp.commit_text, L"壹万贰仟叁佰肆拾伍点陆柒") == 0, L"Committed 2nd macro candidate 壹万贰仟叁佰肆拾伍点陆柒");
+        CHECK_TRUE(keyResp.commit_event_id != 0, L"Macro commit generated WAL event_id");
+        CHECK_TRUE(fbClient.NotifyCommitSuccess(sid, cid, keyResp.commit_event_id), L"Macro NotifyCommitSuccess succeeded and cleaned up pending_commits");
 
         // 5. Mixed input disabled: no cross-scheme matching
         fbClient.Disconnect();

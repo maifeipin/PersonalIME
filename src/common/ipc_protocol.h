@@ -98,6 +98,9 @@ enum IpcUpdateMask : uint32_t {
     IPC_UPDATE_SCHEME        = 1 << 3
 };
 
+// KeyDown mode_arg flags
+constexpr uint32_t IPC_KEYDOWN_EXPLICIT_SELECT = 1u << 0; // Explicit candidate selection from UI click or Enter/Space on highlighted item
+
 #pragma pack(push, 1)
 
 struct IpcKeyRequest {

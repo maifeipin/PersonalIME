@@ -144,6 +144,30 @@ bool Migration::Migrate(SqliteDb& db) {
         }
     }
 
+    bool needsV6 = (currentVer < 6);
+    if (!needsV6) {
+        auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
+        if (!stmt) {
+            return false;
+        }
+        bool hasPayloadHash = false;
+        while (stmt->Step()) {
+            if (stmt->ColumnText(1) == "payload_hash") {
+                hasPayloadHash = true;
+                break;
+            }
+        }
+        if (stmt->HasError() || !hasPayloadHash) {
+            needsV6 = true;
+        }
+    }
+
+    if (needsV6) {
+        if (!ApplyVersion6(db)) {
+            return false;
+        }
+    }
+
     if (!EnsureDefaultPluginsSeeded(db)) {
         return false;
     }
@@ -203,7 +227,8 @@ bool Migration::ApplyVersion1(SqliteDb& db) {
             code TEXT NOT NULL DEFAULT '',
             entry_id TEXT NOT NULL DEFAULT '',
             committed_at INTEGER NOT NULL,
-            status INTEGER NOT NULL DEFAULT 1
+            status INTEGER NOT NULL DEFAULT 1,
+            payload_hash TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS pending_commits (
@@ -592,6 +617,49 @@ bool Migration::ApplyVersion5(SqliteDb& db) {
     }
 
     if (!db.Execute("PRAGMA user_version = 5;")) {
+        tx.Rollback();
+        return false;
+    }
+
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion6(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    bool hasPayloadHash = false;
+    {
+        auto stmt = db.Prepare("PRAGMA table_info(commit_events);");
+        if (!stmt) {
+            tx.Rollback();
+            return false;
+        }
+        while (stmt->Step()) {
+            if (stmt->ColumnText(1) == "payload_hash") {
+                hasPayloadHash = true;
+                break;
+            }
+        }
+        if (stmt->HasError()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!hasPayloadHash) {
+        if (!db.Execute("ALTER TABLE commit_events ADD COLUMN payload_hash TEXT NOT NULL DEFAULT '';")) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '6');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 6;")) {
         tx.Rollback();
         return false;
     }

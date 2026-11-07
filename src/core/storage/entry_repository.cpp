@@ -1,5 +1,6 @@
 #include "entry_repository.h"
 #include "../dictionary/builtin_dict.h"
+#include "../encoding/shuangpin_decoder.h"
 #include <cmath>
 #include <sstream>
 #include <random>
@@ -10,6 +11,53 @@
 namespace ime {
 
 static constexpr double HALF_LIFE_SECONDS = 30.0 * 86400.0; // 30 days
+
+static std::string BuildSentencePayloadFingerprint(uint64_t sessionId, uint64_t contextId,
+                                                   InputScheme scheme, const std::string& scopedLearningCode,
+                                                   const std::wstring& text,
+                                                   const std::string& storagePinyinCode,
+                                                   const std::string& originalCandidateId) {
+    std::string lowerScoped = scopedLearningCode;
+    std::transform(lowerScoped.begin(), lowerScoped.end(), lowerScoped.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::string lowerStorage = storagePinyinCode;
+    std::transform(lowerStorage.begin(), lowerStorage.end(), lowerStorage.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    std::string layoutId;
+    std::string rawQuery;
+    if (scheme == InputScheme::Shuangpin) {
+        auto colonPos = lowerScoped.find(':');
+        if (colonPos != std::string::npos) {
+            layoutId = lowerScoped.substr(0, colonPos);
+            rawQuery = lowerScoped.substr(colonPos + 1);
+        } else {
+            rawQuery = lowerScoped;
+        }
+    } else {
+        rawQuery = lowerScoped;
+    }
+
+    std::ostringstream oss;
+    oss << "s=" << sessionId << ";"
+        << "c=" << contextId << ";"
+        << "sch=" << static_cast<int>(scheme) << ";"
+        << "lay=" << layoutId << ";"
+        << "raw=" << rawQuery << ";"
+        << "sc=" << lowerScoped << ";"
+        << "txt=" << WideToUtf8(text) << ";"
+        << "stg=" << lowerStorage << ";"
+        << "cid=" << originalCandidateId;
+    return oss.str();
+}
+
+static std::string BuildCommitPayloadFingerprint(uint64_t sessionId, uint64_t contextId,
+                                                InputScheme scheme, const std::string& code,
+                                                const std::string& entryId) {
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+    std::ostringstream oss;
+    oss << "s=" << sessionId << ";c=" << contextId << ";sch=" << static_cast<int>(scheme) << ";sc=" << lowerCode << ";eid=" << entryId;
+    return oss.str();
+}
 
 // Validate the whole replacement before deleting any existing mappings.
 static bool ValidateCodes(const std::vector<std::pair<InputScheme, std::string>>& codes) {
@@ -627,7 +675,36 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     stmt->BindText(12, rec.resolved_code);
 
     int64_t gEpoch = rec.global_epoch > 0 ? rec.global_epoch : GetGlobalStatsResetEpoch();
-    int64_t eEpoch = rec.entry_epoch > 0 ? rec.entry_epoch : GetEntryStatsResetEpoch(rec.entry_id);
+    int64_t eEpoch = rec.entry_epoch > 0 ? rec.entry_epoch : 1;
+    if (rec.entry_epoch <= 0) {
+        if (rec.entry_id.rfind("sentence_", 0) == 0) {
+            std::string pinyinSource = (rec.scheme == InputScheme::Shuangpin && !rec.resolved_code.empty())
+                ? rec.resolved_code
+                : (!rec.query_code.empty() ? rec.query_code : rec.matched_code);
+            std::string storageCode;
+            for (char ch : pinyinSource) {
+                if (ch != '\'' && ch != ' ') {
+                    storageCode.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+                }
+            }
+            std::string textUtf8 = WideToUtf8(rec.text);
+            auto stmtFind = m_db.Prepare(
+                "SELECT e.id FROM entries e JOIN entry_codes ec ON e.id = ec.entry_id "
+                "WHERE e.text = ? AND ec.scheme = 1 AND (ec.code = ? OR ec.code = ?) LIMIT 1;"
+            );
+            if (stmtFind) {
+                stmtFind->BindText(1, textUtf8);
+                stmtFind->BindText(2, storageCode);
+                stmtFind->BindText(3, rec.query_code);
+                if (stmtFind->Step()) {
+                    std::string existingId = stmtFind->ColumnText(0);
+                    eEpoch = GetEntryStatsResetEpoch(existingId);
+                }
+            }
+        } else {
+            eEpoch = GetEntryStatsResetEpoch(rec.entry_id);
+        }
+    }
     stmt->BindInt64(13, gEpoch);
     stmt->BindInt64(14, eEpoch);
     return stmt->Execute();
@@ -924,7 +1001,7 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
 
     // 1. Idempotency Check with exact payload and owner verification
     if (!eventId.empty()) {
-        auto stmtEventCheck = m_db.Prepare("SELECT session_id, context_id, scheme, code, entry_id, status FROM commit_events WHERE event_id = ?;");
+        auto stmtEventCheck = m_db.Prepare("SELECT session_id, context_id, scheme, code, entry_id, status, payload_hash FROM commit_events WHERE event_id = ?;");
         if (stmtEventCheck) {
             stmtEventCheck->BindText(1, eventId);
             if (stmtEventCheck->Step()) {
@@ -934,6 +1011,7 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
                 std::string prevCode = stmtEventCheck->ColumnText(3);
                 std::string prevEntryId = stmtEventCheck->ColumnText(4);
                 int prevStatus = stmtEventCheck->ColumnInt(5);
+                std::string prevPayload = stmtEventCheck->ColumnText(6);
 
                 if (prevStatus == 2) {
                     // Cancelled commit can NEVER become Recorded!
@@ -947,6 +1025,15 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
                         tx.Rollback();
                         return false; // Wrong owner replaying confirmation
                     }
+                }
+
+                if (!prevPayload.empty()) {
+                    std::string expectedFp = BuildCommitPayloadFingerprint(sessionId, contextId, scheme, lowerCode, entryId);
+                    if (prevPayload == expectedFp) {
+                        return true;
+                    }
+                    tx.Rollback();
+                    return false;
                 }
 
                 if (prevEntryId.empty() ||
@@ -1036,7 +1123,325 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
             }
         }
 
-        auto stmtEventInsert = m_db.Prepare("INSERT OR REPLACE INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1);");
+        auto stmtEventInsert = m_db.Prepare("INSERT OR REPLACE INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?);");
+        if (!stmtEventInsert) {
+            tx.Rollback();
+            return false;
+        }
+        std::string fp = BuildCommitPayloadFingerprint(sessionId, contextId, scheme, lowerCode, entryId);
+        stmtEventInsert->BindText(1, eventId);
+        stmtEventInsert->BindInt64(2, static_cast<int64_t>(sessionId));
+        stmtEventInsert->BindInt64(3, static_cast<int64_t>(contextId));
+        stmtEventInsert->BindInt(4, static_cast<int>(scheme));
+        stmtEventInsert->BindText(5, lowerCode);
+        stmtEventInsert->BindText(6, entryId);
+        stmtEventInsert->BindInt64(7, now);
+        stmtEventInsert->BindText(8, fp);
+        if (!stmtEventInsert->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    return tx.Commit();
+}
+
+bool EntryRepository::RecordTransientCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                                 InputScheme scheme, const std::string& code, const std::string& entryId) {
+    if (eventId.empty()) return false;
+    int64_t now = m_clock ? m_clock->Now() : 0;
+
+    std::string lowerCode = code;
+    std::transform(lowerCode.begin(), lowerCode.end(), lowerCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    std::string currentFp = BuildCommitPayloadFingerprint(sessionId, contextId, scheme, lowerCode, entryId);
+
+    // 1. Existing commit_events check (immutable terminal receipt contract)
+    auto stmtEventCheck = m_db.Prepare("SELECT session_id, context_id, scheme, code, entry_id, status, payload_hash FROM commit_events WHERE event_id = ?;");
+    if (!stmtEventCheck) {
+        tx.Rollback();
+        return false;
+    }
+    stmtEventCheck->BindText(1, eventId);
+    if (stmtEventCheck->Step()) {
+        uint64_t prevSid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(0));
+        uint64_t prevCid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(1));
+        int prevScheme = stmtEventCheck->ColumnInt(2);
+        std::string prevCode = stmtEventCheck->ColumnText(3);
+        std::string prevEntryId = stmtEventCheck->ColumnText(4);
+        int prevStatus = stmtEventCheck->ColumnInt(5);
+        std::string prevPayload = stmtEventCheck->ColumnText(6);
+
+        if (prevStatus == 2) {
+            tx.Rollback();
+            return false; // Cancelled event can NEVER become Recorded!
+        }
+        if (sessionId != prevSid || contextId != prevCid) {
+            tx.Rollback();
+            return false; // Owner mismatch
+        }
+        if (!prevPayload.empty()) {
+            if (prevPayload == currentFp) {
+                return true;
+            }
+            tx.Rollback();
+            return false;
+        }
+        if (prevScheme == static_cast<int>(scheme) && prevCode == lowerCode && prevEntryId == entryId) {
+            return true; // Idempotent replay of identical commit
+        }
+        tx.Rollback();
+        return false; // Conflict payload replay rejected
+    }
+    if (stmtEventCheck->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 2. Strict pending_commits snapshot verification (Normal ACK must have trusted pending)
+    auto stmtPending = m_db.Prepare("SELECT session_id, context_id, scheme, query_code, entry_id FROM pending_commits WHERE event_id = ?;");
+    if (!stmtPending) {
+        tx.Rollback();
+        return false;
+    }
+    stmtPending->BindText(1, eventId);
+    if (!stmtPending->Step()) {
+        if (stmtPending->HasError()) {
+            tx.Rollback();
+            return false;
+        }
+        // Unknown event has neither existing commit_event nor pending_commit: fail-closed!
+        tx.Rollback();
+        return false;
+    }
+
+    uint64_t pendSid = static_cast<uint64_t>(stmtPending->ColumnInt64(0));
+    uint64_t pendCid = static_cast<uint64_t>(stmtPending->ColumnInt64(1));
+    int pendScheme = stmtPending->ColumnInt(2);
+    std::string pendCode = stmtPending->ColumnText(3);
+    std::string pendEntryId = stmtPending->ColumnText(4);
+    std::transform(pendCode.begin(), pendCode.end(), pendCode.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    if (pendSid != sessionId || pendCid != contextId) {
+        tx.Rollback();
+        return false; // Ownership mismatch against pending
+    }
+    if (pendScheme != static_cast<int>(scheme) || pendCode != lowerCode || pendEntryId != entryId) {
+        tx.Rollback();
+        return false; // Payload tampering rejected
+    }
+
+    // 3. Delete pending commit and verify execution
+    auto stmtDelPending = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+    if (!stmtDelPending) {
+        tx.Rollback();
+        return false;
+    }
+    stmtDelPending->BindText(1, eventId);
+    if (!stmtDelPending->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 4. Insert new commit event using INSERT (NOT REPLACE) to prevent overwriting
+    auto stmtEventInsert = m_db.Prepare("INSERT INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?);");
+    if (!stmtEventInsert) {
+        tx.Rollback();
+        return false;
+    }
+    stmtEventInsert->BindText(1, eventId);
+    stmtEventInsert->BindInt64(2, static_cast<int64_t>(sessionId));
+    stmtEventInsert->BindInt64(3, static_cast<int64_t>(contextId));
+    stmtEventInsert->BindInt(4, static_cast<int>(scheme));
+    stmtEventInsert->BindText(5, lowerCode);
+    stmtEventInsert->BindText(6, entryId);
+    stmtEventInsert->BindInt64(7, now);
+    stmtEventInsert->BindText(8, currentFp);
+    if (!stmtEventInsert->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    return tx.Commit();
+}
+
+bool EntryRepository::RecordSentenceCommit(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                          InputScheme scheme, const std::string& scopedLearningCode,
+                                          const std::wstring& text, const std::string& storagePinyinCode,
+                                          const std::string& originalCandidateId,
+                                          const std::vector<std::pair<InputScheme, std::string>>& allCodes,
+                                          bool learningEnabled) {
+    if (eventId.empty() || text.empty() || storagePinyinCode.empty()) return false;
+    int64_t now = m_clock ? m_clock->Now() : 0;
+
+    std::string lowerScoped = scopedLearningCode;
+    std::transform(lowerScoped.begin(), lowerScoped.end(), lowerScoped.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    std::string lowerPinyin = storagePinyinCode;
+    std::transform(lowerPinyin.begin(), lowerPinyin.end(), lowerPinyin.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    std::string currentFingerprint = BuildSentencePayloadFingerprint(
+        sessionId, contextId, scheme, lowerScoped, text, lowerPinyin, originalCandidateId);
+
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    // 1. Existing commit_events check (idempotency & immutable payload verification)
+    auto stmtEventCheck = m_db.Prepare("SELECT session_id, context_id, scheme, code, entry_id, status, payload_hash FROM commit_events WHERE event_id = ?;");
+    if (!stmtEventCheck) {
+        tx.Rollback();
+        return false;
+    }
+    stmtEventCheck->BindText(1, eventId);
+    if (stmtEventCheck->Step()) {
+        uint64_t prevSid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(0));
+        uint64_t prevCid = static_cast<uint64_t>(stmtEventCheck->ColumnInt64(1));
+        int prevScheme = stmtEventCheck->ColumnInt(2);
+        std::string prevCode = stmtEventCheck->ColumnText(3);
+        std::string prevEntryId = stmtEventCheck->ColumnText(4);
+        int prevStatus = stmtEventCheck->ColumnInt(5);
+        std::string prevPayload = stmtEventCheck->ColumnText(6);
+
+        if (prevStatus == 2) {
+            tx.Rollback();
+            return false; // Cancelled event can NEVER become Recorded!
+        }
+        if (sessionId != prevSid || contextId != prevCid) {
+            tx.Rollback();
+            return false; // Owner mismatch
+        }
+
+        if (!prevPayload.empty()) {
+            if (prevPayload == currentFingerprint) {
+                return true; // Idempotent replay of exact identical sentence commit
+            }
+            tx.Rollback();
+            return false; // Conflict payload replay rejected!
+        }
+
+        // Legacy compatibility for older events without payload_hash
+        if (prevScheme == static_cast<int>(scheme) && prevCode == lowerScoped) {
+            return true;
+        }
+        tx.Rollback();
+        return false; // Conflict payload replay rejected
+    }
+    if (stmtEventCheck->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 2. Strict pending_commits snapshot verification (Normal ACK must have trusted pending)
+    auto stmtPending = m_db.Prepare(
+        "SELECT session_id, context_id, scheme, query_code, entry_id, text, global_epoch, entry_epoch, layout_id, matched_code, resolved_code "
+        "FROM pending_commits WHERE event_id = ?;"
+    );
+    if (!stmtPending) {
+        tx.Rollback();
+        return false;
+    }
+    stmtPending->BindText(1, eventId);
+    if (!stmtPending->Step()) {
+        if (stmtPending->HasError()) {
+            tx.Rollback();
+            return false;
+        }
+        tx.Rollback();
+        return false; // Unknown event has no pending: fail-closed!
+    }
+
+    uint64_t pendSid = static_cast<uint64_t>(stmtPending->ColumnInt64(0));
+    uint64_t pendCid = static_cast<uint64_t>(stmtPending->ColumnInt64(1));
+    int pendScheme = stmtPending->ColumnInt(2);
+    std::string pendQueryCode = stmtPending->ColumnText(3);
+    std::string pendEntryId = stmtPending->ColumnText(4);
+    std::wstring pendText = Utf8ToWide(stmtPending->ColumnText(5));
+    int64_t pendGlobalEpoch = stmtPending->ColumnInt64(6);
+    int64_t pendEntryEpoch = stmtPending->ColumnInt64(7);
+    std::string pendLayoutId = stmtPending->ColumnText(8);
+    std::string pendMatchedCode = stmtPending->ColumnText(9);
+    std::string pendResolvedCode = stmtPending->ColumnText(10);
+
+    if (pendSid != sessionId || pendCid != contextId) {
+        tx.Rollback();
+        return false;
+    }
+    if (pendScheme != static_cast<int>(scheme) || pendText != text ||
+        (!originalCandidateId.empty() && pendEntryId != originalCandidateId)) {
+        tx.Rollback();
+        return false; // Snapshot mismatch/tampering rejected
+    }
+
+    // P1-1: Verify scopedLearningCode against trusted pending
+    std::string lowerQuery = pendQueryCode;
+    std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), [](unsigned char c) { return std::tolower(c); });
+
+    std::string expectedScoped;
+    if (scheme == InputScheme::Shuangpin) {
+        if (!pendLayoutId.empty()) {
+            ShuangpinLayout lay = ShuangpinLayoutFromString(pendLayoutId);
+            std::string canonical = ShuangpinLayoutToString(lay);
+            expectedScoped = canonical + ":" + lowerQuery;
+        } else {
+            expectedScoped = lowerQuery;
+        }
+        if (lowerScoped != expectedScoped) {
+            tx.Rollback();
+            return false; // Scoped code mismatch for Shuangpin
+        }
+    } else if (scheme == InputScheme::Pinyin) {
+        std::string strippedQuery;
+        for (char ch : lowerQuery) {
+            if (ch != '\'' && ch != ' ') strippedQuery.push_back(ch);
+        }
+        if (lowerScoped != lowerQuery && lowerScoped != strippedQuery) {
+            tx.Rollback();
+            return false; // Scoped code mismatch for Pinyin
+        }
+    } else {
+        if (lowerScoped != lowerQuery) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    // P1-1: Verify storagePinyinCode against trusted pending facts
+    std::string pinyinSource;
+    if (scheme == InputScheme::Shuangpin && !pendResolvedCode.empty()) {
+        pinyinSource = pendResolvedCode;
+    } else if (!pendQueryCode.empty()) {
+        pinyinSource = pendQueryCode;
+    } else {
+        pinyinSource = pendMatchedCode;
+    }
+    std::string expectedStoragePinyin;
+    for (char ch : pinyinSource) {
+        if (ch != '\'' && ch != ' ') {
+            expectedStoragePinyin.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+    }
+    if (lowerPinyin != expectedStoragePinyin) {
+        tx.Rollback();
+        return false; // Storage pinyin code mismatch
+    }
+
+    // If learning is disabled, delete pending and record commit event with payload_hash
+    if (!learningEnabled) {
+        auto stmtDelPending = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+        if (!stmtDelPending) {
+            tx.Rollback();
+            return false;
+        }
+        stmtDelPending->BindText(1, eventId);
+        if (!stmtDelPending->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+
+        auto stmtEventInsert = m_db.Prepare("INSERT INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?);");
         if (!stmtEventInsert) {
             tx.Rollback();
             return false;
@@ -1045,13 +1450,161 @@ bool EntryRepository::RecordCommit(const std::string& eventId, uint64_t sessionI
         stmtEventInsert->BindInt64(2, static_cast<int64_t>(sessionId));
         stmtEventInsert->BindInt64(3, static_cast<int64_t>(contextId));
         stmtEventInsert->BindInt(4, static_cast<int>(scheme));
-        stmtEventInsert->BindText(5, lowerCode);
-        stmtEventInsert->BindText(6, entryId);
+        stmtEventInsert->BindText(5, lowerScoped);
+        stmtEventInsert->BindText(6, pendEntryId);
         stmtEventInsert->BindInt64(7, now);
+        stmtEventInsert->BindText(8, currentFingerprint);
         if (!stmtEventInsert->Execute()) {
             tx.Rollback();
             return false;
         }
+        return tx.Commit();
+    }
+
+    // 3. Atomic Find or Create User Entry within THIS transaction
+    std::string targetId;
+    std::string textUtf8 = WideToUtf8(text);
+    const char* sqlFind = R"SQL(
+        SELECT e.id FROM entries e
+        JOIN entry_codes ec ON e.id = ec.entry_id
+        WHERE e.text = ? AND ec.scheme = 1 AND ec.code = ?
+        LIMIT 1;
+    )SQL";
+    auto stmtFind = m_db.Prepare(sqlFind);
+    if (!stmtFind) {
+        tx.Rollback();
+        return false;
+    }
+    stmtFind->BindText(1, textUtf8);
+    stmtFind->BindText(2, lowerPinyin);
+    if (stmtFind->Step()) {
+        targetId = stmtFind->ColumnText(0);
+    }
+    if (stmtFind->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    bool isNewEntryCreated = false;
+    if (targetId.empty()) {
+        // Create new user entry atomically
+        targetId = GenerateUniqueId();
+        auto stmtInsertEntry = m_db.Prepare("INSERT INTO entries (id, text, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?);");
+        if (!stmtInsertEntry) {
+            tx.Rollback();
+            return false;
+        }
+        stmtInsertEntry->BindText(1, targetId);
+        stmtInsertEntry->BindText(2, textUtf8);
+        stmtInsertEntry->BindInt(3, static_cast<int>(EntrySource::User));
+        stmtInsertEntry->BindInt64(4, now);
+        stmtInsertEntry->BindInt64(5, now);
+        if (!stmtInsertEntry->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+
+        auto stmtInsertCode = m_db.Prepare("INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at) VALUES (?, ?, ?, ?);");
+        if (!stmtInsertCode) {
+            tx.Rollback();
+            return false;
+        }
+        for (const auto& codePair : allCodes) {
+            if (codePair.second.empty()) continue;
+            std::string cLower = codePair.second;
+            std::transform(cLower.begin(), cLower.end(), cLower.begin(), [](unsigned char ch) { return std::tolower(ch); });
+            stmtInsertCode->Reset();
+            stmtInsertCode->BindText(1, targetId);
+            stmtInsertCode->BindInt(2, static_cast<int>(codePair.first));
+            stmtInsertCode->BindText(3, cLower);
+            stmtInsertCode->BindInt64(4, now);
+            if (!stmtInsertCode->Execute()) {
+                tx.Rollback();
+                return false;
+            }
+        }
+        isNewEntryCreated = true;
+    }
+
+    // 4. Reset Epoch Verification across identities
+    bool shouldUpdateStats = true;
+    int64_t curGlobalEpoch = GetGlobalStatsResetEpoch();
+    if (pendGlobalEpoch > 0 && pendGlobalEpoch < curGlobalEpoch) {
+        shouldUpdateStats = false; // Global stats reset occurred while pending
+    }
+    if (!isNewEntryCreated) {
+        int64_t curEntryEpoch = GetEntryStatsResetEpoch(targetId);
+        if (pendEntryEpoch > 0 && pendEntryEpoch < curEntryEpoch) {
+            shouldUpdateStats = false; // Target entry reset occurred while pending
+        }
+    }
+
+    // 5. Update stats if valid
+    if (shouldUpdateStats) {
+        auto statOpt = GetStat(scheme, lowerScoped, targetId);
+        int newCount = 1;
+        double newEff = 1.0;
+        if (statOpt) {
+            newCount = statOpt->selected_count + 1;
+            double decayed = CalculateDecayedCount(statOpt->effective_count, statOpt->last_decay_at, now);
+            newEff = decayed + 1.0;
+        }
+        const char* sqlUpsert = R"SQL(
+            INSERT INTO entry_stats (scheme, code, entry_id, selected_count, last_selected_at, effective_count, last_decay_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scheme, code, entry_id) DO UPDATE SET
+                selected_count = excluded.selected_count,
+                last_selected_at = excluded.last_selected_at,
+                effective_count = excluded.effective_count,
+                last_decay_at = excluded.last_decay_at;
+        )SQL";
+        auto stmtStat = m_db.Prepare(sqlUpsert);
+        if (!stmtStat) {
+            tx.Rollback();
+            return false;
+        }
+        stmtStat->BindInt(1, static_cast<int>(scheme));
+        stmtStat->BindText(2, lowerScoped);
+        stmtStat->BindText(3, targetId);
+        stmtStat->BindInt(4, newCount);
+        stmtStat->BindInt64(5, now);
+        stmtStat->BindDouble(6, newEff);
+        stmtStat->BindInt64(7, now);
+        if (!stmtStat->Execute()) {
+            tx.Rollback();
+            return false;
+        }
+    }
+
+    // 6. Delete pending commit
+    auto stmtDelPending = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+    if (!stmtDelPending) {
+        tx.Rollback();
+        return false;
+    }
+    stmtDelPending->BindText(1, eventId);
+    if (!stmtDelPending->Execute()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // 7. Insert commit_event using INSERT (NOT REPLACE) with immutable payload_hash
+    auto stmtEventInsert = m_db.Prepare("INSERT INTO commit_events (event_id, session_id, context_id, scheme, code, entry_id, committed_at, status, payload_hash) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?);");
+    if (!stmtEventInsert) {
+        tx.Rollback();
+        return false;
+    }
+    stmtEventInsert->BindText(1, eventId);
+    stmtEventInsert->BindInt64(2, static_cast<int64_t>(sessionId));
+    stmtEventInsert->BindInt64(3, static_cast<int64_t>(contextId));
+    stmtEventInsert->BindInt(4, static_cast<int>(scheme));
+    stmtEventInsert->BindText(5, lowerScoped);
+    stmtEventInsert->BindText(6, targetId);
+    stmtEventInsert->BindInt64(7, now);
+    stmtEventInsert->BindText(8, currentFingerprint);
+    if (!stmtEventInsert->Execute()) {
+        tx.Rollback();
+        return false;
     }
 
     return tx.Commit();

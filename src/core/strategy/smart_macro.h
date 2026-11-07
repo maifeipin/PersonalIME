@@ -21,15 +21,17 @@ public:
             return true;
         }
 
-        // Financial uppercase numbers: v followed by digits (e.g. v12345 or v100.5)
+        // Financial uppercase numbers: v followed by digits and at most one decimal point (e.g. v12345 or v100.5)
         if (lower.length() >= 2 && lower.front() == 'v') {
             bool hasDigit = false;
+            int dotCount = 0;
             for (size_t i = 1; i < lower.length(); ++i) {
                 char c = lower[i];
                 if (c >= '0' && c <= '9') {
                     hasDigit = true;
                 } else if (c == '.') {
-                    continue;
+                    dotCount++;
+                    if (dotCount > 1) return false;
                 } else {
                     return false;
                 }
@@ -211,20 +213,22 @@ private:
 
         try {
             long long intVal = intPart.empty() ? 0 : std::stoll(intPart);
-            // 1. 金额大写 (壹万贰仟叁佰肆拾伍元陆角柒分)
-            std::wstring currency = convertInt(intVal, true) + L"元";
-            if (fracPart.empty() || fracPart == "0" || fracPart == "00") {
-                currency += L"整";
-            } else {
-                int jiao = fracPart[0] - '0';
-                int fen = (fracPart.length() > 1) ? (fracPart[1] - '0') : 0;
-                if (jiao > 0) { currency += digitsUpper[jiao]; currency += L"角"; }
-                else if (fen > 0) { currency += digitsUpper[0]; }
-                if (fen > 0) { currency += digitsUpper[fen]; currency += L"分"; }
+            // 1. 金额大写 (壹万贰仟叁佰肆拾伍元陆角柒分) - 仅当小数位数不超过2位时提供，超过时不静默截断
+            if (fracPart.length() <= 2) {
+                std::wstring currency = convertInt(intVal, true) + L"元";
+                if (fracPart.empty() || fracPart == "0" || fracPart == "00") {
+                    currency += L"整";
+                } else {
+                    int jiao = fracPart[0] - '0';
+                    int fen = (fracPart.length() > 1) ? (fracPart[1] - '0') : 0;
+                    if (jiao > 0) { currency += digitsUpper[jiao]; currency += L"角"; }
+                    else if (fen > 0) { currency += digitsUpper[0]; }
+                    if (fen > 0) { currency += digitsUpper[fen]; currency += L"分"; }
+                }
+                list.push_back(currency);
             }
-            list.push_back(currency);
 
-            // 2. 传统大写数字 (壹万贰仟叁佰肆拾伍)
+            // 2. 传统大写数字 (壹万贰仟叁佰肆拾伍点...)
             std::wstring pureUpper = convertInt(intVal, true);
             if (!fracPart.empty()) {
                 pureUpper += L"点";
@@ -234,7 +238,7 @@ private:
             }
             list.push_back(pureUpper);
 
-            // 3. 常见中文小写数字 (一万二千三百四十五)
+            // 3. 常见中文小写数字 (一万二千三百四十五点...)
             std::wstring pureLower = convertInt(intVal, false);
             if (!fracPart.empty()) {
                 pureLower += L"点";

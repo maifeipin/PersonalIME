@@ -317,6 +317,25 @@ static std::wstring MapFullWidthChar(uint32_t vk, uint32_t modifiers) {
     return L"";
 }
 
+static bool IsVNumberComposition(const std::wstring& comp) {
+    if (comp.empty() || (comp[0] != L'v' && comp[0] != L'V')) {
+        return false;
+    }
+    int dotCount = 0;
+    for (size_t i = 1; i < comp.size(); ++i) {
+        wchar_t c = comp[i];
+        if (c >= L'0' && c <= L'9') {
+            continue;
+        } else if (c == L'.') {
+            dotCount++;
+            if (dotCount > 1) return false;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ResetContextCompositionAndState(ContextState& state) {
     state.composition.clear();
     state.prev_composition.clear();
@@ -881,8 +900,10 @@ void HandleClient(HANDLE hPipe) {
                     // Active composition
                     uint32_t pageSize = state.policy_snapshot ? state.policy_snapshot->page_size : 5;
                     if (pageSize < 5) pageSize = 5; if (pageSize > 9) pageSize = 9;
+                    bool inVNumber = IsVNumberComposition(state.composition);
 
                     if ((vk >= 'A' && vk <= 'Z') || (vk >= '1' && vk <= ('0' + pageSize)) ||
+                        (inVNumber && (mods & 1) == 0 && ((vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) || vk == VK_DECIMAL)) ||
                         vk == VK_SPACE || vk == VK_BACK || vk == VK_ESCAPE || vk == VK_RETURN ||
                         vk == VK_OEM_7 || vk == VK_OEM_1 || vk == VK_NEXT || vk == VK_PRIOR ||
                         vk == VK_OEM_PERIOD || vk == VK_OEM_COMMA || vk == VK_OEM_PLUS || vk == VK_OEM_MINUS ||
@@ -1064,6 +1085,36 @@ void HandleClient(HANDLE hPipe) {
                         // Semicolon in Shuangpin (e.g. Microsoft layout uses ';' for 'ing') or if custom phrase started with ';'
                         if ((state.scheme == ime::InputScheme::Shuangpin || (!state.composition.empty() && state.composition.front() == L';')) && state.composition.length() < 127) {
                             state.composition.push_back(L';');
+                            state.current_page = 0;
+                            state.has_paged = false;
+                            state.AdvanceGeneration();
+                            PopulateCandidates(state, resp);
+                        }
+                        resp.handled = 1;
+                    }
+                    else if (IsVNumberComposition(state.composition) &&
+                             (req.mode_arg & IPC_KEYDOWN_EXPLICIT_SELECT) == 0 &&
+                             (mods & 1) == 0 &&
+                             ((vk >= '0' && vk <= '9') || (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9))) {
+                        if (state.composition.length() < 32) {
+                            wchar_t digit = (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+                                ? static_cast<wchar_t>(L'0' + (vk - VK_NUMPAD0))
+                                : static_cast<wchar_t>(L'0' + (vk - '0'));
+                            state.composition.push_back(digit);
+                            state.current_page = 0;
+                            state.has_paged = false;
+                            state.AdvanceGeneration();
+                            PopulateCandidates(state, resp);
+                        }
+                        resp.handled = 1;
+                    }
+                    else if (IsVNumberComposition(state.composition) &&
+                             state.composition.length() >= 2 &&
+                             state.composition.find(L'.') == std::wstring::npos &&
+                             (mods & 1) == 0 &&
+                             (vk == VK_OEM_PERIOD || vk == VK_DECIMAL)) {
+                        if (state.composition.length() < 32) {
+                            state.composition.push_back(L'.');
                             state.current_page = 0;
                             state.has_paged = false;
                             state.AdvanceGeneration();

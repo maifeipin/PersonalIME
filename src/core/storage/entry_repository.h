@@ -87,6 +87,14 @@ public:
                       bool updateStats = true) {
         return RecordCommit(eventId, 0, 0, scheme, code, entryId, updateStats);
     }
+    bool RecordTransientCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                    InputScheme scheme, const std::string& code, const std::string& entryId);
+    bool RecordSentenceCommit(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                              InputScheme scheme, const std::string& scopedLearningCode,
+                              const std::wstring& text, const std::string& storagePinyinCode,
+                              const std::string& originalCandidateId,
+                              const std::vector<std::pair<InputScheme, std::string>>& allCodes,
+                              bool learningEnabled);
     bool RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId);
     bool SetStatDirect(InputScheme scheme, const std::string& code, const std::string& entryId,
                        int count, int64_t lastUsed, double effCount, int64_t lastDecayAt, bool mergeMode = false);

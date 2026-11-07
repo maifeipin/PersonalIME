@@ -44,10 +44,13 @@ public:
         const std::vector<std::string>& syllables,
         const BuiltinDictionary& builtinDict,
         EntryRepository& repo,
-        std::shared_ptr<IClock> clock = nullptr)
+        std::shared_ptr<IClock> clock = nullptr,
+        bool allowBuiltinPinyin = true,
+        bool allowCustom = true,
+        bool frequencyEnabled = true)
     {
         size_t N = syllables.size();
-        if (N < 2) return std::nullopt;
+        if (N < 2 || (!allowBuiltinPinyin && !allowCustom)) return std::nullopt;
 
         // DP state at node j (from 0 to N)
         struct DpNode {
@@ -71,18 +74,23 @@ public:
             for (size_t i = minI; i < j; ++i) {
                 if (dp[i].score < -1e8) continue;
 
-                // Build spaced syllables for [i, j)
+                // Build spaced and continuous syllables for [i, j)
                 std::string spaced;
+                std::string continuous;
                 for (size_t k = i; k < j; ++k) {
                     if (k > i) spaced += " ";
                     spaced += syllables[k];
+                    continuous += syllables[k];
                 }
 
-                // 1. Query Builtin dictionary
-                const auto* bItems = builtinDict.FindPinyinExactSpaced(spaced);
+                // 1. Query Builtin dictionary (only if enabled in current scope)
+                const auto* bItems = allowBuiltinPinyin ? builtinDict.FindPinyinExactSpaced(spaced) : nullptr;
 
-                // 2. Query User dictionary
-                auto uCands = repo.QueryUserCandidates(InputScheme::Pinyin, spaced);
+                // 2. Query User dictionary (only if enabled in current scope)
+                std::vector<Candidate> uCands;
+                if (allowCustom) {
+                    uCands = repo.QueryUserCandidates(InputScheme::Pinyin, spaced);
+                }
 
                 // Best word for this edge [i, j)
                 std::wstring bestWord;
@@ -91,8 +99,11 @@ public:
 
                 auto evaluateWord = [&](const std::wstring& text, double baseWeight, const std::string& entryId) {
                     double effectiveCount = 0.0;
-                    if (!entryId.empty()) {
-                        auto stat = repo.GetStat(InputScheme::Pinyin, spaced, entryId);
+                    if (frequencyEnabled && !entryId.empty()) {
+                        auto stat = repo.GetStat(InputScheme::Pinyin, continuous, entryId);
+                        if (!stat) {
+                            stat = repo.GetStat(InputScheme::Pinyin, spaced, entryId);
+                        }
                         if (stat) {
                             effectiveCount = repo.CalculateDecayedCount(stat->effective_count, stat->last_decay_at, nowTime);
                         }
@@ -114,14 +125,15 @@ public:
                         bestWeight = baseWeight;
                     }
 
-                    // If edge starts from index 0, add to prefix word candidates
-                    if (i == 0 && seenPrefixWords.find(text) == seenPrefixWords.end()) {
+                    // If edge starts from index 0 and is a proper prefix (j < N), add to prefix word candidates
+                    if (i == 0 && j < N && seenPrefixWords.find(text) == seenPrefixWords.end()) {
                         seenPrefixWords.insert(text);
                         Candidate sc;
                         sc.entry_id = "sub_" + entryId;
                         sc.text = text;
                         sc.scheme = InputScheme::Pinyin;
                         sc.matched_code = spaced;
+                        sc.resolved_code = continuous;
                         sc.quality = MatchQuality::ExactFull;
                         sc.score = 5000.0 + wordScore;
                         sc.dict_id = entryId.rfind("b_", 0) == 0 ? DICT_ID_BUILTIN_PINYIN : DICT_ID_CUSTOM;
@@ -169,6 +181,9 @@ public:
 
         std::reverse(words.begin(), words.end());
         std::reverse(ranges.begin(), ranges.end());
+
+        std::stable_sort(prefixWordCandidates.begin(), prefixWordCandidates.end(),
+                         [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
 
         DecodedSentence result;
         for (const auto& w : words) {

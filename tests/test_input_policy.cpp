@@ -1,4 +1,5 @@
 #include "../src/core/strategy/input_coordinator.h"
+#include "../src/core/strategy/smart_macro.h"
 #include "../src/core/strategy/input_policy.h"
 #include "../src/core/strategy/input_policy_json.h"
 #include "../src/core/encoding/shuangpin_decoder.h"
@@ -1267,7 +1268,7 @@ static void TestFallbackThresholdAndSecondaryReverseLookup(InputCoordinator& coo
     std::cout << "  [PASS] Stage 6 Waterfall Recall, Fallback Threshold & Secondary Reverse Lookup verified!" << std::endl;
 }
 
-void TestDynamicSmartMacroExpansion(InputCoordinator& coordinator) {
+void TestDynamicSmartMacroExpansion(InputCoordinator& coordinator, EntryRepository& repo) {
     std::cout << "[TEST 22] Testing Stage 6 Dynamic Smart Macro Expansion (date/rq, time/sj, week/xq, v-number)..." << std::endl;
 
     // 1. Date macros: 'date' and 'rq'
@@ -1316,22 +1317,59 @@ void TestDynamicSmartMacroExpansion(InputCoordinator& coordinator) {
     AssertCondition(resV1.candidates[1].text == L"壹万贰仟叁佰肆拾伍", "v12345 produces 壹万贰仟叁佰肆拾伍");
     AssertCondition(resV1.candidates[2].text == L"一万二千三百四十五", "v12345 produces 一万二千三百四十五");
 
-    // 6. Decimal currency numbers: 'v12345.67'
+    // 6. Decimal currency numbers: 'v12345.67' (<=2 decimals produces currency, >2 decimals does not silently truncate)
     auto resV2 = coordinator.Query("v12345.67");
     AssertCondition(resV2.status == CoordinatorStatus::Success, "Query 'v12345.67' succeeds");
     AssertCondition(resV2.candidates[0].text == L"壹万贰仟叁佰肆拾伍元陆角柒分", "v12345.67 produces 壹万贰仟叁佰肆拾伍元陆角柒分");
     AssertCondition(resV2.candidates[1].text == L"壹万贰仟叁佰肆拾伍点陆柒", "v12345.67 produces 壹万贰仟叁佰肆拾伍点陆柒");
     AssertCondition(resV2.candidates[2].text == L"一万二千三百四十五点六七", "v12345.67 produces 一万二千三百四十五点六七");
 
-    // 7. Non-macro check
+    // 6b. More than 2 decimals: 'v1.234' -> does NOT produce currency candidate, only standard upper/lower number readings
+    auto resV3 = coordinator.Query("v1.234");
+    AssertCondition(resV3.status == CoordinatorStatus::Success, "Query 'v1.234' succeeds");
+    AssertCondition(resV3.candidates.size() == 2, "v1.234 has exactly 2 candidates (no truncated currency)");
+    AssertCondition(resV3.candidates[0].text == L"壹点贰叁肆", "v1.234 candidate 1 is 壹点贰叁肆");
+    AssertCondition(resV3.candidates[1].text == L"一点二三四", "v1.234 candidate 2 is 一点二三四");
+
+    // 7. Non-macro & malformed v-number check
     auto resA = coordinator.Query("a");
     for (const auto& c : resA.candidates) {
         AssertCondition(c.entry_id.rfind("macro_", 0) != 0, "Non-macro query 'a' contains no macro candidates");
     }
+    AssertCondition(!SmartMacroProcessor::IsMacroQuery("v1.2.3"), "Malformed multiple-dot 'v1.2.3' is not a macro query");
+    AssertCondition(!SmartMacroProcessor::IsMacroQuery("v."), "Bare 'v.' without digits is not a macro query");
+    AssertCondition(SmartMacroProcessor::IsMacroQuery("v12345."), "Trailing dot 'v12345.' while typing is valid macro query");
 
-    // 8. Commit candidate durability without db crash
-    bool commitOk = coordinator.CommitCandidate(resV1.candidates[0], "event_macro_test");
+    // 8. Commit candidate WAL durability & fail-closed contract:
+    // Unknown event without pending is rejected fail-closed
+    AssertCondition(!coordinator.CommitCandidate(resV1.candidates[0], "unknown_event_without_pending", 10, 20),
+                    "Unknown event without pending_commits is rejected fail-closed");
+
+    // Valid pending -> commit succeeds
+    EntryRepository::PendingCommitRecord macroPending{};
+    macroPending.event_id = "event_macro_test";
+    macroPending.session_id = 10;
+    macroPending.context_id = 20;
+    macroPending.scheme = resV1.candidates[0].scheme;
+    macroPending.query_code = resV1.candidates[0].raw_code;
+    macroPending.entry_id = resV1.candidates[0].entry_id;
+    macroPending.text = resV1.candidates[0].text;
+    AssertCondition(repo.SavePendingCommit(macroPending), "SavePendingCommit for macro succeeds");
+
+    // Tampered payload against pending is rejected
+    Candidate tamperedCand = resV1.candidates[0];
+    tamperedCand.entry_id = "macro_tampered_id";
+    AssertCondition(!coordinator.CommitCandidate(tamperedCand, "event_macro_test", 10, 20),
+                    "Tampered entry_id against pending is rejected");
+
+    bool commitOk = coordinator.CommitCandidate(resV1.candidates[0], "event_macro_test", 10, 20);
     AssertCondition(commitOk, "Commit macro candidate succeeds idempotently");
+    bool replayMacroOk = coordinator.CommitCandidate(resV1.candidates[0], "event_macro_test", 10, 20);
+    AssertCondition(replayMacroOk, "Replay commit macro candidate succeeds idempotently");
+
+    // Conflicting payload replay rejected
+    AssertCondition(!coordinator.CommitCandidate(tamperedCand, "event_macro_test", 10, 20),
+                    "Conflicting payload replay against Recorded terminal event is rejected");
 
     std::cout << "  [PASS] Stage 6 Dynamic Smart Macro Expansion verified!" << std::endl;
 }
@@ -1351,11 +1389,30 @@ void TestContinuousSentenceAndAutoPhraseLearning(InputCoordinator& coordinator, 
     AssertCondition(res1.candidates[0].text == L"人人输入法", "Candidate 1 is full sentence 人人输入法");
     AssertCondition(res1.candidates.size() >= 2, "Returns sub-candidates for partial commit");
 
+    // Verify sub_ candidate commit records stats under the sub-word's own Pinyin code ('renren'), not 'renrenshurufa'
+    Candidate subCand;
+    for (const auto& c : res1.candidates) {
+        if (c.entry_id.rfind("sub_", 0) == 0 && c.text == L"人人") {
+            subCand = c;
+            break;
+        }
+    }
+    if (!subCand.entry_id.empty()) {
+        AssertCondition(coordinator.CommitCandidate(subCand, "ev_sub_commit_1", 10, 20),
+                        "Committing sub_ candidate succeeds");
+        std::string realSubId = subCand.entry_id.substr(4);
+        auto subStat = repo.GetStat(InputScheme::Pinyin, "renren", realSubId);
+        AssertCondition(subStat.has_value() && subStat->selected_count >= 1,
+                        "Sub-candidate stats recorded under sub-word code 'renren'");
+        auto wrongSentenceStat = repo.GetStat(InputScheme::Pinyin, "renrenshurufa", realSubId);
+        AssertCondition(!wrongSentenceStat.has_value(),
+                        "Sub-candidate stats must NOT pollute full sentence code 'renrenshurufa'");
+    }
+
     // 2. Continuous multi-syllable phrase 'jintianshiyigehaorizi'
     auto res2 = coordinator.Query("jintianshiyigehaorizi");
     AssertCondition(res2.status == CoordinatorStatus::Success, "Query 'jintianshiyigehaorizi' succeeds");
     AssertCondition(!res2.candidates.empty(), "Query 'jintianshiyigehaorizi' returns candidates");
-    std::cout << "DEBUG res2 cand0 text=" << WideToUtf8(res2.candidates[0].text) << " matched=" << res2.candidates[0].matched_code << " resolved=" << res2.candidates[0].resolved_code << std::endl;
     AssertCondition(res2.candidates[0].text == L"今天是一个好日子", "Candidate 1 is 今天是一个好日子");
 
     // 3. Explicit apostrophe separators 'xi'an'ren'
@@ -1364,22 +1421,82 @@ void TestContinuousSentenceAndAutoPhraseLearning(InputCoordinator& coordinator, 
     AssertCondition(!res3.candidates.empty(), "Query 'xi'an'ren' returns candidates");
     AssertCondition(res3.candidates[0].text == L"西安人", "Candidate 1 is 西安人");
 
-    // 4. Auto Phrase Composition & Learning
+    // 4. Auto Phrase Composition & Learning + WAL pending_commits cleanup & deduplication
     Candidate candToCommit = res1.candidates[0];
     AssertCondition(candToCommit.entry_id.rfind("sentence_", 0) == 0, "Candidate is sentence candidate");
-    bool commitOk = coordinator.CommitCandidate(candToCommit, "ev_sentence_learn_1");
-    AssertCondition(commitOk, "Commit sentence candidate succeeds");
 
-    // After commit, user dictionary has learned '人人输入法' with code 'renrenshurufa'
+    // 4a. Unknown event without pending is rejected fail-closed
+    AssertCondition(!coordinator.CommitCandidate(candToCommit, "unknown_sentence_event", 100, 200),
+                    "Unknown sentence event without pending is rejected fail-closed");
+
+    // 4b. Tampered pending snapshot (different text) is rejected
+    EntryRepository::PendingCommitRecord pendingTampered{};
+    pendingTampered.event_id = "ev_sentence_tampered_1";
+    pendingTampered.session_id = 100;
+    pendingTampered.context_id = 200;
+    pendingTampered.scheme = InputScheme::Pinyin;
+    pendingTampered.query_code = "renrenshurufa";
+    pendingTampered.entry_id = candToCommit.entry_id;
+    pendingTampered.text = L"篡改的文本";
+    pendingTampered.learning_enabled = true;
+    AssertCondition(repo.SavePendingCommit(pendingTampered), "SavePendingCommit for tampered test succeeds");
+    AssertCondition(!coordinator.CommitCandidate(candToCommit, "ev_sentence_tampered_1", 100, 200),
+                    "Sentence commit with tampered pending text is rejected");
+    repo.RemovePendingCommit("ev_sentence_tampered_1");
+
+    // 4c. Valid pending commit succeeds
+    EntryRepository::PendingCommitRecord pendingRec{};
+    pendingRec.event_id = "ev_sentence_learn_1";
+    pendingRec.session_id = 100;
+    pendingRec.context_id = 200;
+    pendingRec.scheme = InputScheme::Pinyin;
+    pendingRec.query_code = "renrenshurufa";
+    pendingRec.entry_id = candToCommit.entry_id;
+    pendingRec.text = candToCommit.text;
+    pendingRec.learning_enabled = true;
+    AssertCondition(repo.SavePendingCommit(pendingRec), "SavePendingCommit for sentence candidate succeeds");
+
+    bool commitOk = coordinator.CommitCandidate(candToCommit, "ev_sentence_learn_1", 100, 200);
+    AssertCondition(commitOk, "Commit sentence candidate succeeds");
+    AssertCondition(!repo.HasAnyPendingCommits(), "Sentence CommitCandidate cleaned up pending_commits");
+    AssertCondition(repo.GetCommitEventRecord("ev_sentence_learn_1").status == 1,
+                    "Sentence CommitCandidate recorded status=1 in commit_events");
+
+    // Idempotent replay of identical sentence commit
+    AssertCondition(coordinator.CommitCandidate(candToCommit, "ev_sentence_learn_1", 100, 200),
+                    "Replay identical sentence commit succeeds");
+
+    // Conflicting payload replay rejected
+    Candidate conflictCand = candToCommit;
+    conflictCand.raw_code = "renrenshurufa_conflict";
+    AssertCondition(!coordinator.CommitCandidate(conflictCand, "ev_sentence_learn_1", 100, 200),
+                    "Conflicting code replay on Recorded sentence event rejected");
+
+    // 4d. Committing the same sentence a second time under a new event_id (with its own pending)
+    // MUST reuse the user entry atomically without duplicating rows!
+    EntryRepository::PendingCommitRecord pendingRec2{};
+    pendingRec2.event_id = "ev_sentence_learn_2";
+    pendingRec2.session_id = 100;
+    pendingRec2.context_id = 200;
+    pendingRec2.scheme = InputScheme::Pinyin;
+    pendingRec2.query_code = "renrenshurufa";
+    pendingRec2.entry_id = candToCommit.entry_id;
+    pendingRec2.text = candToCommit.text;
+    pendingRec2.learning_enabled = true;
+    AssertCondition(repo.SavePendingCommit(pendingRec2), "SavePendingCommit for 2nd sentence event succeeds");
+
+    AssertCondition(coordinator.CommitCandidate(candToCommit, "ev_sentence_learn_2", 100, 200),
+                    "Second sentence commit succeeds");
+
+    // After commit, user dictionary has learned '人人输入法' with code 'renrenshurufa' (exactly 1 entry)
     auto userEntries = repo.GetAllUserEntries();
-    bool foundLearned = false;
+    int learnedCount = 0;
     for (const auto& u : userEntries) {
         if (u.text == L"人人输入法") {
-            foundLearned = true;
-            break;
+            learnedCount++;
         }
     }
-    AssertCondition(foundLearned, "Auto-phrase learning saved 人人输入法 into user dictionary");
+    AssertCondition(learnedCount == 1, "Auto-phrase learning saved exactly 1 deduplicated 人人输入法 entry into user dictionary");
 
     // Subsequent query 'renrenshurufa' recalls '人人输入法' directly from custom dictionary
     auto res4 = coordinator.Query("renrenshurufa");
@@ -1387,7 +1504,332 @@ void TestContinuousSentenceAndAutoPhraseLearning(InputCoordinator& coordinator, 
                     "Subsequent query recalls learned 人人输入法 at top rank");
     AssertCondition(res4.candidates[0].dict_id == DICT_ID_CUSTOM, "Candidate source is custom dictionary");
 
+    // 4e. Test Reset Epoch Cross-Identity Verification:
+    // When an entry's stats are reset, pending commits created before the reset must NOT increment stats
+    std::string learnedId;
+    for (const auto& u : userEntries) {
+        if (u.text == L"人人输入法") { learnedId = u.id; break; }
+    }
+    AssertCondition(!learnedId.empty(), "Learned entry id found");
+    auto statBeforeReset = repo.GetStat(InputScheme::Pinyin, "renrenshurufa", learnedId);
+    AssertCondition(statBeforeReset.has_value() && statBeforeReset->selected_count == 2,
+                    "Learned entry has 2 commits recorded in stats");
+
+    // Pending commit created before reset (captures epoch 1)
+    EntryRepository::PendingCommitRecord stalePending{};
+    stalePending.event_id = "ev_sentence_stale_epoch";
+    stalePending.session_id = 100;
+    stalePending.context_id = 200;
+    stalePending.scheme = InputScheme::Pinyin;
+    stalePending.query_code = "renrenshurufa";
+    stalePending.entry_id = candToCommit.entry_id;
+    stalePending.text = candToCommit.text;
+    stalePending.learning_enabled = true;
+    AssertCondition(repo.SavePendingCommit(stalePending), "SavePendingCommit before reset succeeds");
+
+    // Reset entry stats AFTER pending was created -> bumps entry epoch to 2
+    repo.ResetStats(learnedId);
+    auto statAfterReset = repo.GetStat(InputScheme::Pinyin, "renrenshurufa", learnedId);
+    AssertCondition(!statAfterReset.has_value(),
+                    "Entry stats deleted after reset");
+
+    // Stale epoch commit commits receipt, but does NOT increment stats
+    AssertCondition(coordinator.CommitCandidate(candToCommit, "ev_sentence_stale_epoch", 100, 200),
+                    "Stale epoch commit still commits receipt successfully");
+    auto statAfterStale = repo.GetStat(InputScheme::Pinyin, "renrenshurufa", learnedId);
+    AssertCondition(!statAfterStale.has_value(),
+                    "Stale epoch commit did NOT increment reset stats (remains absent)");
+
+    // Fresh commit created after reset (derives epoch from SavePendingCommit) DOES increment stats
+    EntryRepository::PendingCommitRecord freshPending{};
+    freshPending.event_id = "ev_sentence_fresh_epoch";
+    freshPending.session_id = 100;
+    freshPending.context_id = 200;
+    freshPending.scheme = InputScheme::Pinyin;
+    freshPending.query_code = "renrenshurufa";
+    freshPending.entry_id = candToCommit.entry_id;
+    freshPending.text = candToCommit.text;
+    freshPending.learning_enabled = true;
+    AssertCondition(repo.SavePendingCommit(freshPending), "SavePendingCommit with fresh epoch succeeds");
+
+    AssertCondition(coordinator.CommitCandidate(candToCommit, "ev_sentence_fresh_epoch", 100, 200),
+                    "Fresh epoch commit succeeds");
+    auto statAfterFresh = repo.GetStat(InputScheme::Pinyin, "renrenshurufa", learnedId);
+    AssertCondition(statAfterFresh.has_value() && statAfterFresh->selected_count == 1,
+                    "Fresh commit created after reset successfully incremented stats (count=1)");
+
+    // 5. Learning disabled: sentence commit still cleans up pending_commits and records commit_events without adding user entry
+    policy.learning_enabled = false;
+    coordinator.SetPolicy(policy);
+    EntryRepository::PendingCommitRecord pendingNoLearn{};
+    pendingNoLearn.event_id = "ev_sentence_nolearn_1";
+    pendingNoLearn.session_id = 100;
+    pendingNoLearn.context_id = 200;
+    pendingNoLearn.scheme = InputScheme::Pinyin;
+    pendingNoLearn.query_code = "jintianshiyigehaorizi";
+    pendingNoLearn.entry_id = res2.candidates[0].entry_id;
+    pendingNoLearn.text = res2.candidates[0].text;
+    pendingNoLearn.learning_enabled = false;
+    AssertCondition(repo.SavePendingCommit(pendingNoLearn), "SavePendingCommit for no-learn sentence succeeds");
+    AssertCondition(coordinator.CommitCandidate(res2.candidates[0], "ev_sentence_nolearn_1", 100, 200),
+                    "Commit sentence with learning_enabled=false succeeds");
+    AssertCondition(!repo.HasAnyPendingCommits(), "No-learn sentence commit cleaned up pending_commits");
+    AssertCondition(repo.GetCommitEventRecord("ev_sentence_nolearn_1").status == 1,
+                    "No-learn sentence commit recorded status=1 in commit_events");
+
+    policy.learning_enabled = true;
+    coordinator.SetPolicy(policy);
+
     std::cout << "  [PASS] Stage 6 Continuous Sentence Viterbi Decoding & Auto Phrase Learning verified!" << std::endl;
+}
+
+void TestSentenceReceiptImmutabilityAndConcurrency(InputCoordinator& coordinator, EntryRepository& repo, SqliteDb& db, std::shared_ptr<IClock> clock) {
+    std::cout << "[Test 24] Testing Sentence Receipt Immutability, Scope Normalization & Concurrency..." << std::endl;
+    using S = InputScheme;
+
+    auto hasPendingEvent = [&](const std::string& evId) {
+        auto all = repo.LoadAllPendingCommits();
+        return std::any_of(all.begin(), all.end(), [&](const auto& r) { return r.event_id == evId; });
+    };
+
+    // 1. P1-1: Scope & Query validation with full scheme coverage
+    // 1a. Pinyin with explicit delimiters
+    {
+        EntryRepository::PendingCommitRecord p{};
+        p.event_id = "ev_p1_1_delim";
+        p.session_id = 1; p.context_id = 2; p.scheme = S::Pinyin;
+        p.query_code = "xi'an"; p.entry_id = "sentence_delim";
+        p.text = L"西安"; p.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(p), "Save pending with delimiter");
+
+        // Wrong scope rejected
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "xian"}};
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_1_delim", 1, 2, S::Pinyin, "wrong_scope", L"西安", "xian", "sentence_delim", codes, true),
+                        "P1-1: Wrong scope rejected for delimited pinyin");
+        // Pending preserved
+        AssertCondition(hasPendingEvent("ev_p1_1_delim"), "Pending preserved after scope rejection");
+
+        // Wrong storage pinyin rejected
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_1_delim", 1, 2, S::Pinyin, "xian", L"西安", "wrongpinyin", "sentence_delim", codes, true),
+                        "P1-1: Mismatched storage pinyin rejected");
+
+        // Correct confirmation with stripped or raw query code succeeds
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_1_delim", 1, 2, S::Pinyin, "xian", L"西安", "xian", "sentence_delim", codes, true),
+                        "P1-1: Delimited pinyin confirmed successfully with valid scope");
+        AssertCondition(!hasPendingEvent("ev_p1_1_delim"), "Pending cleaned up after valid commit");
+    }
+
+    // 1b. Shuangpin layouts (Natural, MS, Xiaohe)
+    {
+        // Xiaohe layout
+        EntryRepository::PendingCommitRecord pXh{};
+        pXh.event_id = "ev_p1_1_xh";
+        pXh.session_id = 10; pXh.context_id = 20; pXh.scheme = S::Shuangpin;
+        pXh.query_code = "vswf"; pXh.layout_id = "xiaohe";
+        pXh.resolved_code = "zhongwen"; pXh.entry_id = "sentence_xh";
+        pXh.text = L"中文"; pXh.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(pXh), "Save pending for Xiaohe Shuangpin");
+
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "zhongwen"}};
+
+        // Bare query without layout prefix MUST be rejected
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_1_xh", 10, 20, S::Shuangpin, "vswf", L"中文", "zhongwen", "sentence_xh", codes, true),
+                        "P1-1: Bare query string without layout prefix rejected for Shuangpin");
+
+        // Wrong layout prefix (natural vs xiaohe) rejected
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_1_xh", 10, 20, S::Shuangpin, "natural:vswf", L"中文", "zhongwen", "sentence_xh", codes, true),
+                        "P1-1: Mismatched layout prefix rejected for Shuangpin");
+
+        // Correct layout prefix 'xiaohe:vswf' succeeds
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_1_xh", 10, 20, S::Shuangpin, "xiaohe:vswf", L"中文", "zhongwen", "sentence_xh", codes, true),
+                        "P1-1: Xiaohe Shuangpin commit with proper layout prefix succeeds");
+    }
+
+    // 2. P1-2: Immutable terminal payload fingerprint & tamper resistance
+    {
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "wending"}};
+        EntryRepository::PendingCommitRecord p{};
+        p.event_id = "ev_p1_2_immut";
+        p.session_id = 50; p.context_id = 60; p.scheme = S::Pinyin;
+        p.query_code = "wending"; p.entry_id = "sentence_wending";
+        p.text = L"稳定"; p.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(p), "Save pending for immutability test");
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"稳定", "wending", "sentence_wending", codes, true),
+                        "First sentence commit succeeds");
+
+        // Tamper text
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"篡改文本", "wending", "sentence_wending", codes, true),
+                        "P1-2: Replay with tampered text rejected");
+        // Tamper storage code
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"稳定", "tampered_code", "sentence_wending", codes, true),
+                        "P1-2: Replay with tampered storage code rejected");
+        // Tamper candidate ID
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"稳定", "wending", "other_id", codes, true),
+                        "P1-2: Replay with tampered candidate ID rejected");
+        // Tamper owner
+        AssertCondition(!repo.RecordSentenceCommit("ev_p1_2_immut", 999, 60, S::Pinyin, "wending", L"稳定", "wending", "sentence_wending", codes, true),
+                        "P1-2: Replay with wrong session_id rejected");
+
+        // Identical replay succeeds without incrementing stats
+        std::string wendingId;
+        for (const auto& u : repo.GetAllUserEntries()) {
+            if (u.text == L"稳定") { wendingId = u.id; break; }
+        }
+        AssertCondition(!wendingId.empty(), "Entry '稳定' exists");
+        auto statBefore = repo.GetStat(S::Pinyin, "wending", wendingId);
+        int countBefore = statBefore ? statBefore->selected_count : 0;
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"稳定", "wending", "sentence_wending", codes, true),
+                        "P1-2: Identical replay succeeds");
+        auto statAfter = repo.GetStat(S::Pinyin, "wending", wendingId);
+        int countAfter = statAfter ? statAfter->selected_count : 0;
+        AssertCondition(countBefore == countAfter, "P1-2: Replay does NOT duplicate stats count");
+
+        // User edits or deletes entry: replay still verifies against immutable fingerprint in commit_events!
+        repo.UpdateEntryText(wendingId, L"已修改文本");
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_2_immut", 50, 60, S::Pinyin, "wending", L"稳定", "wending", "sentence_wending", codes, true),
+                        "P1-2: Replay succeeds even after entry text is edited by user");
+    }
+
+    // 3. P1-3: Cross-Identity Epoch in production SavePendingCommit & Reset scenarios
+    {
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "kaixin"}};
+        auto kid = repo.AddEntry(L"开心", codes, EntrySource::User);
+        AssertCondition(!kid.empty(), "Create initial user entry '开心'");
+
+        // Scenario 1: Pending created BEFORE reset, confirmed AFTER reset
+        EntryRepository::PendingCommitRecord pPre{};
+        pPre.event_id = "ev_p1_3_pre";
+        pPre.session_id = 70; pPre.context_id = 80; pPre.scheme = S::Pinyin;
+        pPre.query_code = "kaixin"; pPre.entry_id = "sentence_kaixin";
+        pPre.text = L"开心"; pPre.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(pPre), "Save pending BEFORE reset (epoch 1)");
+
+        // Reset stats
+        repo.ResetStats(kid);
+        AssertCondition(!repo.GetStat(S::Pinyin, "kaixin", kid).has_value(), "Stats reset");
+
+        // Confirm pre-reset pending: ACK is true, but stats remain absent (not learned)
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_3_pre", 70, 80, S::Pinyin, "kaixin", L"开心", "kaixin", "sentence_kaixin", codes, true),
+                        "P1-3: Pre-reset pending confirmed");
+        AssertCondition(!repo.GetStat(S::Pinyin, "kaixin", kid).has_value(),
+                        "P1-3: Pre-reset pending did NOT increment stats after reset");
+
+        // Scenario 2: Pending created AFTER reset (real production SavePendingCommit without manual epoch)
+        EntryRepository::PendingCommitRecord pPost{};
+        pPost.event_id = "ev_p1_3_post";
+        pPost.session_id = 70; pPost.context_id = 80; pPost.scheme = S::Pinyin;
+        pPost.query_code = "kaixin"; pPost.entry_id = "sentence_kaixin";
+        pPost.text = L"开心"; pPost.learning_enabled = true;
+        // Notice: entry_epoch is NOT manually supplied!
+        AssertCondition(repo.SavePendingCommit(pPost), "Save pending AFTER reset via production SavePendingCommit");
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_3_post", 70, 80, S::Pinyin, "kaixin", L"开心", "kaixin", "sentence_kaixin", codes, true),
+                        "P1-3: Post-reset fresh pending confirmed");
+        auto kStat = repo.GetStat(S::Pinyin, "kaixin", kid);
+        AssertCondition(kStat.has_value() && kStat->selected_count == 1,
+                        "P1-3: Post-reset fresh commit learned count=1");
+
+        // Replay of fresh commit
+        AssertCondition(repo.RecordSentenceCommit("ev_p1_3_post", 70, 80, S::Pinyin, "kaixin", L"开心", "kaixin", "sentence_kaixin", codes, true),
+                        "Replay of post-reset commit succeeds");
+        auto kStatAfterReplay = repo.GetStat(S::Pinyin, "kaixin", kid);
+        AssertCondition(kStatAfterReplay.has_value() && kStatAfterReplay->selected_count == 1,
+                        "Count remains 1 after replay");
+    }
+
+    // 4. Concurrency test: Multi-threaded simultaneous commits of the same phrase
+    {
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "tongbu"}};
+        const std::wstring syncText = L"同步并发";
+
+        EntryRepository::PendingCommitRecord p1{};
+        p1.event_id = "ev_conc_1";
+        p1.session_id = 11; p1.context_id = 22; p1.scheme = S::Pinyin;
+        p1.query_code = "tongbu"; p1.entry_id = "sentence_sync_1";
+        p1.text = syncText; p1.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(p1), "Save pending 1 for concurrency");
+
+        EntryRepository::PendingCommitRecord p2{};
+        p2.event_id = "ev_conc_2";
+        p2.session_id = 33; p2.context_id = 44; p2.scheme = S::Pinyin;
+        p2.query_code = "tongbu"; p2.entry_id = "sentence_sync_2";
+        p2.text = syncText; p2.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(p2), "Save pending 2 for concurrency");
+
+        // Run simultaneously on two threads
+        std::atomic<bool> start{false};
+        bool res1 = false, res2 = false;
+        std::thread t1([&]() {
+            while (!start.load()) std::this_thread::yield();
+            res1 = repo.RecordSentenceCommit("ev_conc_1", 11, 22, S::Pinyin, "tongbu", syncText, "tongbu", "sentence_sync_1", codes, true);
+        });
+        std::thread t2([&]() {
+            while (!start.load()) std::this_thread::yield();
+            res2 = repo.RecordSentenceCommit("ev_conc_2", 33, 44, S::Pinyin, "tongbu", syncText, "tongbu", "sentence_sync_2", codes, true);
+        });
+
+        start.store(true);
+        t1.join();
+        t2.join();
+
+        AssertCondition(res1 && res2, "Both concurrent sentence commits succeeded");
+
+        // Check deduplication in database
+        int syncCount = 0;
+        std::string foundId;
+        for (const auto& u : repo.GetAllUserEntries()) {
+            if (u.text == syncText) {
+                syncCount++;
+                foundId = u.id;
+            }
+        }
+        AssertCondition(syncCount == 1, "Concurrent commits created EXACTLY 1 user entry in SQLite");
+        auto syncStat = repo.GetStat(S::Pinyin, "tongbu", foundId);
+        AssertCondition(syncStat.has_value() && syncStat->selected_count == 2,
+                        "Concurrent commits both learned: count=2 in entry_stats");
+    }
+
+    // 5. Fault Injection: Verify full rollback on write failures
+    {
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "huigun"}};
+        EntryRepository::PendingCommitRecord p{};
+        p.event_id = "ev_rollback_test";
+        p.session_id = 88; p.context_id = 99; p.scheme = S::Pinyin;
+        p.query_code = "huigun"; p.entry_id = "sentence_rb";
+        p.text = L"回滚测试"; p.learning_enabled = true;
+        AssertCondition(repo.SavePendingCommit(p), "Save pending for rollback test");
+
+        // Inject SQLite authorizer failure on INSERT INTO commit_events
+        auto denyCommitEvents = [](void*, int op, const char* arg1, const char*, const char*, const char*) -> int {
+            if (op == SQLITE_INSERT && arg1 && std::string(arg1) == "commit_events") {
+                return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        };
+        sqlite3_set_authorizer(db.GetRawHandle(), denyCommitEvents, nullptr);
+
+        bool ack = repo.RecordSentenceCommit("ev_rollback_test", 88, 99, S::Pinyin, "huigun", L"回滚测试", "huigun", "sentence_rb", codes, true);
+        AssertCondition(!ack, "Fault injection: RecordSentenceCommit aborted on DB write failure");
+
+        sqlite3_set_authorizer(db.GetRawHandle(), nullptr, nullptr);
+
+        // Verify pending commit is STILL preserved (zero side effects on rollback)
+        AssertCondition(hasPendingEvent("ev_rollback_test"),
+                        "Pending commit remains preserved after rollback");
+
+        // Verify word was not half-created
+        bool wordCreated = false;
+        for (const auto& u : repo.GetAllUserEntries()) {
+            if (u.text == L"回滚测试") { wordCreated = true; break; }
+        }
+        AssertCondition(!wordCreated, "User entry rolled back on failure (zero side effects)");
+
+        // Subsequent retry without fault succeeds
+        AssertCondition(repo.RecordSentenceCommit("ev_rollback_test", 88, 99, S::Pinyin, "huigun", L"回滚测试", "huigun", "sentence_rb", codes, true),
+                        "Retry after fault cleared succeeds completely");
+        AssertCondition(!hasPendingEvent("ev_rollback_test"), "Pending cleaned up after retry");
+    }
+
+    std::cout << "  [PASS] Test 24 Sentence Receipt Immutability, Normalization & Concurrency verified!" << std::endl;
 }
 
 // Main Test Runner
@@ -1442,8 +1884,9 @@ int main() {
     TestFinalizationPinyinPrefixesAndBoundaries();
     TestInputMethodEnablingDisablingAndValidation(coordinator, repo);
     TestFallbackThresholdAndSecondaryReverseLookup(coordinator, repo);
-    TestDynamicSmartMacroExpansion(coordinator);
+    TestDynamicSmartMacroExpansion(coordinator, repo);
     TestContinuousSentenceAndAutoPhraseLearning(coordinator, repo);
+    TestSentenceReceiptImmutabilityAndConcurrency(coordinator, repo, db, clock);
 
     db.Close();
     std::filesystem::remove(testDb);

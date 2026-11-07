@@ -1047,33 +1047,50 @@ InputCoordinator::Query(const std::string& rawCode,
             }
 
             // Continuous sentence decode if input has >= 2 syllables
-            for (const auto& m : methods) {
-                if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
-                    auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, const_cast<EntryRepository&>(m_repo), m_clock);
-                    if (dec.has_value()) {
-                        Candidate sentCand;
-                        sentCand.entry_id = "sentence_" + rawCode;
-                        sentCand.text = dec->text;
-                        sentCand.raw_code = rawCode;
-                        sentCand.matched_code = rawCode;
-                        sentCand.resolved_code = m.resolved_code;
-                        sentCand.dict_id = DICT_ID_BUILTIN_PINYIN;
-                        sentCand.scheme = m.scheme;
-                        sentCand.quality = MatchQuality::ExactFull;
-                        sentCand.score = 50000.0;
-                        sentCand.dict_priority = 0;
-                        sentCand.method_priority = m.method_priority;
+            bool canUseBuiltinPinyin = std::find(searchDicts.begin(), searchDicts.end(), DICT_ID_BUILTIN_PINYIN) != searchDicts.end();
+            bool canUseCustom = std::find(searchDicts.begin(), searchDicts.end(), DICT_ID_CUSTOM) != searchDicts.end();
+            bool freqEnabled = policySnapshot ? policySnapshot->frequency_enabled : true;
 
-                        result.candidates.push_back(std::move(sentCand));
-                        for (auto& sc : dec->sub_candidates) {
-                            sc.method_priority = m.method_priority;
-                            sc.raw_code = rawCode;
-                            result.candidates.push_back(std::move(sc));
+            if (canUseBuiltinPinyin || canUseCustom) {
+                for (const auto& m : methods) {
+                    if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
+                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, m_repo, m_clock,
+                                                                   canUseBuiltinPinyin, canUseCustom, freqEnabled);
+                        if (dec.has_value()) {
+                            std::string sentenceDictId = canUseBuiltinPinyin ? DICT_ID_BUILTIN_PINYIN : DICT_ID_CUSTOM;
+                            Candidate sentCand;
+                            sentCand.entry_id = "sentence_" + rawCode;
+                            sentCand.text = dec->text;
+                            sentCand.raw_code = rawCode;
+                            sentCand.matched_code = rawCode;
+                            sentCand.resolved_code = m.resolved_code;
+                            sentCand.layout_id = m.layout_id;
+                            sentCand.dict_id = sentenceDictId;
+                            sentCand.scheme = m.scheme;
+                            sentCand.quality = MatchQuality::ExactFull;
+                            sentCand.score = 50000.0;
+                            sentCand.dict_priority = 0;
+                            sentCand.method_priority = m.method_priority;
+
+                            result.candidates.push_back(std::move(sentCand));
+                            for (auto& sc : dec->sub_candidates) {
+                                sc.scheme = m.scheme;
+                                sc.layout_id = m.layout_id;
+                                sc.method_priority = m.method_priority;
+                                sc.raw_code = rawCode;
+                                result.candidates.push_back(std::move(sc));
+                            }
+                            result.status = CoordinatorStatus::Success;
+                            result.active_dict_id = sentenceDictId;
+                            result.current_dict_index = 0;
+                            for (int i = 0; i < static_cast<int>(enabledDicts.size()); ++i) {
+                                if (enabledDicts[i] == sentenceDictId) {
+                                    result.current_dict_index = i;
+                                    break;
+                                }
+                            }
+                            return result;
                         }
-                        result.status = CoordinatorStatus::Success;
-                        result.active_dict_id = DICT_ID_BUILTIN_PINYIN;
-                        result.current_dict_index = 0;
-                        return result;
                     }
                 }
             }
@@ -1152,44 +1169,59 @@ InputCoordinator::Query(const std::string& rawCode,
         result.candidates = std::move(deduped);
 
         // Stage 6: Continuous sentence recall if input has >= 2 syllables
-        for (const auto& m : methods) {
-            if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
-                // If a higher priority method (e.g. primary Wubi86) already produced exact matches, do not override it
-                if (!result.candidates.empty() && result.candidates[0].method_priority < m.method_priority && result.candidates[0].quality == MatchQuality::ExactFull) {
-                    break;
-                }
+        bool canUseBuiltinPinyin = std::find(searchDicts.begin(), searchDicts.end(), DICT_ID_BUILTIN_PINYIN) != searchDicts.end();
+        bool canUseCustom = std::find(searchDicts.begin(), searchDicts.end(), DICT_ID_CUSTOM) != searchDicts.end();
+        bool freqEnabled = policySnapshot ? policySnapshot->frequency_enabled : true;
 
-                bool hasFullExact = !result.candidates.empty() && 
-                    result.candidates[0].quality == MatchQuality::ExactFull &&
-                    (result.candidates[0].matched_code.length() >= rawCode.length() ||
-                     result.candidates[0].text.length() >= m.syllables.size());
+        if (canUseBuiltinPinyin || canUseCustom) {
+            for (const auto& m : methods) {
+                if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
+                    // If a higher priority method (e.g. primary Wubi86) already produced exact matches, do not override it
+                    if (!result.candidates.empty() && result.candidates[0].method_priority < m.method_priority && result.candidates[0].quality == MatchQuality::ExactFull) {
+                        break;
+                    }
 
-                if (!hasFullExact) {
-                    auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, const_cast<EntryRepository&>(m_repo), m_clock);
-                    if (dec.has_value()) {
-                        bool alreadyHas = false;
-                        for (const auto& c : result.candidates) {
-                            if (c.text == dec->text) { alreadyHas = true; break; }
-                        }
-                        if (!alreadyHas) {
-                            Candidate sentCand;
-                            sentCand.entry_id = "sentence_" + rawCode;
-                            sentCand.text = dec->text;
-                            sentCand.raw_code = rawCode;
-                            sentCand.matched_code = rawCode;
-                            sentCand.resolved_code = m.resolved_code;
-                            sentCand.dict_id = DICT_ID_BUILTIN_PINYIN;
-                            sentCand.scheme = m.scheme;
-                            sentCand.quality = MatchQuality::ExactFull;
-                            sentCand.score = 50000.0;
-                            sentCand.dict_priority = 0;
-                            sentCand.method_priority = m.method_priority;
+                    bool hasFullExact = !result.candidates.empty() &&
+                        result.candidates[0].quality == MatchQuality::ExactFull &&
+                        (result.candidates[0].matched_code.length() >= rawCode.length() ||
+                         result.candidates[0].text.length() >= m.syllables.size());
 
-                            result.candidates.insert(result.candidates.begin(), std::move(sentCand));
+                    if (!hasFullExact) {
+                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, m_repo, m_clock,
+                                                                   canUseBuiltinPinyin, canUseCustom, freqEnabled);
+                        if (dec.has_value()) {
+                            std::string sentenceDictId = canUseBuiltinPinyin ? DICT_ID_BUILTIN_PINYIN : DICT_ID_CUSTOM;
+                            if (seenTexts.find(dec->text) == seenTexts.end()) {
+                                seenTexts.insert(dec->text);
+                                Candidate sentCand;
+                                sentCand.entry_id = "sentence_" + rawCode;
+                                sentCand.text = dec->text;
+                                sentCand.raw_code = rawCode;
+                                sentCand.matched_code = rawCode;
+                                sentCand.resolved_code = m.resolved_code;
+                                sentCand.layout_id = m.layout_id;
+                                sentCand.dict_id = sentenceDictId;
+                                sentCand.scheme = m.scheme;
+                                sentCand.quality = MatchQuality::ExactFull;
+                                sentCand.score = 50000.0;
+                                sentCand.dict_priority = 0;
+                                sentCand.method_priority = m.method_priority;
+
+                                result.candidates.insert(result.candidates.begin(), std::move(sentCand));
+                            }
+                            for (auto& sc : dec->sub_candidates) {
+                                if (seenTexts.insert(sc.text).second) {
+                                    sc.scheme = m.scheme;
+                                    sc.layout_id = m.layout_id;
+                                    sc.method_priority = m.method_priority;
+                                    sc.raw_code = rawCode;
+                                    result.candidates.push_back(std::move(sc));
+                                }
+                            }
                         }
                     }
+                    break;
                 }
-                break;
             }
         }
 
@@ -1287,8 +1319,10 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
                                        uint64_t contextId,
                                        std::shared_ptr<const InputPolicy> policySnapshot) {
     if (candidate.entry_id.rfind("macro_", 0) == 0) {
-        // Dynamic smart macros expand transiently and do not require repository learning or persistence
-        return true;
+        // Dynamic smart macros expand transiently and do not require repository learning or stats,
+        // but MUST still finalize the WAL pending_commits / commit_events receipt!
+        return m_repo.RecordTransientCommitEvent(eventId, sessionId, contextId,
+                                                 candidate.scheme, candidate.raw_code, candidate.entry_id);
     }
 
     if (!policySnapshot) {
@@ -1297,30 +1331,40 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
 
     // Stage 6 Sentence auto-phrase learning
     if (candidate.entry_id.rfind("sentence_", 0) == 0) {
-        if (policySnapshot->learning_enabled) {
-            std::string cleanCode = candidate.raw_code;
-            std::transform(cleanCode.begin(), cleanCode.end(), cleanCode.begin(), [](unsigned char c) { return std::tolower(c); });
-            std::string storageCode;
-            for (char ch : cleanCode) { if (ch != '\'') storageCode.push_back(ch); }
-
-            std::vector<std::pair<InputScheme, std::string>> codes = {
-                { InputScheme::Pinyin, storageCode }
-            };
-            if (cleanCode.find('\'') != std::string::npos) {
-                codes.push_back({ InputScheme::Pinyin, cleanCode });
-            }
-            auto wubiCodes = m_builtinDict.ReverseLookupWubi(candidate.text);
-            if (!wubiCodes.empty()) {
-                codes.push_back({ InputScheme::Wubi86, wubiCodes[0] });
-            }
-            std::string newId = m_repo.AddEntry(candidate.text, codes, EntrySource::User);
-            if (!newId.empty()) {
-                m_repo.RecordCommit(eventId, sessionId, contextId,
-                                    candidate.scheme, storageCode, newId,
-                                    true, candidate.scheme, storageCode);
-            }
+        std::string basePinyinSource = (candidate.scheme == InputScheme::Shuangpin && !candidate.resolved_code.empty())
+            ? candidate.resolved_code
+            : (!candidate.raw_code.empty() ? candidate.raw_code : candidate.resolved_code);
+        std::string cleanCode = basePinyinSource;
+        std::transform(cleanCode.begin(), cleanCode.end(), cleanCode.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::string storageCode;
+        for (char ch : cleanCode) {
+            if (ch != '\'' && ch != ' ') storageCode.push_back(ch);
         }
-        return true;
+        if (storageCode.empty()) {
+            return m_repo.RecordTransientCommitEvent(eventId, sessionId, contextId,
+                                                     candidate.scheme, candidate.raw_code, candidate.entry_id);
+        }
+
+        std::string rawForScope = !candidate.raw_code.empty() ? candidate.raw_code : storageCode;
+        std::string scopedLearningCode = BuildScopedCode(candidate.scheme, candidate.layout_id, rawForScope);
+
+        std::vector<std::pair<InputScheme, std::string>> allCodes = {
+            { InputScheme::Pinyin, storageCode }
+        };
+        if (candidate.scheme == InputScheme::Pinyin && cleanCode.find('\'') != std::string::npos) {
+            allCodes.push_back({ InputScheme::Pinyin, cleanCode });
+        }
+        auto wubiCodes = m_builtinDict.ReverseLookupWubi(candidate.text);
+        if (!wubiCodes.empty()) {
+            allCodes.push_back({ InputScheme::Wubi86, wubiCodes[0] });
+        }
+
+        return m_repo.RecordSentenceCommit(eventId, sessionId, contextId,
+                                           candidate.scheme, scopedLearningCode,
+                                           candidate.text, storageCode,
+                                           candidate.entry_id,
+                                           allCodes,
+                                           policySnapshot->learning_enabled);
     }
 
     // Sub-candidate commit forwarding
@@ -1330,13 +1374,21 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
         if (realCand.entry_id.rfind("b_", 0) == 0) {
             m_repo.EnsureBuiltinEntryExists(realCand.entry_id, realCand.text);
         }
-        std::string rawOrMatched = !realCand.raw_code.empty() ? realCand.raw_code
-            : (!realCand.matched_code.empty() ? realCand.matched_code : realCand.resolved_code);
-        std::string learningCode = BuildScopedCode(realCand.scheme, realCand.layout_id, rawOrMatched);
+        std::string subMatched = !realCand.matched_code.empty() ? realCand.matched_code
+            : (!realCand.resolved_code.empty() ? realCand.resolved_code : realCand.raw_code);
+        std::string subContinuous;
+        for (char ch : subMatched) {
+            if (ch != ' ' && ch != '\'') subContinuous.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (subContinuous.empty()) subContinuous = subMatched;
+
+        InputScheme affScheme = (realCand.scheme == InputScheme::Shuangpin || realCand.scheme == InputScheme::Pinyin)
+            ? InputScheme::Pinyin : realCand.scheme;
+        std::string learningCode = BuildScopedCode(realCand.scheme, realCand.layout_id, subContinuous);
         return m_repo.RecordCommit(eventId, sessionId, contextId,
-                                  realCand.scheme, learningCode, realCand.entry_id,
-                                  policySnapshot->learning_enabled,
-                                  realCand.scheme, rawOrMatched);
+                                   realCand.scheme, learningCode, realCand.entry_id,
+                                   policySnapshot->learning_enabled,
+                                   affScheme, subContinuous);
     }
 
     // Ensure builtin entry row exists in SQLite for foreign key integrity (both when learning is on or off)

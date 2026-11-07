@@ -1136,6 +1136,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     bool selectLastOnPageUp = false;
     uint32_t navSnapshotVersion = 0;
     bool useNavSnapshotVersion = false;
+    bool isExplicitCandidateSelect = hasExplicitVersion && (wParam >= '1' && wParam <= '9');
 
     if (!hasExplicitVersion &&
         m_candidateWindow.GetCandidateCount() > 0 &&
@@ -1176,6 +1177,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             if (sel >= 0 && sel < count && sel < 9) {
                 if (wParam == VK_RETURN || sel > 0) {
                     wParam = static_cast<WPARAM>('1' + sel);
+                    isExplicitCandidateSelect = true;
                 }
                 navSnapshotVersion = snap.candidate_version;
                 useNavSnapshotVersion = true;
@@ -1195,6 +1197,9 @@ bool CTextInputProcessor::ProcessKeyInternal(
     if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    if (isExplicitCandidateSelect) {
+        req.mode_arg |= IPC_KEYDOWN_EXPLICIT_SELECT;
+    }
 
     uint32_t currentCandVer = 0;
     if (hasExplicitVersion) {
