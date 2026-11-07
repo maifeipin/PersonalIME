@@ -133,6 +133,8 @@ jobs:
           Copy-Item "data/dictionaries/NOTICE.txt" -Destination "$pkgDir/dictionaries/"
           Copy-Item "scripts/register.ps1" -Destination "$pkgDir/scripts/"
           Copy-Item "scripts/unregister.ps1" -Destination "$pkgDir/scripts/"
+          Copy-Item "scripts/start_portable.bat" -Destination "$pkgDir/启动人人输入法.bat"
+          Copy-Item "scripts/stop_portable.bat" -Destination "$pkgDir/停止并卸载.bat"
           Copy-Item "out/publish/manager/*" -Destination "$pkgDir/manager/" -Recurse
 
           Compress-Archive -Path "$pkgDir/*" -DestinationPath "out/release/PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip" -Force
@@ -177,10 +179,10 @@ jobs:
             
             > **让每个人都能拥有属于自己的输入法，做那个越来越懂你的输入伙伴。**
             
-            ### 产物清单 (Artifacts)
-            - **标准安装包 (Inno Setup)**: `PersonalIME-Setup-x64.exe`
-            - **绿色便携包 (Portable Archive)**: `PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip`
-            - **校验和文件 (Checksums)**: `SHA256SUMS.txt`
+            ### 产物清单与直接下载 (Artifacts & Direct Downloads)
+            - 📦 **标准安装包 (推荐向导安装)**: [PersonalIME-Setup-x64.exe](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-Setup-x64.exe)
+            - 🗜️ **绿色便携包 (解压即用免安装)**: [PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip)
+            - 📄 **哈希校验和**: [SHA256SUMS.txt](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/SHA256SUMS.txt)
             
             ### 架构与运行环境 (Architecture Scope)
             - **操作系统**: Windows 10 / Windows 11 (仅限 64 位 x64 / AMD64)
@@ -188,12 +190,12 @@ jobs:
             
             ### 安装与启用说明 (How to Install & Enable)
             1. **方式 A (安装包推荐)**:
-               - 下载并运行 `PersonalIME-Setup-x64.exe`，按安装向导完成安装。
+               - 点击上方链接下载并运行 `PersonalIME-Setup-x64.exe`，按安装向导完成安装。
                - 在 Windows“设置 -> 时间和语言 -> 语言和区域 -> 键盘”中可选用“人人 (RenRen IME)”。
             2. **方式 B (绿色便携免安装)**:
                - 解压 `PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip` 到任意目录。
-               - 以管理员权限运行 `scripts/register.ps1` 完成 TSF 注册。
-               - 启动根目录下 `ime-service.exe` 即可使用。
+               - 双击根目录下 `启动人人输入法.bat`（首次运行会自动请求管理员权限注册系统 TSF 输入法驱动并启动后台服务）。
+               - 随时可运行根目录下 `停止并卸载.bat` 彻底注销系统驱动并停止服务。
             
             ### 代码签名说明 (Code Signing Status)
             > [!WARNING]

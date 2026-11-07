@@ -36,6 +36,8 @@ Copy-Item (Join-Path $ProjectRoot "data\dictionaries\*.dict") -Destination (Join
 Copy-Item (Join-Path $ProjectRoot "data\dictionaries\NOTICE.txt") -Destination (Join-Path $pkgDir "dictionaries")
 Copy-Item (Join-Path $ProjectRoot "scripts\register.ps1") -Destination (Join-Path $pkgDir "scripts")
 Copy-Item (Join-Path $ProjectRoot "scripts\unregister.ps1") -Destination (Join-Path $pkgDir "scripts")
+Copy-Item (Join-Path $ProjectRoot "scripts\start_portable.bat") -Destination (Join-Path $pkgDir "启动人人输入法.bat")
+Copy-Item (Join-Path $ProjectRoot "scripts\stop_portable.bat") -Destination (Join-Path $pkgDir "停止并卸载.bat")
 Copy-Item (Join-Path $resolvedOutDir "publish\manager\*") -Destination (Join-Path $pkgDir "manager") -Recurse
 
 $zipName = "PersonalIME-v$Version-portable-x64.zip"
