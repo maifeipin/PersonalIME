@@ -272,6 +272,23 @@ if ($Action -ne "reload") {
         if ($LASTEXITCODE -ne 0) { throw "CMake configure failed." }
     }
 
+    # Clean up old unlocked renamed DLLs and rename currently mapped PersonalIME.dll if locked
+    $releaseDir = Split-Path -Parent $targetDll
+    if (Test-Path $releaseDir) {
+        Get-ChildItem -Path $releaseDir -Filter "PersonalIME.dll.old*" -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path $targetDll) {
+        try {
+            $fs = [System.IO.File]::Open($targetDll, 'Open', 'ReadWrite', 'None')
+            $fs.Close()
+        } catch {
+            $oldName = "$targetDll.old.$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())"
+            Move-Item -Path $targetDll -Destination $oldName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Build targets
     $targets = if ($BuildTests) { @() } else { @("--target", "PersonalIME", "ime-service", "ime-cli") }
     & $cmake --build $resolvedBuildDir --config Release @targets

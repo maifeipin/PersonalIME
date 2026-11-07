@@ -7,14 +7,6 @@
 #include "candidate_window.h"
 #include "globals.h"
 
-// Outcome of an edit session to govern key consumption and server synchronization
-enum class EditSessionResult {
-    Unmodified,        // Host text was not touched by this session (SetText failed or not reached). Safe to rollback server & pass key (*pfEaten = FALSE).
-    PartiallyModified, // THIS session modified host text by SetText, but tail operation (SetSelection/EndComposition) failed. Must eat key (*pfEaten = TRUE), do NOT rollback server.
-    RecoveryBlocked,   // Previous commit could not be ended, so THIS session could not execute. Current request text was NOT touched. Must NOT eat key (*pfEaten = FALSE), and MUST rollback server for current key!
-    Success            // All operations succeeded. (*pfEaten = TRUE).
-};
-
 // Dedicated EditSession to terminate composition on the host document
 class CTerminateCompositionSession : public ITfEditSession {
 public:
@@ -103,11 +95,22 @@ public:
     CEditSession(CTextInputProcessor* pTip, ITfContext* pContext, CCandidateWindow* pCandWnd,
                  bool hasComp, const std::wstring& compText,
                  bool hasCommit, const std::wstring& commitText,
-                 const std::vector<std::wstring>& candidates)
+                 const std::vector<std::wstring>& candidates,
+                 uint64_t generation = 0,
+                 const CandidateDisplaySnapshot* pSnapshot = nullptr)
         : m_pTip(pTip), m_pContext(pContext), m_pCandWnd(pCandWnd),
           m_hasComp(hasComp), m_compText(compText),
           m_hasCommit(hasCommit), m_commitText(commitText),
-          m_candidates(candidates) {
+          m_candidates(candidates),
+          m_contextId(reinterpret_cast<uint64_t>(pContext)),
+          m_generation(generation) {
+        if (pSnapshot) {
+            m_snapshot = *pSnapshot;
+        } else {
+            m_snapshot.context_id = m_contextId;
+            m_snapshot.pContext = pContext;
+            m_snapshot.candidates = candidates;
+        }
         DllAddRef();
         if (m_pTip) m_pTip->AddRef();
         if (m_pContext) m_pContext->AddRef();
@@ -121,6 +124,7 @@ public:
 
     EditSessionResult GetResult() const { return m_result; }
     HRESULT GetFinalHResult() const { return m_finalHr; }
+    bool HasExecuted() const { return m_executed; }
 
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
@@ -146,11 +150,39 @@ public:
 
     // ITfEditSession
     STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+        if (m_executed) {
+            return m_finalHr;
+        }
+        m_executed = true;
+
+        struct CompletionGuard {
+            CEditSession* self;
+            ~CompletionGuard() {
+                if (self->m_pTip && self->m_generation != 0) {
+                    self->m_pTip->OnEditSessionCompleted(
+                        self->m_contextId,
+                        self->m_generation,
+                        self->m_result,
+                        self->m_finalHr);
+                }
+            }
+        } guard{this};
+
         if (!m_pContext || !m_pTip) {
             m_result = EditSessionResult::Unmodified;
             m_finalHr = E_FAIL;
             return E_FAIL;
         }
+
+        auto hideOwnedWindow = [&]() {
+            if (m_pCandWnd) {
+                if (m_generation != 0 && m_pTip) {
+                    m_pTip->HideCandidateWindowIfOwnedBy(m_contextId);
+                } else {
+                    m_pCandWnd->Hide();
+                }
+            }
+        };
 
         ITfContextComposition* pContextComp = nullptr;
         HRESULT hr = m_pContext->QueryInterface(IID_ITfContextComposition, (void**)&pContextComp);
@@ -184,9 +216,43 @@ public:
 
         ITfComposition* pComp = m_pTip->GetComposition(m_pContext);
 
+        // If this is a composition-only session that was unfocused / context-switched / deactivated
+        // while queued in TF_S_ASYNC, do not start or leave an active composition or resurrect UI!
+        if (!m_hasCommit && m_hasComp && m_generation != 0 &&
+            m_pTip->ShouldTerminateAfterEdit(m_contextId, m_generation)) {
+            hideOwnedWindow();
+            if (pComp) {
+                ITfRange* pRange = nullptr;
+                hr = pComp->GetRange(&pRange);
+                if (SUCCEEDED(hr) && pRange) {
+                    hr = pRange->SetText(ec, 0, L"", 0);
+                    pRange->Release();
+                }
+                if (SUCCEEDED(hr)) {
+                    hr = pComp->EndComposition(ec);
+                }
+                pContextComp->Release();
+                if (SUCCEEDED(hr)) {
+                    m_pTip->SetComposition(nullptr, nullptr, CompositionState::None);
+                    m_result = EditSessionResult::Success;
+                    m_finalHr = S_OK;
+                    return S_OK;
+                } else {
+                    m_result = EditSessionResult::Unmodified;
+                    m_finalHr = hr;
+                    return hr;
+                }
+            } else {
+                pContextComp->Release();
+                m_result = EditSessionResult::Success;
+                m_finalHr = S_OK;
+                return S_OK;
+            }
+        }
+
         // 1. Commit Phase
         if (m_hasCommit && !m_commitText.empty()) {
-            if (m_pCandWnd) m_pCandWnd->Hide();
+            hideOwnedWindow();
 
             if (pComp) {
                 ITfRange* pRange = nullptr;
@@ -281,7 +347,7 @@ public:
         // 2. Composition Phase
         if (m_hasComp) {
             if (m_compText.empty()) {
-                if (m_pCandWnd) m_pCandWnd->Hide();
+                hideOwnedWindow();
                 if (pComp) {
                     ITfRange* pRange = nullptr;
                     hr = pComp->GetRange(&pRange);
@@ -381,26 +447,34 @@ public:
                     hrSelection = m_pContext->SetSelection(ec, 1, &sel);
                 }
 
-                // Locate Caret and display candidate window
-                if (!m_candidates.empty() && m_pCandWnd) {
+                // Locate Caret and display candidate window only if this context is still focused and current
+                bool canShowUI = (m_generation == 0) ||
+                                 (m_pTip && m_pTip->CanShowCandidateWindow(m_contextId, m_generation));
+                if (!m_candidates.empty() && m_pCandWnd && canShowUI) {
                     ITfContextView* pView = nullptr;
-                    if (SUCCEEDED(m_pContext->GetActiveView(&pView)) && pView) {
+                    HRESULT hrView = m_pContext->GetActiveView(&pView);
+                    if (SUCCEEDED(hrView) && pView) {
                         RECT rc{};
                         BOOL fClipped = FALSE;
                         if (SUCCEEDED(pView->GetTextExt(ec, pRange, &rc, &fClipped))) {
                             if (rc.right >= rc.left && rc.bottom > rc.top) {
                                 POINT pt = { rc.left, rc.bottom + 2 };
-                                m_pCandWnd->Show(m_candidates, pt);
+                                m_pCandWnd->Show(m_snapshot, pt);
                             } else {
-                                m_pCandWnd->Hide();
+                                hideOwnedWindow();
                             }
                         } else {
-                            m_pCandWnd->Hide();
+                            hideOwnedWindow();
                         }
                         pView->Release();
+                    } else if (hrView == E_NOTIMPL) {
+                        POINT pt = { 100, 100 };
+                        m_pCandWnd->Show(m_snapshot, pt);
+                    } else {
+                        hideOwnedWindow();
                     }
-                } else if (m_pCandWnd) {
-                    m_pCandWnd->Hide();
+                } else {
+                    hideOwnedWindow();
                 }
 
                 pRange->Release();
@@ -434,6 +508,10 @@ private:
     bool m_hasCommit = false;
     std::wstring m_commitText;
     std::vector<std::wstring> m_candidates;
+    uint64_t m_contextId = 0;
+    uint64_t m_generation = 0;
+    CandidateDisplaySnapshot m_snapshot;
+    bool m_executed = false;
     EditSessionResult m_result = EditSessionResult::Unmodified;
     HRESULT m_finalHr = S_OK;
 };

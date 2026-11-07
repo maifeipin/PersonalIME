@@ -14,6 +14,14 @@ enum class CompositionState {
     CommitPendingEnd  // Text was written to document, but EndComposition failed
 };
 
+// Outcome of an edit session to govern key consumption and server synchronization
+enum class EditSessionResult {
+    Unmodified,        // Host text was not touched by this session (SetText failed or not reached). Safe to rollback server & pass key (*pfEaten = FALSE).
+    PartiallyModified, // THIS session modified host text by SetText, but tail operation (SetSelection/EndComposition) failed. Must eat key (*pfEaten = TRUE), do NOT rollback server.
+    RecoveryBlocked,   // Previous commit could not be ended, so THIS session could not execute. Current request text was NOT touched. Must NOT eat key (*pfEaten = FALSE), and MUST rollback server for current key!
+    Success            // All operations succeeded. (*pfEaten = TRUE).
+};
+
 class CTextInputProcessor : 
     public ITfTextInputProcessor,
     public ITfKeyEventSink,
@@ -119,6 +127,97 @@ public:
     void OnTerminationSessionCompleted(uint64_t contextId, ITfComposition* pComp, uint64_t generation, HRESULT hr);
     void OnTerminationSessionRequestFailed(uint64_t contextId, ITfComposition* pComp, uint64_t generation, HRESULT hr);
 
+    enum class PendingEditStatus {
+        PendingSync,
+        QueuedAsync
+    };
+
+    struct PendingEditSession {
+        uint64_t contextId = 0;
+        ITfContext* pContext = nullptr; // Strong reference!
+        uint64_t generation = 0;
+        bool hasComposition = false;
+        std::wstring composition;
+        bool hasCommit = false;
+        std::wstring commitText;
+        uint64_t commitEventId = 0;
+        CandidateDisplaySnapshot displaySnapshot;
+        PendingEditStatus status = PendingEditStatus::PendingSync;
+        bool uiSuppressed = false;
+        bool terminateAfterEdit = false;
+        bool completed = false;
+        EditSessionResult finalResult = EditSessionResult::Unmodified;
+        HRESULT finalHr = S_OK;
+
+        PendingEditSession() = default;
+        PendingEditSession(uint64_t ctxId, ITfContext* ctx, uint64_t gen,
+                           bool hasComp, const std::wstring& comp,
+                           bool hasCom, const std::wstring& comText, uint64_t comEvId,
+                           const CandidateDisplaySnapshot& snap,
+                           PendingEditStatus st)
+            : contextId(ctxId), pContext(ctx), generation(gen),
+              hasComposition(hasComp), composition(comp),
+              hasCommit(hasCom), commitText(comText), commitEventId(comEvId),
+              displaySnapshot(snap), status(st) {
+            if (pContext) pContext->AddRef();
+        }
+
+        ~PendingEditSession() {
+            if (pContext) { pContext->Release(); pContext = nullptr; }
+        }
+
+        PendingEditSession(const PendingEditSession& o)
+            : contextId(o.contextId), pContext(o.pContext), generation(o.generation),
+              hasComposition(o.hasComposition), composition(o.composition),
+              hasCommit(o.hasCommit), commitText(o.commitText), commitEventId(o.commitEventId),
+              displaySnapshot(o.displaySnapshot), status(o.status),
+              uiSuppressed(o.uiSuppressed), terminateAfterEdit(o.terminateAfterEdit),
+              completed(o.completed), finalResult(o.finalResult), finalHr(o.finalHr) {
+            if (pContext) pContext->AddRef();
+        }
+
+        PendingEditSession& operator=(const PendingEditSession& o) {
+            if (this != &o) {
+                if (pContext) pContext->Release();
+                contextId = o.contextId;
+                pContext = o.pContext;
+                generation = o.generation;
+                hasComposition = o.hasComposition;
+                composition = o.composition;
+                hasCommit = o.hasCommit;
+                commitText = o.commitText;
+                commitEventId = o.commitEventId;
+                displaySnapshot = o.displaySnapshot;
+                status = o.status;
+                uiSuppressed = o.uiSuppressed;
+                terminateAfterEdit = o.terminateAfterEdit;
+                completed = o.completed;
+                finalResult = o.finalResult;
+                finalHr = o.finalHr;
+                if (pContext) pContext->AddRef();
+            }
+            return *this;
+        }
+    };
+
+    const std::vector<PendingEditSession>& GetPendingEditSessions() const { return m_pendingEditSessions; }
+    size_t GetPendingEditSessionCount() const;
+    bool HasPendingEditSession(uint64_t contextId) const;
+    bool HasQueuedEditSession(uint64_t contextId) const;
+    bool IsEditSessionUiSuppressed(uint64_t contextId, uint64_t generation) const;
+    bool ShouldTerminateAfterEdit(uint64_t contextId, uint64_t generation) const;
+    bool CanShowCandidateWindow(uint64_t contextId, uint64_t generation) const;
+    void HideCandidateWindowIfOwnedBy(uint64_t contextId);
+    void SuppressQueuedEditSessionsForContext(uint64_t contextId, bool terminateAfter);
+    void SuppressAllQueuedEditSessions(bool terminateAfter);
+    void OnEditSessionCompleted(uint64_t contextId, uint64_t generation, EditSessionResult result, HRESULT hrFinal);
+    bool IsDisplayedSnapshotValid(const CandidateDisplaySnapshot& snap, ITfContext* expectedContext = nullptr) const;
+    bool SubmitCandidateSelectionFromSnapshot(const CandidateDisplaySnapshot& snap, int index);
+    bool SubmitPageScrollFromSnapshot(const CandidateDisplaySnapshot& snap, bool nextPage);
+
+    CCandidateWindow& GetCandidateWindowForTest() { return m_candidateWindow; }
+    uint64_t GetSessionIdForTest() const { return m_sessionId; }
+
     void SetClientIdForTest(TfClientId id) { m_tfClientId = id; }
     IpcClient& GetIpcClient() { return m_ipcClient; }
 
@@ -173,6 +272,9 @@ private:
     uint64_t m_sessionId = 0;
     uint64_t m_activeContextId = 0;
     uint64_t m_terminationGeneration = 0;
+    uint64_t m_editSessionGeneration = 0;
+    bool m_hasFocus = true;
+    bool m_isDeactivated = false;
     ITfThreadMgr* m_pThreadMgr = nullptr;
     TfClientId m_tfClientId = TF_CLIENTID_NULL;
 
@@ -185,6 +287,9 @@ private:
     // Retained pending terminations across contexts - preserves identity and prevents zombie overwrites
     std::vector<PendingTermination> m_pendingTerminations;
 
+    // Retained pending edit sessions across contexts (for TF_S_ASYNC deferred execution)
+    std::vector<PendingEditSession> m_pendingEditSessions;
+
     // Per-instance Candidate Window
     CCandidateWindow m_candidateWindow;
 
@@ -193,8 +298,14 @@ private:
 
     // Context-isolated candidate snapshot versions
     std::map<uint64_t, uint32_t> m_contextCandidateVersions;
+    std::map<uint64_t, uint32_t> m_latestServerCandidateVersions;
+    std::map<uint64_t, uint32_t> m_contextPageIndices;
+    std::map<uint64_t, uint32_t> m_contextPageCounts;
     uint32_t m_currentPageIndex = 0;
     uint32_t m_currentPageCount = 0;
+
+    bool ProcessKeyInternal(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten,
+                            bool hasExplicitVersion, uint32_t explicitCandidateVersion);
 
     // Taskbar Tray / Language Bar button
     class CLangBarItemButton* m_pLangBarButton = nullptr;

@@ -651,10 +651,16 @@ void HandleClient(HANDLE hPipe) {
             }
 
             // All validations passed: apply changes atomically
+            bool switching_to_english = (state.is_chinese && !new_is_chinese);
             bool mode_or_scheme_changed = (state.is_chinese != new_is_chinese ||
                                            state.scheme != new_scheme ||
                                            state.full_width != new_full_width ||
                                            state.chinese_punctuation != new_chinese_punct);
+
+            if (switching_to_english && !state.composition.empty()) {
+                SafeCopyCommitText(resp, state.composition);
+                resp.commit_event_id = 0;
+            }
 
             state.is_chinese = new_is_chinese;
             state.full_width = new_full_width;
@@ -834,6 +840,9 @@ void HandleClient(HANDLE hPipe) {
             else if ((mods & 1) && vk == VK_SPACE) {
                 resp.handled = 1; // Shift + Space (Full/Half width)
             }
+            else if (vk == VK_CAPITAL && (mods & ~1u) == 0) {
+                resp.handled = 1; // CapsLock (Switch Chinese / English)
+            }
             else if (vk == VK_SHIFT) {
                 // Standalone Shift down: DO NOT eat in TestKeyDown so host key state machine is intact
                 resp.handled = 0;
@@ -908,12 +917,31 @@ void HandleClient(HANDLE hPipe) {
                 resp.handled = 1;
             }
             else if ((mods & 2) && vk == VK_SPACE) {
-                // Ctrl + Space: toggle Chinese / English
+                // Ctrl + Space: toggle Chinese / English (commit uncommitted raw composition when switching to English)
+                if (state.is_chinese && !state.composition.empty()) {
+                    SafeCopyCommitText(resp, state.composition);
+                    resp.commit_event_id = 0;
+                }
                 state.is_chinese = !state.is_chinese;
                 ResetContextCompositionAndState(state);
                 resp.status_flags = ComputeModeFlags(state);
                 resp.has_composition = 1;
                 resp.composition[0] = L'\0';
+                resp.candidate_count = 0;
+                resp.handled = 1;
+            }
+            else if (vk == VK_CAPITAL && (mods & ~1u) == 0) {
+                // CapsLock: switch to English (committing any uncommitted raw composition) or toggle back to Chinese
+                if (state.is_chinese && !state.composition.empty()) {
+                    SafeCopyCommitText(resp, state.composition);
+                    resp.commit_event_id = 0;
+                }
+                state.is_chinese = !state.is_chinese;
+                ResetContextCompositionAndState(state);
+                resp.status_flags = ComputeModeFlags(state);
+                resp.has_composition = 1;
+                resp.composition[0] = L'\0';
+                resp.candidate_count = 0;
                 resp.handled = 1;
             }
             else if (vk == VK_SHIFT && mods == 1) {

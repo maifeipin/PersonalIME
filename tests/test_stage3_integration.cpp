@@ -712,6 +712,44 @@ int main(int argc, char* argv[]) {
         req.vk_code = VK_ESCAPE;
         client.SendRequest(req, resp, 80);
 
+        // 2b. CapsLock (VK_CAPITAL) and Ctrl+Space switching to English commits uncommitted raw composition!
+        req.modifiers = 0;
+        req.vk_code = 'H'; client.SendRequest(req, resp, 80);
+        req.vk_code = 'I'; client.SendRequest(req, resp, 80);
+        CHECK_TRUE(wcscmp(resp.composition, L"hi") == 0, L"Composition is 'hi'");
+
+        // TestKeyDown for VK_CAPITAL must be handled
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
+        req.vk_code = VK_CAPITAL;
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"VK_CAPITAL TestKeyDown must be handled");
+
+        // KeyDown for VK_CAPITAL switches to English and commits raw 'hi'
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"VK_CAPITAL KeyDown must be handled");
+        CHECK_EQUAL(resp.has_commit, 1, L"VK_CAPITAL with active composition must commit raw composition");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"hi") == 0, L"VK_CAPITAL must commit 'hi'");
+        CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition cleared after committing raw input");
+        CHECK_EQUAL(resp.status_flags & IPC_MODE_CHINESE, 0u, L"Context switched to English mode on CapsLock");
+
+        // Press VK_CAPITAL again to return to Chinese mode
+        client.SendRequest(req, resp, 80);
+        CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Second VK_CAPITAL returns to Chinese mode");
+
+        // Type 'ok' and press Ctrl+Space -> commits 'ok' and switches to English
+        req.vk_code = 'O'; client.SendRequest(req, resp, 80);
+        req.vk_code = 'K'; client.SendRequest(req, resp, 80);
+        CHECK_TRUE(wcscmp(resp.composition, L"ok") == 0, L"Composition is 'ok'");
+        req.vk_code = VK_SPACE;
+        req.modifiers = 2; // Ctrl+Space
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"Ctrl+Space handled");
+        CHECK_EQUAL(resp.has_commit, 1, L"Ctrl+Space with active composition must commit raw 'ok'");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"ok") == 0, L"Ctrl+Space committed 'ok'");
+        CHECK_EQUAL(resp.status_flags & IPC_MODE_CHINESE, 0u, L"Ctrl+Space switched to English mode");
+        req.modifiers = 0;
+
         // 3. Full-width digit handling
         client.SetMode(100, ctx, IPC_MODE_FULL_WIDTH);
         req.vk_code = '1';

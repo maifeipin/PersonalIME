@@ -1253,6 +1253,635 @@ int TestDeactivateFailureRemainsRecoverable() {
     return 0;
 }
 
+// Stateful Mock IPC Server supporting candidate snapshots, commits, CommitSuccess/CommitCancel, and paging
+class SnapshotMockIpcServer {
+public:
+    std::wstring m_pipeName;
+    HANDLE m_hStopEvent = nullptr;
+    std::vector<HANDLE> m_threads;
+    std::vector<HANDLE> m_pipes;
+    CRITICAL_SECTION m_cs;
+    std::atomic<bool> m_running{false};
+    std::atomic<int> m_instancesReady{0};
+
+    struct ContextMockState {
+        std::wstring composition;
+        std::wstring prev_composition;
+        uint32_t candidate_version = 0;
+        uint32_t page_index = 0;
+        uint32_t page_count = 1;
+        std::vector<std::wstring> candidates;
+    };
+
+    struct PendingCommitRecord {
+        uint64_t session_id = 0;
+        uint64_t context_id = 0;
+        std::wstring text;
+        std::wstring comp_before;
+        uint32_t page_before = 0;
+        std::vector<std::wstring> cands_before;
+        int state = 0; // 0 = Pending, 1 = Recorded (Success), 2 = Cancelled
+    };
+
+    std::map<uint64_t, ContextMockState> m_ctxStates;
+    std::map<uint64_t, PendingCommitRecord> m_pendingCommits;
+    uint64_t m_nextEventId = 5000;
+    std::atomic<int> m_commitSuccessCount{0};
+    std::atomic<int> m_commitCancelCount{0};
+    std::atomic<int> m_learnedCount{0};
+    std::atomic<int> m_resetCount{0};
+    std::atomic<uint32_t> m_lastSelectVersion{0};
+    std::wstring m_lastSelectedText;
+
+    SnapshotMockIpcServer(const std::wstring& pipeName) : m_pipeName(pipeName) {
+        m_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        InitializeCriticalSection(&m_cs);
+    }
+
+    ~SnapshotMockIpcServer() {
+        Stop();
+        DeleteCriticalSection(&m_cs);
+        if (m_hStopEvent) CloseHandle(m_hStopEvent);
+    }
+
+    bool Start(int numInstances = 2) {
+        m_running.store(true);
+        m_instancesReady.store(0);
+        for (int i = 0; i < numInstances; ++i) {
+            HANDLE hThread = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
+            if (hThread) m_threads.push_back(hThread);
+        }
+        while (m_instancesReady.load() < numInstances) Sleep(5);
+        return !m_threads.empty();
+    }
+
+    void Stop() {
+        if (m_running.exchange(false)) {
+            SetEvent(m_hStopEvent);
+            EnterCriticalSection(&m_cs);
+            for (HANDLE h : m_pipes) {
+                if (h != INVALID_HANDLE_VALUE) CancelIoEx(h, nullptr);
+            }
+            LeaveCriticalSection(&m_cs);
+            for (HANDLE h : m_threads) {
+                WaitForSingleObject(h, INFINITE);
+                CloseHandle(h);
+            }
+            m_threads.clear();
+            EnterCriticalSection(&m_cs);
+            for (HANDLE h : m_pipes) {
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            }
+            m_pipes.clear();
+            LeaveCriticalSection(&m_cs);
+        }
+    }
+
+    int GetPendingCommitState(uint64_t evId) {
+        EnterCriticalSection(&m_cs);
+        int st = -1;
+        auto it = m_pendingCommits.find(evId);
+        if (it != m_pendingCommits.end()) st = it->second.state;
+        LeaveCriticalSection(&m_cs);
+        return st;
+    }
+
+    static void FillCandidates(IpcKeyResponse& resp, const ContextMockState& st) {
+        resp.has_composition = 1;
+        wcsncpy_s(resp.composition, st.composition.c_str(), _TRUNCATE);
+        resp.candidate_version = st.candidate_version;
+        resp.page_index = st.page_index;
+        resp.page_count = st.page_count;
+        resp.candidate_count = static_cast<uint32_t>((std::min)(st.candidates.size(), size_t(9)));
+        for (uint32_t i = 0; i < resp.candidate_count; ++i) {
+            std::wstring label = std::to_wstring(i + 1) + L". " + st.candidates[i];
+            wcsncpy_s(resp.candidates[i], label.c_str(), _TRUNCATE);
+        }
+    }
+
+    static DWORD WINAPI ThreadProc(LPVOID lpParam) {
+        auto* pThis = static_cast<SnapshotMockIpcServer*>(lpParam);
+        while (pThis->m_running.load()) {
+            HANDLE hPipe = CreateNamedPipeW(
+                pThis->m_pipeName.c_str(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                16384, 16384, 0, nullptr);
+            if (hPipe == INVALID_HANDLE_VALUE) {
+                Sleep(10);
+                continue;
+            }
+            EnterCriticalSection(&pThis->m_cs);
+            pThis->m_pipes.push_back(hPipe);
+            LeaveCriticalSection(&pThis->m_cs);
+            pThis->m_instancesReady.fetch_add(1);
+
+            OVERLAPPED ovConnect{};
+            ovConnect.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!ConnectNamedPipe(hPipe, &ovConnect)) {
+                DWORD err = GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    HANDLE handles[2] = { ovConnect.hEvent, pThis->m_hStopEvent };
+                    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) {
+                        CloseHandle(ovConnect.hEvent);
+                        break;
+                    }
+                } else if (err != ERROR_PIPE_CONNECTED) {
+                    CloseHandle(ovConnect.hEvent);
+                    continue;
+                }
+            }
+            CloseHandle(ovConnect.hEvent);
+
+            while (pThis->m_running.load()) {
+                IpcKeyRequest req{};
+                DWORD bytesRead = 0;
+                OVERLAPPED ovRead{};
+                ovRead.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                BOOL okRead = ReadFile(hPipe, &req, sizeof(req), &bytesRead, &ovRead);
+                if (!okRead && GetLastError() == ERROR_IO_PENDING) {
+                    HANDLE handles[2] = { ovRead.hEvent, pThis->m_hStopEvent };
+                    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) {
+                        CloseHandle(ovRead.hEvent);
+                        break;
+                    }
+                    GetOverlappedResult(hPipe, &ovRead, &bytesRead, FALSE);
+                }
+                CloseHandle(ovRead.hEvent);
+                if (bytesRead != sizeof(req)) break;
+
+                IpcKeyResponse resp{};
+                resp.msg_type = req.msg_type;
+                resp.session_id = req.session_id;
+                resp.context_id = req.context_id;
+                resp.protocol_version = req.protocol_version;
+                resp.handled = 1;
+
+                EnterCriticalSection(&pThis->m_cs);
+                auto& st = pThis->m_ctxStates[req.context_id];
+                if (req.msg_type == static_cast<uint32_t>(IpcMsgType::KeyDown)) {
+                    uint32_t vk = req.vk_code;
+                    if (vk >= 'A' && vk <= 'Z') {
+                        st.prev_composition = st.composition;
+                        st.composition.push_back(static_cast<wchar_t>(L'a' + (vk - 'A')));
+                        st.candidate_version++;
+                        st.page_index = 0;
+                        if (vk == 'A') {
+                            st.page_count = 2;
+                            st.candidates = { L"工", L"戈", L"阿", L"啊", L"呵" };
+                        } else if (vk == 'B') {
+                            st.page_count = 1;
+                            st.candidates = { L"节", L"芭", L"吧" };
+                        } else {
+                            st.page_count = 1;
+                            st.candidates = { L"华", L"花", L"化" };
+                        }
+                        FillCandidates(resp, st);
+                    } else if (vk == VK_NEXT) {
+                        if (req.candidate_version != st.candidate_version) {
+                            resp.handled = 0;
+                        } else {
+                            st.page_index = 1;
+                            st.candidate_version++;
+                            st.candidates = { L"腌", L"锕", L"錒" };
+                            FillCandidates(resp, st);
+                        }
+                    } else if (vk == VK_PRIOR) {
+                        if (req.candidate_version != st.candidate_version) {
+                            resp.handled = 0;
+                        } else {
+                            st.page_index = 0;
+                            st.candidate_version++;
+                            st.candidates = { L"工", L"戈", L"阿", L"啊", L"呵" };
+                            FillCandidates(resp, st);
+                        }
+                    } else if (vk == VK_SPACE || (vk >= '1' && vk <= '9')) {
+                        pThis->m_lastSelectVersion.store(req.candidate_version);
+                        if (st.candidates.empty() || req.candidate_version != st.candidate_version) {
+                            resp.handled = 0;
+                        } else {
+                            size_t idx = (vk == VK_SPACE) ? 0 : static_cast<size_t>(vk - '1');
+                            if (idx < st.candidates.size()) {
+                                uint64_t evId = ++pThis->m_nextEventId;
+                                PendingCommitRecord rec{};
+                                rec.session_id = req.session_id;
+                                rec.context_id = req.context_id;
+                                rec.text = st.candidates[idx];
+                                rec.comp_before = st.composition;
+                                rec.page_before = st.page_index;
+                                rec.cands_before = st.candidates;
+                                rec.state = 0; // Pending
+                                pThis->m_pendingCommits[evId] = rec;
+                                pThis->m_lastSelectedText = rec.text;
+
+                                resp.has_commit = 1;
+                                wcsncpy_s(resp.commit_text, rec.text.c_str(), _TRUNCATE);
+                                resp.commit_length = static_cast<uint32_t>(rec.text.length());
+                                resp.commit_event_id = evId;
+                                resp.has_composition = 1;
+                                resp.composition[0] = L'\0';
+                                resp.candidate_count = 0;
+
+                                st.composition.clear();
+                                st.candidates.clear();
+                            } else {
+                                resp.handled = 0;
+                            }
+                        }
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitSuccess)) {
+                    auto it = pThis->m_pendingCommits.find(req.event_id);
+                    if (it != pThis->m_pendingCommits.end() &&
+                        it->second.session_id == req.session_id &&
+                        it->second.context_id == req.context_id &&
+                        it->second.state != 2) {
+                        if (it->second.state == 0) {
+                            it->second.state = 1;
+                            pThis->m_commitSuccessCount.fetch_add(1);
+                            pThis->m_learnedCount.fetch_add(1);
+                        }
+                        resp.handled = 1;
+                    } else {
+                        resp.handled = 0;
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitCancel)) {
+                    auto it = pThis->m_pendingCommits.find(req.event_id);
+                    if (it != pThis->m_pendingCommits.end() &&
+                        it->second.session_id == req.session_id &&
+                        it->second.context_id == req.context_id &&
+                        it->second.state == 0) {
+                        it->second.state = 2;
+                        pThis->m_commitCancelCount.fetch_add(1);
+                        st.composition = it->second.comp_before;
+                        st.page_index = it->second.page_before;
+                        st.candidates = it->second.cands_before;
+                        st.candidate_version++;
+                        FillCandidates(resp, st);
+                        resp.handled = 1;
+                    } else {
+                        resp.handled = 0;
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Rollback)) {
+                    st.composition = st.prev_composition;
+                    if (!st.composition.empty()) {
+                        st.candidate_version++;
+                        FillCandidates(resp, st);
+                    } else {
+                        st.candidates.clear();
+                        resp.has_composition = 0;
+                        resp.candidate_count = 0;
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Reset)) {
+                    pThis->m_resetCount.fetch_add(1);
+                    st.composition.clear();
+                    st.candidates.clear();
+                    resp.has_composition = 1;
+                    resp.composition[0] = L'\0';
+                }
+                LeaveCriticalSection(&pThis->m_cs);
+
+                DWORD written = 0;
+                OVERLAPPED ovWrite{};
+                ovWrite.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                BOOL okWrite = WriteFile(hPipe, &resp, sizeof(resp), &written, &ovWrite);
+                if (!okWrite && GetLastError() == ERROR_IO_PENDING) {
+                    WaitForSingleObject(ovWrite.hEvent, INFINITE);
+                }
+                CloseHandle(ovWrite.hEvent);
+            }
+            DisconnectNamedPipe(hPipe);
+        }
+        return 0;
+    }
+};
+
+// Test 16: P1 #1 - TF_S_ASYNC Deferred EditSession Lifecycle & Receipt / Pending Verification
+int TestAsyncQueuedEditSessionCommitAndFailureMatrix() {
+    std::wcout << L"[TEST] Testing TF_S_ASYNC Deferred EditSession Lifecycle & Receipt Matrix (P1-Async)..." << std::endl;
+
+    const std::wstring pipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_AsyncEdit_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(pipeName);
+    CHECK_TRUE(server.Start(2), L"SnapshotMockIpcServer must start");
+    IpcClient::SetPipeNameForTest(pipeName.c_str());
+
+    // 1. Sync Blocked -> Async Queued (TF_S_ASYNC) -> Unexecuted has NO ACK / NO Learning -> Execute Success
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        auto* comp = new LifecyclePersistentComposition();
+
+        // Step 1a: Type 'A' synchronously to establish composition "a" and candidates (ver=1)
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Sync key 'A' eaten");
+        // Attach persistent composition so we can inspect range text after commit
+        tip.SetComposition(comp, &ctx, CompositionState::Composing);
+        comp->range->m_text = L"a";
+
+        // Step 1b: Force sync failure -> async deferral for Space commit
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        int learnedBefore = server.m_learnedCount.load();
+        int successBefore = server.m_commitSuccessCount.load();
+
+        BOOL eatenSpace = FALSE;
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eatenSpace);
+        CHECK_EQUAL(eatenSpace, TRUE, L"Queued async commit key is eaten on submission");
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 1, L"Must have 1 queued pending edit session");
+        CHECK_TRUE(tip.HasQueuedEditSession(reinterpret_cast<uint64_t>(&ctx)), L"Context must report HasQueuedEditSession=true");
+
+        uint64_t evId = tip.GetPendingEditSessions()[0].commitEventId;
+        CHECK_TRUE(evId != 0, L"Queued commit must have valid commitEventId");
+
+        // CRITICAL P1 ASSERTIONS BEFORE EXECUTION:
+        // Host text has NOT been written yet; NO CommitSuccess ACK; NO learning; server pending is still Pending (0)!
+        CHECK_EQUAL(comp->range->m_text, L"a", L"Host range text must still be 'a' before deferred DoEditSession runs");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"MUST have 0 CommitSuccess ACK while TF_S_ASYNC is only queued!");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"MUST have 0 learning while TF_S_ASYNC is only queued!");
+        CHECK_EQUAL(server.GetPendingCommitState(evId), 0, L"Server event must remain Pending (0) while queued");
+
+        // While queued, subsequent keystroke on same context must NOT overlap or replace m_pDeferredSession
+        BOOL eatenNext = TRUE;
+        tip.OnKeyDown(&ctx, 'B', 0, &eatenNext);
+        CHECK_EQUAL(eatenNext, FALSE, L"Subsequent keystroke while queued must not be eaten or overlap");
+        CHECK_EQUAL(ctx.m_asyncRequestCount, 1, L"Only 1 async session requested (no overlap)");
+
+        // Step 1c: Now host executes the deferred edit session -> Success!
+        ITfEditSession* rawSession = ctx.m_pDeferredSession;
+        rawSession->AddRef();
+        ctx.ExecuteDeferredSession();
+
+        CHECK_EQUAL(comp->range->m_text, L"工", L"Host range text must now be '工' after DoEditSession executes");
+        CHECK_EQUAL(comp->m_endCompositionCalled, true, L"EndComposition called on commit");
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 0, L"Pending edit session cleared on completion");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore + 1, L"CommitSuccess sent exactly once after actual DoEditSession execution");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore + 1, L"Learning recorded after actual DoEditSession execution");
+        CHECK_EQUAL(server.GetPendingCommitState(evId), 1, L"Server event state is now Recorded (1)");
+
+        // Duplicate DoEditSession execution on the same session must be a strict no-op (single terminal state)
+        rawSession->DoEditSession(1001);
+        rawSession->Release();
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore + 1, L"Duplicate DoEditSession must NOT send duplicate CommitSuccess");
+
+        comp->Release();
+        tip.Deactivate();
+    }
+
+    // 2. Sync Blocked -> Async Queued -> Deferred SetText Fails (Unmodified) -> CommitCancel & Composition Restored
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        auto* comp = new LifecyclePersistentComposition();
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        tip.SetComposition(comp, &ctx, CompositionState::Composing);
+        comp->range->m_text = L"a";
+
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        int learnedBefore = server.m_learnedCount.load();
+        int cancelBefore = server.m_commitCancelCount.load();
+
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        uint64_t evId = tip.GetPendingEditSessions()[0].commitEventId;
+        CHECK_EQUAL(server.GetPendingCommitState(evId), 0, L"Server event is Pending before execution");
+
+        // Inject SetText failure when deferred session executes!
+        g_failSetText = true;
+        ctx.ExecuteDeferredSession();
+        g_failSetText = false;
+
+        CHECK_EQUAL(comp->range->m_text, L"a", L"Host text untouched on SetText failure");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"Failed async SetText must NEVER learn!");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"Failed async SetText must send CommitCancel!");
+        CHECK_EQUAL(server.GetPendingCommitState(evId), 2, L"Server event state must be Cancelled (2)");
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 0, L"Pending edit session removed after failure handling");
+
+        // And because CommitCancel synchronized the restored candidate version, immediate retry when lock clears succeeds!
+        ctx.m_forceSyncBlocked = false;
+        ctx.m_deferAsyncSession = false;
+        BOOL eatenRetry = FALSE;
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eatenRetry);
+        CHECK_EQUAL(eatenRetry, TRUE, L"Immediate retry after async CommitCancel snapshot sync must succeed");
+        CHECK_EQUAL(comp->range->m_text, L"工", L"Retry committed '工'");
+
+        comp->Release();
+        tip.Deactivate();
+    }
+
+    // 3. Sync Blocked -> Async Queued -> Deferred EndComposition Fails (PartiallyModified)
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        auto* comp = new LifecyclePersistentComposition();
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        tip.SetComposition(comp, &ctx, CompositionState::Composing);
+        comp->range->m_text = L"a";
+
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        int successBefore = server.m_commitSuccessCount.load();
+
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        uint64_t evId = tip.GetPendingEditSessions()[0].commitEventId;
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"No CommitSuccess before execution");
+
+        g_failEndComposition = true;
+        ctx.ExecuteDeferredSession();
+        g_failEndComposition = false;
+
+        CHECK_EQUAL(comp->range->m_text, L"工", L"SetText modified host text to '工'");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore + 1, L"PartiallyModified confirms commit because text is on host");
+        CHECK_EQUAL(server.GetPendingCommitState(evId), 1, L"Server event is Recorded");
+        CHECK_TRUE(tip.GetCompositionState(&ctx) == CompositionState::CommitPendingEnd, L"State marked CommitPendingEnd for recovery");
+
+        tip.SetComposition(nullptr, nullptr);
+        comp->Release();
+        tip.Deactivate();
+    }
+
+    // 4. Sync Blocked -> Async Queued -> Unfocus / Context Switch BEFORE execution (No UI Resurrection!)
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctxA;
+        MockContext ctxB;
+
+        // Queue async composition 'A' on ctxA
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        BOOL eatenA = FALSE;
+        tip.OnKeyDown(&ctxA, 'A', 0, &eatenA);
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 1, L"ctxA has 1 queued composition session");
+
+        // Switch to ctxB synchronously and type 'B' -> candidate window now shows ctxB's candidates!
+        BOOL eatenB = FALSE;
+        tip.OnKeyDown(&ctxB, 'B', 0, &eatenB);
+        CHECK_EQUAL(eatenB, TRUE, L"ctxB key 'B' handled");
+        CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()), TRUE, L"Candidate window visible for ctxB");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetSnapshot().context_id, reinterpret_cast<uint64_t>(&ctxB), L"Window belongs to ctxB");
+
+        int resetBefore = server.m_resetCount.load();
+        // Now ctxA's late async session executes! It MUST NOT resurrect ctxA's UI or hide ctxB's active window!
+        ctxA.ExecuteDeferredSession();
+        CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()), TRUE, L"ctxB candidate window must remain visible");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetSnapshot().context_id, reinterpret_cast<uint64_t>(&ctxB), L"Window still belongs to ctxB, not resurrected by ctxA!");
+        CHECK_TRUE(server.m_resetCount.load() > resetBefore, L"ctxA server state was cleanly reset after aborted async composition");
+
+        // Now queue an async session on ctxB, then call OnSetFocus(FALSE) before it executes!
+        ctxB.m_forceSyncBlocked = true;
+        ctxB.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctxB, 'A', 0, &eatenB);
+        tip.OnSetFocus(FALSE);
+        CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()), FALSE, L"Window hidden on OnSetFocus(FALSE)");
+
+        // Late execution after OnSetFocus(FALSE) must NOT resurrect candidate window!
+        ctxB.ExecuteDeferredSession();
+        CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()), FALSE, L"Late async session after focus loss must NEVER resurrect candidate window!");
+
+        tip.Deactivate();
+    }
+
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] TF_S_ASYNC deferred EditSession lifecycle, receipts, failure rollback & focus safety verified!" << std::endl;
+    return 0;
+}
+
+// Test 17: P1 #2 - Snapshot-Bound Mouse Selection, Press-to-Release Mutation, Cross-Context & Late Paging
+int TestSnapshotBoundMouseSelectionAndLatePaging() {
+    std::wcout << L"[TEST] Testing Snapshot-Bound Mouse Selection, Cross-Context & Late Paging (P1-Snapshot)..." << std::endl;
+
+    const std::wstring pipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_SnapMouse_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(pipeName);
+    CHECK_TRUE(server.Start(2), L"SnapshotMockIpcServer must start");
+    IpcClient::SetPipeNameForTest(pipeName.c_str());
+
+    CTextInputProcessor tip;
+    tip.SetClientIdForTest(1);
+    MockContext ctxA;
+    MockContext ctxB;
+    CCandidateWindow& wnd = tip.GetCandidateWindowForTest();
+
+    // 1. Old page displayed while new result is queued asynchronously (TF_S_ASYNC): stale click rejected!
+    {
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctxA, 'A', 0, &eaten); // Displays version 1: "1. 工", "2. 戈", ...
+        SendMessageW(wnd.GetHwnd(), WM_PAINT, 0, 0);
+        uint32_t ver1 = wnd.GetSnapshot().candidate_version;
+        CHECK_TRUE(ver1 > 0, L"Initial snapshot version > 0");
+        CHECK_EQUAL(wnd.GetSnapshot().context_id, reinterpret_cast<uint64_t>(&ctxA), L"Snapshot bound to ctxA");
+
+        // Queue 'B' asynchronously on ctxA: server advances to version 2 ("1. 节", "2. 芭"),
+        // while wnd still displays version 1!
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctxA, 'B', 0, &eaten);
+        CHECK_EQUAL(wnd.GetSnapshot().candidate_version, ver1, L"Window still displays old version 1 while version 2 is queued");
+
+        // User clicks candidate 1 ("2. 戈" on screen) while version 2 is queued!
+        // MUST BE REJECTED: must NOT commit version 2's candidate 1 ("芭")!
+        int successBefore = server.m_commitSuccessCount.load();
+        const auto& rects = wnd.GetCandidateRects();
+        POINT ptCand1 = { (rects[1].left + rects[1].right) / 2, (rects[1].top + rects[1].bottom) / 2 };
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptCand1.x, ptCand1.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptCand1.x, ptCand1.y));
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"Click on stale window while new edit session is queued MUST be rejected!");
+
+        // Now execute deferred session so version 2 is actually displayed!
+        ctxA.m_forceSyncBlocked = false;
+        ctxA.m_deferAsyncSession = false;
+        ctxA.ExecuteDeferredSession();
+        SendMessageW(wnd.GetHwnd(), WM_PAINT, 0, 0);
+        uint32_t ver2 = wnd.GetSnapshot().candidate_version;
+        CHECK_TRUE(ver2 > ver1, L"Window snapshot updated to version 2 after async session completed");
+
+        // 2. Candidate changes between WM_LBUTTONDOWN and WM_LBUTTONUP (点按之间候选改变): click rejected!
+        const auto& rects2 = wnd.GetCandidateRects();
+        POINT pt2 = { (rects2[1].left + rects2[1].right) / 2, (rects2[1].top + rects2[1].bottom) / 2 };
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt2.x, pt2.y));
+
+        // Before WM_LBUTTONUP, user types 'C' -> candidates change to version 3 ("1. 华", "2. 花", "3. 化")!
+        tip.OnKeyDown(&ctxA, 'C', 0, &eaten);
+        SendMessageW(wnd.GetHwnd(), WM_PAINT, 0, 0);
+        uint32_t ver3 = wnd.GetSnapshot().candidate_version;
+        CHECK_TRUE(ver3 > ver2, L"Window updated to version 3 while mouse button held down");
+
+        // Now user releases mouse button (WM_LBUTTONUP) -> MUST NOT commit version 3's candidate!
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(pt2.x, pt2.y));
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"Click where candidates mutated between LButtonDown and LButtonUp MUST be rejected!");
+
+        // Now a fresh press + release on version 3 candidate 1 ("2. 花") succeeds with version 3!
+        const auto& rects3 = wnd.GetCandidateRects();
+        POINT pt3 = { (rects3[1].left + rects3[1].right) / 2, (rects3[1].top + rects3[1].bottom) / 2 };
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt3.x, pt3.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(pt3.x, pt3.y));
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore + 1, L"Valid fresh click on current snapshot commits cleanly");
+        CHECK_EQUAL(server.m_lastSelectVersion.load(), ver3, L"Mouse click submitted exact displayed snapshot version");
+        CHECK_EQUAL(server.m_lastSelectedText, L"花", L"Mouse click committed exact candidate '花'");
+    }
+
+    // 3. Cross-context rejection (跨输入框): stale snapshot from ctxA rejected when ctxB is active
+    {
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctxA, 'A', 0, &eaten);
+        CandidateDisplaySnapshot staleCtxASnap = wnd.GetSnapshot();
+        CHECK_EQUAL(staleCtxASnap.context_id, reinterpret_cast<uint64_t>(&ctxA), L"Captured ctxA snapshot");
+
+        // Switch active input to ctxB
+        tip.OnKeyDown(&ctxB, 'B', 0, &eaten);
+        CHECK_EQUAL(wnd.GetSnapshot().context_id, reinterpret_cast<uint64_t>(&ctxB), L"Window now shows ctxB snapshot");
+
+        // Attempting to submit ctxA's snapshot while ctxB is active MUST be rejected!
+        CHECK_EQUAL(tip.SubmitCandidateSelectionFromSnapshot(staleCtxASnap, 0), false, L"Cross-context snapshot selection MUST be rejected!");
+        CHECK_EQUAL(tip.SubmitPageScrollFromSnapshot(staleCtxASnap, true), false, L"Cross-context snapshot page scroll MUST be rejected!");
+    }
+
+    // 4. Late async PageUp (`selectLastOnPageUp` / 翻页晚到): only selects last item AFTER new page renders!
+    {
+        BOOL eaten = FALSE;
+        // Start on ctxA with 'A' (Page 0, 5 candidates, page_count = 2)
+        tip.OnKeyDown(&ctxA, 'A', 0, &eaten);
+        // Flip to Page 1 synchronously via VK_NEXT (Page 1 has 3 candidates: "1. 腌", "2. 锕", "3. 錒", selectedIndex = 0)
+        tip.OnKeyDown(&ctxA, VK_NEXT, 0, &eaten);
+        CHECK_EQUAL(wnd.GetSnapshot().page_index, 1u, L"On Page 1");
+        CHECK_EQUAL(wnd.GetCandidateCount(), 3, L"Page 1 has 3 candidates");
+        CHECK_EQUAL(wnd.GetSelectedIndex(), 0, L"Page 1 selectedIndex is 0");
+
+        // Now defer async session on ctxA and press VK_UP at index 0 -> triggers PageUp (VK_PRIOR) with selectLastOnPageUp!
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctxA, VK_UP, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"VK_UP paging request eaten");
+
+        // CRITICAL P1 ASSERTION: While Page 0 edit session is still queued in TF_S_ASYNC,
+        // the old Page 1 window MUST NOT have its selectedIndex mutated to 2!
+        CHECK_EQUAL(wnd.GetSnapshot().page_index, 1u, L"Still displaying Page 1 before deferred execution");
+        CHECK_EQUAL(wnd.GetSelectedIndex(), 0, L"Old Page 1 selectedIndex MUST remain 0 while PageUp edit session is queued!");
+
+        // Now execute deferred PageUp edit session -> Page 0 (5 candidates) renders with selectedIndex = 4 (last item)!
+        ctxA.m_forceSyncBlocked = false;
+        ctxA.m_deferAsyncSession = false;
+        ctxA.ExecuteDeferredSession();
+        CHECK_EQUAL(wnd.GetSnapshot().page_index, 0u, L"Now displaying Page 0 after deferred execution");
+        CHECK_EQUAL(wnd.GetCandidateCount(), 5, L"Page 0 has 5 candidates");
+        CHECK_EQUAL(wnd.GetSelectedIndex(), 4, L"New Page 0 selectedIndex is now 4 (last item) after async completion!");
+    }
+
+    tip.Deactivate();
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Snapshot-bound mouse selection, press-release mutation guard, cross-context & late paging verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -1271,6 +1900,8 @@ int main() {
     if (TestPendingRefCountAndDestructionSafety() != 0) return 1;
     if (TestQueuedTerminationSingleFlight() != 0) return 1;
     if (TestDeactivateFailureRemainsRecoverable() != 0) return 1;
+    if (TestAsyncQueuedEditSessionCommitAndFailureMatrix() != 0) return 1;
+    if (TestSnapshotBoundMouseSelectionAndLatePaging() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

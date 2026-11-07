@@ -36,24 +36,12 @@ CTextInputProcessor::CTextInputProcessor() {
         }
     });
 
-    m_candidateWindow.SetOnSelectCandidate([this](int index) {
-        ITfContext* pCtx = m_pCompositionContext;
-        if (pCtx && index >= 0 && index < 9) {
-            pCtx->AddRef();
-            BOOL eaten = FALSE;
-            OnKeyDown(pCtx, static_cast<WPARAM>('1' + index), 0, &eaten);
-            pCtx->Release();
-        }
+    m_candidateWindow.SetOnSelectCandidateSnapshot([this](const CandidateDisplaySnapshot& snap, int index) {
+        SubmitCandidateSelectionFromSnapshot(snap, index);
     });
 
-    m_candidateWindow.SetOnPageScroll([this](bool nextPage) {
-        ITfContext* pCtx = m_pCompositionContext;
-        if (pCtx) {
-            pCtx->AddRef();
-            BOOL eaten = FALSE;
-            OnKeyDown(pCtx, nextPage ? VK_NEXT : VK_PRIOR, 0, &eaten);
-            pCtx->Release();
-        }
+    m_candidateWindow.SetOnPageScrollSnapshot([this](const CandidateDisplaySnapshot& snap, bool nextPage) {
+        SubmitPageScrollFromSnapshot(snap, nextPage);
     });
 }
 
@@ -99,7 +87,22 @@ CTextInputProcessor::~CTextInputProcessor() {
     m_candidateWindow.SetOnOpenManager(nullptr);
     m_candidateWindow.SetOnExecutePlugin(nullptr);
     m_candidateWindow.SetOnSelectCandidate(nullptr);
+    m_candidateWindow.SetOnSelectCandidateSnapshot(nullptr);
     m_candidateWindow.SetOnPageScroll(nullptr);
+    m_candidateWindow.SetOnPageScrollSnapshot(nullptr);
+
+    // Any queued async edit session that never executed before TIP destruction
+    // has NOT modified the host document; cancel any pending commit event it owned.
+    for (auto& pending : m_pendingEditSessions) {
+        if (!pending.completed) {
+            pending.completed = true;
+            if (pending.hasCommit && pending.commitEventId != 0) {
+                EnqueueUnconfirmedCommit(pending.contextId, pending.commitEventId, UnconfirmedAction::Cancel);
+            }
+        }
+    }
+    m_pendingEditSessions.clear();
+
     // Final Release must not create sessions that AddRef a TIP already being destroyed.
     DrainUnconfirmedCommits(false);
     for (const auto& c : m_unconfirmedCommits) {
@@ -329,6 +332,314 @@ CTextInputProcessor::PendingTerminationStatus CTextInputProcessor::GetPendingSta
     return PendingTerminationStatus::Succeeded;
 }
 
+size_t CTextInputProcessor::GetPendingEditSessionCount() const {
+    size_t count = 0;
+    for (const auto& p : m_pendingEditSessions) {
+        if (!p.completed) ++count;
+    }
+    return count;
+}
+
+bool CTextInputProcessor::HasPendingEditSession(uint64_t contextId) const {
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && !p.completed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CTextInputProcessor::HasQueuedEditSession(uint64_t contextId) const {
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && !p.completed && p.status == PendingEditStatus::QueuedAsync) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CTextInputProcessor::IsEditSessionUiSuppressed(uint64_t contextId, uint64_t generation) const {
+    if (m_isDeactivated || !m_hasFocus || m_activeContextId != contextId) {
+        return true;
+    }
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && p.generation == generation) {
+            return p.uiSuppressed;
+        }
+    }
+    return false;
+}
+
+bool CTextInputProcessor::ShouldTerminateAfterEdit(uint64_t contextId, uint64_t generation) const {
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && p.generation == generation) {
+            return p.terminateAfterEdit;
+        }
+    }
+    return false;
+}
+
+bool CTextInputProcessor::CanShowCandidateWindow(uint64_t contextId, uint64_t generation) const {
+    if (m_isDeactivated || !m_hasFocus || m_activeContextId != contextId) {
+        return false;
+    }
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && p.generation == generation) {
+            return !p.uiSuppressed && !p.terminateAfterEdit;
+        }
+    }
+    return true;
+}
+
+void CTextInputProcessor::HideCandidateWindowIfOwnedBy(uint64_t contextId) {
+    uint64_t shownCtx = m_candidateWindow.GetSnapshot().context_id;
+    if (shownCtx == 0 || shownCtx == contextId) {
+        m_candidateWindow.Hide();
+    }
+}
+
+void CTextInputProcessor::SuppressQueuedEditSessionsForContext(uint64_t contextId, bool terminateAfter) {
+    for (auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && !p.completed) {
+            p.uiSuppressed = true;
+            if (terminateAfter) {
+                p.terminateAfterEdit = true;
+            }
+        }
+    }
+}
+
+void CTextInputProcessor::SuppressAllQueuedEditSessions(bool terminateAfter) {
+    for (auto& p : m_pendingEditSessions) {
+        if (!p.completed) {
+            p.uiSuppressed = true;
+            if (terminateAfter) {
+                p.terminateAfterEdit = true;
+            }
+        }
+    }
+}
+
+void CTextInputProcessor::OnEditSessionCompleted(
+    uint64_t contextId,
+    uint64_t generation,
+    EditSessionResult result,
+    HRESULT hrFinal)
+{
+    PendingEditSession pending{};
+    bool found = false;
+    for (auto it = m_pendingEditSessions.begin(); it != m_pendingEditSessions.end(); ++it) {
+        if (it->contextId == contextId && it->generation == generation) {
+            if (it->completed) {
+                return; // Strict single terminal state per edit session
+            }
+            it->completed = true;
+            it->finalResult = result;
+            it->finalHr = hrFinal;
+            pending = *it;
+            m_pendingEditSessions.erase(it);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return;
+    }
+
+    auto applySnapshotState = [&](uint32_t ver, uint32_t pageIdx, uint32_t pageCnt) {
+        m_contextCandidateVersions[contextId] = ver;
+        m_latestServerCandidateVersions[contextId] = ver;
+        m_contextPageIndices[contextId] = pageIdx;
+        m_contextPageCounts[contextId] = pageCnt;
+        if (contextId == m_activeContextId) {
+            m_currentPageIndex = pageIdx;
+            m_currentPageCount = pageCnt;
+        }
+    };
+
+    if (result == EditSessionResult::Success) {
+        if (pending.terminateAfterEdit && !pending.hasCommit) {
+            HideCandidateWindowIfOwnedBy(contextId);
+            applySnapshotState(0, 0, 0);
+            m_ipcClient.ResetContext(m_sessionId, contextId);
+            return;
+        }
+
+        if (!pending.displaySnapshot.candidates.empty() ||
+            (pending.hasComposition && !pending.composition.empty())) {
+            applySnapshotState(
+                pending.displaySnapshot.candidate_version,
+                pending.displaySnapshot.page_index,
+                pending.displaySnapshot.page_count);
+        } else if ((pending.hasComposition && pending.composition.empty()) || pending.hasCommit) {
+            applySnapshotState(0, 0, 0);
+        }
+
+        if (pending.hasCommit && pending.commitEventId != 0) {
+            EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
+            DrainUnconfirmedCommits(true);
+        }
+
+        if (pending.terminateAfterEdit || pending.uiSuppressed) {
+            HideCandidateWindowIfOwnedBy(contextId);
+        }
+    } else if (result == EditSessionResult::PartiallyModified) {
+        HideCandidateWindowIfOwnedBy(contextId);
+        if ((pending.hasComposition && pending.composition.empty()) || pending.hasCommit) {
+            applySnapshotState(0, 0, 0);
+        } else if (!pending.displaySnapshot.candidates.empty() ||
+                   (pending.hasComposition && !pending.composition.empty())) {
+            applySnapshotState(
+                pending.displaySnapshot.candidate_version,
+                pending.displaySnapshot.page_index,
+                pending.displaySnapshot.page_count);
+        }
+
+        if (pending.hasCommit && pending.commitEventId != 0) {
+            EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
+            DrainUnconfirmedCommits(true);
+        }
+    } else {
+        // Unmodified or RecoveryBlocked: current key text was NOT applied to host!
+        if (result == EditSessionResult::RecoveryBlocked) {
+            s_hitRecoveryBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        HideCandidateWindowIfOwnedBy(contextId);
+
+        IpcKeyResponse cancelOrRollbackResp{};
+        if (pending.hasCommit && pending.commitEventId != 0) {
+            bool durableClaim = EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Cancel);
+            bool cancelOk = false;
+            if (durableClaim) {
+                cancelOk = m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, pending.commitEventId, &cancelOrRollbackResp);
+                if (cancelOk) {
+                    if (RemoveConfirmedSpilloverRecord(pending.commitEventId)) {
+                        for (auto itU = m_unconfirmedCommits.begin(); itU != m_unconfirmedCommits.end(); ++itU) {
+                            if (itU->event_id == pending.commitEventId) {
+                                m_unconfirmedCommits.erase(itU);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!durableClaim || !cancelOk) {
+                applySnapshotState(0, 0, 0);
+            } else {
+                if (cancelOrRollbackResp.candidate_count > 0 ||
+                    (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                    applySnapshotState(
+                        cancelOrRollbackResp.candidate_version,
+                        cancelOrRollbackResp.page_index,
+                        cancelOrRollbackResp.page_count);
+                } else {
+                    applySnapshotState(0, 0, 0);
+                }
+            }
+        } else {
+            if (m_ipcClient.Rollback(m_sessionId, contextId, &cancelOrRollbackResp)) {
+                if (cancelOrRollbackResp.candidate_count > 0 ||
+                    (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                    applySnapshotState(
+                        cancelOrRollbackResp.candidate_version,
+                        cancelOrRollbackResp.page_index,
+                        cancelOrRollbackResp.page_count);
+                } else {
+                    applySnapshotState(0, 0, 0);
+                }
+            } else {
+                applySnapshotState(0, 0, 0);
+            }
+        }
+
+        if (pending.terminateAfterEdit && pending.pContext) {
+            bool termOk = TerminateCompositionOnHost(pending.pContext);
+            if (termOk && GetComposition(pending.pContext) == nullptr &&
+                GetPendingStatus(contextId) == PendingTerminationStatus::Succeeded) {
+                applySnapshotState(0, 0, 0);
+                m_ipcClient.ResetContext(m_sessionId, contextId);
+            }
+        }
+    }
+}
+
+bool CTextInputProcessor::IsDisplayedSnapshotValid(
+    const CandidateDisplaySnapshot& snap,
+    ITfContext* expectedContext) const
+{
+    if (m_isDeactivated || !m_hasFocus) return false;
+    if (snap.session_id == 0 || snap.session_id != m_sessionId) return false;
+    if (snap.context_id == 0 || snap.context_id != m_activeContextId || snap.pContext == nullptr) return false;
+    if (expectedContext != nullptr &&
+        (snap.pContext != expectedContext || snap.context_id != reinterpret_cast<uint64_t>(expectedContext))) {
+        return false;
+    }
+    if (m_pCompositionContext != snap.pContext || m_pComposition == nullptr) return false;
+    if (m_candidateWindow.GetCandidateCount() <= 0) return false;
+
+    const auto& winSnap = m_candidateWindow.GetSnapshot();
+    if (winSnap.session_id != snap.session_id ||
+        winSnap.context_id != snap.context_id ||
+        winSnap.candidate_version != snap.candidate_version ||
+        winSnap.page_index != snap.page_index) {
+        return false;
+    }
+
+    if (HasPendingEditSession(snap.context_id)) return false;
+    if (GetPendingStatus(snap.context_id) != PendingTerminationStatus::Succeeded) return false;
+    if (snap.candidate_version == 0) return false;
+
+    auto itVer = m_contextCandidateVersions.find(snap.context_id);
+    if (itVer == m_contextCandidateVersions.end() || itVer->second != snap.candidate_version) {
+        return false;
+    }
+
+    auto itSrvVer = m_latestServerCandidateVersions.find(snap.context_id);
+    if (itSrvVer != m_latestServerCandidateVersions.end() && itSrvVer->second != snap.candidate_version) {
+        return false;
+    }
+
+    auto itPage = m_contextPageIndices.find(snap.context_id);
+    if (itPage != m_contextPageIndices.end() && itPage->second != snap.page_index) {
+        return false;
+    }
+
+    return true;
+}
+
+bool CTextInputProcessor::SubmitCandidateSelectionFromSnapshot(const CandidateDisplaySnapshot& snap, int index) {
+    if (index < 0 || index >= 9 || index >= static_cast<int>(snap.candidates.size())) {
+        return false;
+    }
+    if (!IsDisplayedSnapshotValid(snap)) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ITfContext> ctxLease(snap.pContext);
+    BOOL eaten = FALSE;
+    return ProcessKeyInternal(
+        snap.pContext,
+        static_cast<WPARAM>('1' + index),
+        0,
+        &eaten,
+        true,
+        snap.candidate_version);
+}
+
+bool CTextInputProcessor::SubmitPageScrollFromSnapshot(const CandidateDisplaySnapshot& snap, bool nextPage) {
+    if (!IsDisplayedSnapshotValid(snap)) {
+        return false;
+    }
+    Microsoft::WRL::ComPtr<ITfContext> ctxLease(snap.pContext);
+    BOOL eaten = FALSE;
+    return ProcessKeyInternal(
+        snap.pContext,
+        nextPage ? VK_NEXT : VK_PRIOR,
+        0,
+        &eaten,
+        true,
+        snap.candidate_version);
+}
+
 void CTextInputProcessor::ResetBranchCounters() {
     s_hitTermSyncSuccess.store(0);
     s_hitTermSyncFail.store(0);
@@ -377,6 +688,8 @@ STDMETHODIMP_(ULONG) CTextInputProcessor::Release() {
 STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     if (!ptim) return E_INVALIDARG;
 
+    m_isDeactivated = false;
+    m_hasFocus = true;
     m_pThreadMgr = ptim;
     m_pThreadMgr->AddRef();
     m_tfClientId = tid;
@@ -404,6 +717,8 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
 }
 
 STDMETHODIMP CTextInputProcessor::Deactivate() {
+    m_isDeactivated = true;
+    SuppressAllQueuedEditSessions(true);
     UninitKeyEventSink();
 
     if (m_pLangBarButton) {
@@ -421,9 +736,11 @@ STDMETHODIMP CTextInputProcessor::Deactivate() {
 
     if (m_pCompositionContext) {
         uint64_t oldContextId = m_compositionContextId;
-        bool termOk = TerminateCompositionOnHost();
-        if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
-            m_ipcClient.ResetContext(m_sessionId, oldContextId);
+        if (!HasQueuedEditSession(oldContextId)) {
+            bool termOk = TerminateCompositionOnHost();
+            if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
+                m_ipcClient.ResetContext(m_sessionId, oldContextId);
+            }
         }
     }
 
@@ -529,15 +846,21 @@ static bool IsContextReadOnly(ITfContext* pic) {
 }
 
 STDMETHODIMP CTextInputProcessor::OnSetFocus(BOOL fForeground) {
+    m_hasFocus = (fForeground != FALSE);
     if (!fForeground) {
         m_candidateWindow.Hide();
+        SuppressAllQueuedEditSessions(true);
         if (m_pCompositionContext) {
             uint64_t oldContextId = m_compositionContextId;
-            bool termOk = TerminateCompositionOnHost();
-            if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
-                m_ipcClient.ResetContext(m_sessionId, oldContextId);
+            if (!HasQueuedEditSession(oldContextId)) {
+                bool termOk = TerminateCompositionOnHost();
+                if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
+                    m_ipcClient.ResetContext(m_sessionId, oldContextId);
+                }
             }
-        } else if (GetPendingStatus(m_activeContextId) == PendingTerminationStatus::Succeeded) {
+        } else if (m_activeContextId != 0 &&
+                   !HasQueuedEditSession(m_activeContextId) &&
+                   GetPendingStatus(m_activeContextId) == PendingTerminationStatus::Succeeded) {
             m_ipcClient.ResetContext(m_sessionId, m_activeContextId);
         }
     }
@@ -552,8 +875,14 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
         return S_OK;
     }
 
-    if (m_candidateWindow.GetCandidateCount() > 0 &&
-        (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN)) {
+    uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    if (HasQueuedEditSession(contextId)) {
+        return S_OK;
+    }
+
+    if ((wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) &&
+        m_candidateWindow.GetCandidateCount() > 0 &&
+        IsDisplayedSnapshotValid(m_candidateWindow.GetSnapshot(), pic)) {
         *pfEaten = TRUE;
         return S_OK;
     }
@@ -676,6 +1005,9 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
             if (ok) {
                 if (drainResp.candidate_count > 0 || (drainResp.has_composition && drainResp.composition[0] != L'\0')) {
                     m_contextCandidateVersions[it->context_id] = drainResp.candidate_version;
+                    m_latestServerCandidateVersions[it->context_id] = drainResp.candidate_version;
+                    m_contextPageIndices[it->context_id] = drainResp.page_index;
+                    m_contextPageCounts[it->context_id] = drainResp.page_count;
                 }
             }
         }
@@ -709,15 +1041,35 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
 STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
+    ProcessKeyInternal(pic, wParam, lParam, pfEaten, false, 0);
+    return S_OK;
+}
+
+bool CTextInputProcessor::ProcessKeyInternal(
+    ITfContext* pic,
+    WPARAM wParam,
+    LPARAM lParam,
+    BOOL* pfEaten,
+    bool hasExplicitVersion,
+    uint32_t explicitCandidateVersion)
+{
+    if (!pfEaten) return false;
+    *pfEaten = FALSE;
 
     DrainUnconfirmedCommits();
-    if (receipt_retry::Pending()) return S_OK;
+    if (receipt_retry::Pending()) return false;
 
     if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
-        return S_OK;
+        return false;
     }
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+
+    // Do not overlap new keystrokes while an asynchronous edit session is queued on this context
+    if (HasQueuedEditSession(contextId)) {
+        *pfEaten = FALSE;
+        return false;
+    }
 
     // If returning to a context with a pending/failed termination, retry finishing it before handling new input
     if (GetPendingStatus(contextId) != PendingTerminationStatus::Succeeded) {
@@ -727,54 +1079,76 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
         } else {
             // Cannot cleanly end previous composition on this context: block new composition to prevent overlapping!
             *pfEaten = FALSE;
-            m_candidateWindow.Hide();
-            return S_OK;
+            HideCandidateWindowIfOwnedBy(contextId);
+            return false;
         }
     }
 
     if (m_activeContextId != contextId) {
+        if (m_activeContextId != 0) {
+            SuppressQueuedEditSessionsForContext(m_activeContextId, true);
+            HideCandidateWindowIfOwnedBy(m_activeContextId);
+        }
         if (m_pCompositionContext && m_pCompositionContext != pic) {
             uint64_t oldContextId = m_compositionContextId;
-            bool termOk = TerminateCompositionOnHost();
-            if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
-                m_ipcClient.ResetContext(m_sessionId, oldContextId);
+            if (!HasQueuedEditSession(oldContextId)) {
+                bool termOk = TerminateCompositionOnHost();
+                if (termOk && m_pComposition == nullptr && GetPendingStatus(oldContextId) == PendingTerminationStatus::Succeeded) {
+                    m_ipcClient.ResetContext(m_sessionId, oldContextId);
+                }
             }
         }
         m_activeContextId = contextId;
     }
+    m_hasFocus = true;
+    m_isDeactivated = false;
 
     bool selectLastOnPageUp = false;
-    if (m_candidateWindow.GetCandidateCount() > 0) {
+    uint32_t navSnapshotVersion = 0;
+    bool useNavSnapshotVersion = false;
+
+    if (!hasExplicitVersion &&
+        m_candidateWindow.GetCandidateCount() > 0 &&
+        IsDisplayedSnapshotValid(m_candidateWindow.GetSnapshot(), pic)) {
+        const auto& snap = m_candidateWindow.GetSnapshot();
         int count = m_candidateWindow.GetCandidateCount();
         int sel = m_candidateWindow.GetSelectedIndex();
         if (wParam == VK_RIGHT || wParam == VK_DOWN) {
             if (sel + 1 < count) {
                 m_candidateWindow.SetSelectedIndex(sel + 1);
                 *pfEaten = TRUE;
-                return S_OK;
-            } else if (m_currentPageIndex + 1 < m_currentPageCount) {
+                return true;
+            } else if (snap.page_index + 1 < snap.page_count) {
                 wParam = VK_NEXT;
+                navSnapshotVersion = snap.candidate_version;
+                useNavSnapshotVersion = true;
             } else {
                 m_candidateWindow.SetSelectedIndex(0);
                 *pfEaten = TRUE;
-                return S_OK;
+                return true;
             }
         } else if (wParam == VK_LEFT || wParam == VK_UP) {
             if (sel > 0) {
                 m_candidateWindow.SetSelectedIndex(sel - 1);
                 *pfEaten = TRUE;
-                return S_OK;
-            } else if (m_currentPageIndex > 0) {
+                return true;
+            } else if (snap.page_index > 0) {
                 wParam = VK_PRIOR;
                 selectLastOnPageUp = true;
+                navSnapshotVersion = snap.candidate_version;
+                useNavSnapshotVersion = true;
             } else {
                 m_candidateWindow.SetSelectedIndex(count - 1);
                 *pfEaten = TRUE;
-                return S_OK;
+                return true;
             }
         } else if ((wParam == VK_SPACE || wParam == VK_RETURN) && (GetKeyState(VK_SHIFT) & 0x8000) == 0) {
             if (sel >= 0 && sel < count && sel < 9) {
-                wParam = static_cast<WPARAM>('1' + sel);
+                if (wParam == VK_RETURN || sel > 0) {
+                    wParam = static_cast<WPARAM>('1' + sel);
+                }
+                navSnapshotVersion = snap.candidate_version;
+                useNavSnapshotVersion = true;
             }
         }
     }
@@ -793,26 +1167,28 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
 
     uint32_t currentCandVer = 0;
-    auto itVer = m_contextCandidateVersions.find(contextId);
-    if (itVer != m_contextCandidateVersions.end()) {
-        currentCandVer = itVer->second;
+    if (hasExplicitVersion) {
+        currentCandVer = explicitCandidateVersion;
+    } else if (useNavSnapshotVersion) {
+        currentCandVer = navSnapshotVersion;
+    } else {
+        auto itVer = m_contextCandidateVersions.find(contextId);
+        if (itVer != m_contextCandidateVersions.end()) {
+            currentCandVer = itVer->second;
+        }
     }
     req.candidate_version = currentCandVer;
 
     IpcKeyResponse resp{};
     if (m_ipcClient.SendRequest(req, resp, 80)) {
         if (!resp.handled) {
-            return S_OK;
+            return false;
         }
 
         if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
-            m_contextCandidateVersions[contextId] = resp.candidate_version;
-            m_currentPageIndex = resp.page_index;
-            m_currentPageCount = resp.page_count;
-        } else if (resp.has_composition && resp.composition[0] == L'\0') {
-            m_contextCandidateVersions[contextId] = 0;
-            m_currentPageIndex = 0;
-            m_currentPageCount = 0;
+            m_latestServerCandidateVersions[contextId] = resp.candidate_version;
+        } else if ((resp.has_composition && resp.composition[0] == L'\0') || resp.has_commit) {
+            m_latestServerCandidateVersions[contextId] = 0;
         }
 
         std::vector<std::wstring> cands;
@@ -824,87 +1200,111 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
             if (resp.has_commit && resp.commit_event_id != 0 &&
                 !receipt_journal::Prepare({m_sessionId, contextId, resp.commit_event_id, 0, 0})) {
                 IpcKeyResponse restored{};
-                if (m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &restored))
+                if (m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &restored)) {
                     m_contextCandidateVersions[contextId] = restored.candidate_version;
-                return S_OK; // No host edit when the preflight barrier cannot persist.
+                    m_latestServerCandidateVersions[contextId] = restored.candidate_version;
+                    m_contextPageIndices[contextId] = restored.page_index;
+                    m_contextPageCounts[contextId] = restored.page_count;
+                }
+                return false; // No host edit when the preflight barrier cannot persist.
             }
+
+            CandidateDisplaySnapshot snap{};
+            snap.session_id = m_sessionId;
+            snap.context_id = contextId;
+            snap.pContext = pic;
+            snap.candidate_version = resp.candidate_version;
+            snap.page_index = resp.page_index;
+            snap.page_count = resp.page_count;
+            snap.candidates = cands;
+            snap.initial_selected_index =
+                (selectLastOnPageUp && !cands.empty()) ? (static_cast<int>(cands.size()) - 1) : 0;
+
+            uint64_t editGen = ++m_editSessionGeneration;
+            m_pendingEditSessions.emplace_back(
+                contextId,
+                pic,
+                editGen,
+                resp.has_composition != 0,
+                resp.composition,
+                resp.has_commit != 0,
+                resp.commit_text,
+                resp.commit_event_id,
+                snap,
+                PendingEditStatus::PendingSync);
+
             CEditSession* pSession = new CEditSession(
                 this, pic, &m_candidateWindow,
                 resp.has_composition != 0, resp.composition,
                 resp.has_commit != 0, resp.commit_text,
-                cands
+                cands,
+                editGen,
+                &snap
             );
 
             HRESULT hrSession = S_OK;
             HRESULT hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
-            EditSessionResult result = pSession->GetResult();
-            if (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS) {
-                hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_ASYNC | TF_ES_READWRITE, &hrSession);
-                if (SUCCEEDED(hr) && SUCCEEDED(hrSession)) {
-                    result = EditSessionResult::Success;
+            bool isSyncBlocked = (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS);
+            if (isSyncBlocked) {
+                for (auto& pe : m_pendingEditSessions) {
+                    if (pe.contextId == contextId && pe.generation == editGen) {
+                        pe.status = PendingEditStatus::QueuedAsync;
+                        break;
+                    }
                 }
+                hrSession = S_OK;
+                hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_ASYNC | TF_ES_READWRITE, &hrSession);
+                if (FAILED(hr) || FAILED(hrSession)) {
+                    if (!pSession->HasExecuted()) {
+                        OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, FAILED(hr) ? hr : hrSession);
+                    }
+                    pSession->Release();
+                    *pfEaten = FALSE;
+                    return false;
+                }
+                if (!pSession->HasExecuted()) {
+                    // Request is queued in host (TF_S_ASYNC); completion will be handled when DoEditSession runs!
+                    pSession->Release();
+                    *pfEaten = TRUE;
+                    return true;
+                }
+                EditSessionResult asyncResult = pSession->GetResult();
+                pSession->Release();
+                if (asyncResult == EditSessionResult::Success || asyncResult == EditSessionResult::PartiallyModified) {
+                    *pfEaten = TRUE;
+                    return true;
+                }
+                *pfEaten = FALSE;
+                return false;
             }
-            pSession->Release();
 
-            if (selectLastOnPageUp && m_candidateWindow.GetCandidateCount() > 0) {
-                m_candidateWindow.SetSelectedIndex(m_candidateWindow.GetCandidateCount() - 1);
+            if (!pSession->HasExecuted()) {
+                OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, FAILED(hr) ? hr : hrSession);
+                pSession->Release();
+                *pfEaten = FALSE;
+                return false;
             }
+
+            EditSessionResult result = pSession->GetResult();
+            pSession->Release();
 
             if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && result == EditSessionResult::Success) {
                 *pfEaten = TRUE;
-                if (resp.has_commit && resp.commit_event_id != 0) {
-                    EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Success);
-                    DrainUnconfirmedCommits(true);
-                }
+                return true;
             } else if (result == EditSessionResult::PartiallyModified) {
-                // THIS session modified host text; eat key to avoid duplication, do NOT rollback
                 *pfEaten = TRUE;
-                m_candidateWindow.Hide();
-                if (resp.has_commit && resp.commit_event_id != 0) {
-                    EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Success);
-                    DrainUnconfirmedCommits(true);
-                }
+                return true;
             } else {
-                // Unmodified or RecoveryBlocked: current key text was NOT applied to host!
-                // Do NOT eat the key (*pfEaten = FALSE), hide window, and roll back server for current key!
-                if (result == EditSessionResult::RecoveryBlocked) {
-                    s_hitRecoveryBlocked.fetch_add(1, std::memory_order_relaxed);
-                }
                 *pfEaten = FALSE;
-                m_candidateWindow.Hide();
-
-                IpcKeyResponse cancelOrRollbackResp{};
-                if (resp.has_commit && resp.commit_event_id != 0) {
-                    if (!EnqueueUnconfirmedCommit(contextId, resp.commit_event_id, UnconfirmedAction::Cancel) ||
-                        !m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &cancelOrRollbackResp)) {
-
-                        m_contextCandidateVersions[contextId] = 0;
-                    } else {
-                        // Synchronize restored snapshot from server!
-                        if (cancelOrRollbackResp.candidate_count > 0 || (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
-                            m_contextCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
-                        } else {
-                            m_contextCandidateVersions[contextId] = 0;
-                        }
-                    }
-                } else {
-                    if (m_ipcClient.Rollback(m_sessionId, contextId, &cancelOrRollbackResp)) {
-                        if (cancelOrRollbackResp.candidate_count > 0 || (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
-                            m_contextCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
-                        } else {
-                            m_contextCandidateVersions[contextId] = 0;
-                        }
-                    } else {
-                        m_contextCandidateVersions[contextId] = 0;
-                    }
-                }
+                return false;
             }
         } else {
             *pfEaten = TRUE;
+            return true;
         }
     }
 
-    return S_OK;
+    return false;
 }
 
 STDMETHODIMP CTextInputProcessor::OnTestKeyUp(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
@@ -931,12 +1331,14 @@ STDMETHODIMP CTextInputProcessor::OnCompositionTerminated(TfEditCookie ecWrite, 
     // 1. Check active composition
     if (m_pComposition == pComposition) {
         uint64_t terminatedContextId = m_compositionContextId;
+        SuppressQueuedEditSessionsForContext(terminatedContextId, true);
         SetComposition(nullptr, nullptr, CompositionState::None);
         m_contextCandidateVersions[terminatedContextId] = 0;
+        m_latestServerCandidateVersions[terminatedContextId] = 0;
+        m_contextPageIndices[terminatedContextId] = 0;
+        m_contextPageCounts[terminatedContextId] = 0;
         m_ipcClient.ResetContext(m_sessionId, terminatedContextId);
-        if (terminatedContextId == m_activeContextId) {
-            m_candidateWindow.Hide();
-        }
+        HideCandidateWindowIfOwnedBy(terminatedContextId);
         return S_OK;
     }
 
@@ -944,8 +1346,13 @@ STDMETHODIMP CTextInputProcessor::OnCompositionTerminated(TfEditCookie ecWrite, 
     for (auto it = m_pendingTerminations.begin(); it != m_pendingTerminations.end(); ++it) {
         if (it->pComp == pComposition) {
             uint64_t terminatedContextId = it->contextId;
+            SuppressQueuedEditSessionsForContext(terminatedContextId, true);
             m_contextCandidateVersions[terminatedContextId] = 0;
+            m_latestServerCandidateVersions[terminatedContextId] = 0;
+            m_contextPageIndices[terminatedContextId] = 0;
+            m_contextPageCounts[terminatedContextId] = 0;
             m_ipcClient.ResetContext(m_sessionId, terminatedContextId);
+            HideCandidateWindowIfOwnedBy(terminatedContextId);
             m_pendingTerminations.erase(it);
             return S_OK;
         }

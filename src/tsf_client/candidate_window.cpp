@@ -135,11 +135,16 @@ void CCandidateWindow::Hide() {
     if (m_hWnd && IsWindow(m_hWnd)) {
         ShowWindow(m_hWnd, SW_HIDE);
     }
+    m_snapshot = {};
     m_candidates.clear();
     m_candidateRects.clear();
     m_selectedIndex = 0;
     m_hoveredIndex = -1;
     m_pressedIndex = -1;
+    m_pressedVersion = 0;
+    m_pressedContextId = 0;
+    m_pressedPageIndex = 0;
+    m_pressedCandidateText.clear();
     m_isHoveringMgrBtn = false;
     m_isPressedMgrBtn = false;
     m_trackingMouse = false;
@@ -171,7 +176,14 @@ void CCandidateWindow::TriggerManagerButton() {
 }
 
 void CCandidateWindow::Show(const std::vector<std::wstring>& candidates, POINT pt) {
-    if (candidates.empty()) {
+    CandidateDisplaySnapshot snap{};
+    snap.candidates = candidates;
+    snap.initial_selected_index = 0;
+    Show(snap, pt);
+}
+
+void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) {
+    if (snapshot.candidates.empty()) {
         Hide();
         return;
     }
@@ -180,10 +192,20 @@ void CCandidateWindow::Show(const std::vector<std::wstring>& candidates, POINT p
         return;
     }
 
-    m_candidates = candidates;
-    m_selectedIndex = 0;
+    m_snapshot = snapshot;
+    m_candidates = snapshot.candidates;
+    int initSel = snapshot.initial_selected_index;
+    if (initSel < 0) initSel = 0;
+    if (initSel >= static_cast<int>(m_candidates.size())) {
+        initSel = static_cast<int>(m_candidates.size()) - 1;
+    }
+    m_selectedIndex = initSel;
     m_hoveredIndex = -1;
     m_pressedIndex = -1;
+    m_pressedVersion = 0;
+    m_pressedContextId = 0;
+    m_pressedPageIndex = 0;
+    m_pressedCandidateText.clear();
     m_candidateRects.clear();
 
     // Calculate dimensions using bold font so switching selection never shifts candidate layout
@@ -320,8 +342,14 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
     if (uMsg == WM_MOUSEWHEEL && pThis) {
         short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
-        if (zDelta != 0 && pThis->m_onPageScroll) {
-            pThis->m_onPageScroll(zDelta < 0);
+        if (zDelta != 0 && !pThis->m_candidates.empty()) {
+            CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+            if (pThis->m_onPageScrollSnapshot) {
+                pThis->m_onPageScrollSnapshot(snapCopy, zDelta < 0);
+            }
+            if (pThis->m_onPageScroll) {
+                pThis->m_onPageScroll(zDelta < 0);
+            }
         }
         return 0;
     }
@@ -390,6 +418,10 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         for (size_t i = 0; i < pThis->m_candidateRects.size(); ++i) {
             if (PtInRect(&pThis->m_candidateRects[i], pt)) {
                 pThis->m_pressedIndex = static_cast<int>(i);
+                pThis->m_pressedVersion = pThis->m_snapshot.candidate_version;
+                pThis->m_pressedContextId = pThis->m_snapshot.context_id;
+                pThis->m_pressedPageIndex = pThis->m_snapshot.page_index;
+                pThis->m_pressedCandidateText = (i < pThis->m_candidates.size()) ? pThis->m_candidates[i] : L"";
                 pThis->m_selectedIndex = static_cast<int>(i);
                 SetCapture(hWnd);
                 InvalidateRect(hWnd, nullptr, FALSE);
@@ -419,9 +451,31 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
         if (pThis->m_pressedIndex >= 0) {
             int clickedIdx = pThis->m_pressedIndex;
+            uint32_t pressedVer = pThis->m_pressedVersion;
+            uint64_t pressedCtx = pThis->m_pressedContextId;
+            uint32_t pressedPage = pThis->m_pressedPageIndex;
+            std::wstring pressedText = pThis->m_pressedCandidateText;
+
             pThis->m_pressedIndex = -1;
-            if (clickedIdx < static_cast<int>(pThis->m_candidateRects.size()) &&
-                PtInRect(&pThis->m_candidateRects[clickedIdx], pt)) {
+            pThis->m_pressedVersion = 0;
+            pThis->m_pressedContextId = 0;
+            pThis->m_pressedPageIndex = 0;
+            pThis->m_pressedCandidateText.clear();
+
+            bool hitSameCandidate =
+                clickedIdx < static_cast<int>(pThis->m_candidateRects.size()) &&
+                clickedIdx < static_cast<int>(pThis->m_candidates.size()) &&
+                PtInRect(&pThis->m_candidateRects[clickedIdx], pt) &&
+                pThis->m_snapshot.candidate_version == pressedVer &&
+                pThis->m_snapshot.context_id == pressedCtx &&
+                pThis->m_snapshot.page_index == pressedPage &&
+                pThis->m_candidates[clickedIdx] == pressedText;
+
+            if (hitSameCandidate) {
+                CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+                if (pThis->m_onSelectCandidateSnapshot) {
+                    pThis->m_onSelectCandidateSnapshot(snapCopy, clickedIdx);
+                }
                 if (pThis->m_onSelectCandidate) {
                     pThis->m_onSelectCandidate(clickedIdx);
                 }
