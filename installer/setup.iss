@@ -47,6 +47,10 @@ RestartIfNeededByRun=no
 SetupLogging=yes
 UninstallDisplayIcon={app}\manager\{#MyAppExeName}
 
+[Registry]
+; 开机静默自动启动输入法后台核心服务
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PersonalIMEService"; ValueData: """{app}\ime-service.exe"""; Flags: uninsdeletevalue
+
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
 

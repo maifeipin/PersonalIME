@@ -98,6 +98,12 @@ add_executable(ime-service
     src/ime_service/admin_server.cpp
 )
 
+if (MSVC)
+    set_target_properties(ime-service PROPERTIES
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
+    )
+endif()
+
 target_link_libraries(ime-service PRIVATE
     ime-core
     advapi32

@@ -116,6 +116,10 @@ STDAPI DllRegisterServer() {
         static_cast<ULONG>(wcslen(szDllPath)),
         0
     );
+    if (SUCCEEDED(hr)) {
+        pProfiles->EnableLanguageProfileByDefault(CLSID_PersonalIME, IME_LANGID, GUID_PersonalIME_Profile, TRUE);
+        pProfiles->EnableLanguageProfile(CLSID_PersonalIME, IME_LANGID, GUID_PersonalIME_Profile, TRUE);
+    }
     pProfiles->Release();
     if (FAILED(hr)) {
         if (SUCCEEDED(hrCo)) CoUninitialize();
