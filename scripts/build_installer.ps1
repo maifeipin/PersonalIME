@@ -17,6 +17,24 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Inno Setup's VersionInfoVersion requires four numeric fields (0-65535 each).
+# CI builds on main pass SemVer-style strings such as "1.0.0-ci.20261107.0fd389b",
+# which are fine for AppVersion but abort ISCC with "VersionInfoVersion is
+# invalid". Normalize the leading numeric segments for the version resource.
+$versionInfoParts = @(0, 0, 0, 0)
+$versionMatch = [regex]::Match($Version, '^\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?')
+if ($versionMatch.Success) {
+    for ($segment = 1; $segment -le 3; $segment++) {
+        if ($versionMatch.Groups[$segment].Success) {
+            $numeric = [int]$versionMatch.Groups[$segment].Value
+            if ($numeric -gt 65535) { $numeric = 65535 }
+            $versionInfoParts[$segment - 1] = $numeric
+        }
+    }
+}
+$VersionInfoVersion = $versionInfoParts -join '.'
+
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptRoot
 
@@ -30,6 +48,7 @@ $installerOutputDir = Join-Path $resolvedOutDir "installer"
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "  Personal IME: Local Installer Build (Inno Setup x64)" -ForegroundColor Cyan
 Write-Host "  Target Package Version : $Version" -ForegroundColor Cyan
+Write-Host "  VersionInfoVersion     : $VersionInfoVersion" -ForegroundColor Cyan
 Write-Host "  Binaries Directory     : $resolvedBuildDir" -ForegroundColor Cyan
 Write-Host "  Installer Output       : $installerOutputDir" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
@@ -104,7 +123,7 @@ if (-not (Test-Path $installerOutputDir)) {
 }
 
 $issPath = Join-Path $ProjectRoot "installer\setup.iss"
-& $isccPath "/DMyAppVersion=$Version" $issPath
+& $isccPath "/DMyAppVersion=$Version" "/DMyAppVersionInfoVersion=$VersionInfoVersion" $issPath
 
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup compilation failed with exit code $LASTEXITCODE"

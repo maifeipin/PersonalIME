@@ -8,6 +8,13 @@
 #define MyAppVersion "1.0.9"
 #endif
 
+; VersionInfoVersion must be four numeric fields (0-65535 each), so release
+; strings like "1.0.0-ci.20261107.0fd389b" cannot be used directly. The build
+; script passes a normalized numeric variant through this define.
+#ifndef MyAppVersionInfoVersion
+#define MyAppVersionInfoVersion "1.0.9.0"
+#endif
+
 #define MyAppName "人人"
 #define MyAppPublisher "人人 项目组"
 #define MyAppURL "https://github.com/maifeipin/PersonalIME"
@@ -34,7 +41,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
 ; Executable Metadata & Version Information:
-VersionInfoVersion={#MyAppVersion}.0
+VersionInfoVersion={#MyAppVersionInfoVersion}
 VersionInfoTextVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 输入法安装程序
