@@ -72,7 +72,7 @@ jobs:
           uname -m
 
       - name: Configure CMake (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
 
       - name: Build ime-core, ime-cli, portable tests and input method bundle
         run: cmake --build build --config Release --parallel
@@ -90,6 +90,10 @@ jobs:
           /usr/libexec/PlistBuddy -c "Print :InputMethodConnectionName" build/PersonalIME.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Print :InputMethodServerControllerClass" build/PersonalIME.app/Contents/Info.plist
           codesign --verify --verbose build/PersonalIME.app
+          echo "--- universal binary check ---"
+          lipo -info build/PersonalIME.app/Contents/MacOS/PersonalIME
+          lipo -info build/PersonalIME.app/Contents/MacOS/PersonalIME | grep -q "x86_64 arm64\|arm64 x86_64" \
+            || { echo "ERROR: PersonalIME is not a universal binary"; exit 1; }
 
       - name: Host Acceptance Scope Notice (macOS)
         run: |
@@ -251,7 +255,7 @@ jobs:
           echo "version=${ver}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure CMake (Release)
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
 
       - name: Build macOS Input Method Bundle
         run: cmake --build build --config Release --parallel
@@ -264,8 +268,7 @@ jobs:
       - name: Create DMG
         run: |
           mkdir -p out/release
-          ARCH="$(uname -m)"
-          DMG="out/release/PersonalIME-macOS-${ARCH}-v${{ env.RELEASE_VERSION }}.dmg"
+          DMG="out/release/PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg"
           hdiutil create -volname "PersonalIME" -srcfolder build/PersonalIME.app \
             -ov -format UDZO "${DMG}"
           echo "DMG_PATH=${DMG}" >> "${GITHUB_ENV}"

@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 project(PersonalIME LANGUAGES C CXX)
 
+# macOS ships a universal input method bundle by default so the DMG runs on both
+# Apple Silicon and Intel. Override with -DCMAKE_OSX_ARCHITECTURES to narrow it.
+if (APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS target architectures" FORCE)
+endif()
+if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "macOS deployment target" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -215,6 +224,7 @@ endif()
 # if (APPLE) and has no effect on the Windows build.
 if (APPLE)
     find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
+    find_program(LIPO_EXECUTABLE lipo REQUIRED)
     find_program(CODESIGN_EXECUTABLE codesign)
 
     set(MAC_CLIENT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/mac_client)
@@ -223,46 +233,106 @@ if (APPLE)
     set(MAC_APP_EXEC ${MAC_APP_BUNDLE}/Contents/MacOS/PersonalIME)
     set(MAC_SWIFT_HEADER ${MAC_OBJ_DIR}/PersonalIME-Swift.h)
     set(MAC_SWIFT_OBJ ${MAC_OBJ_DIR}/CandidateWindow.o)
+    set(MAC_DEPLOY_TARGET ${CMAKE_OSX_DEPLOYMENT_TARGET})
+
+    execute_process(
+        COMMAND ${XCRUN_EXECUTABLE} --show-sdk-path
+        OUTPUT_VARIABLE MAC_SDK_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    # swiftc rejects repeating -arch, so Swift sources and the final link are
+    # driven per architecture with -target and merged through lipo. clang does
+    # accept -arch repetition, so Objective-C++ objects go straight to fat.
+    set(MAC_ARCHS ${CMAKE_OSX_ARCHITECTURES})
+    list(GET MAC_ARCHS 0 MAC_PRIMARY_ARCH)
+    list(LENGTH MAC_ARCHS MAC_ARCH_COUNT)
+
+    set(MAC_CLANG_ARCH_FLAGS)
+    set(MAC_SWIFT_ARCH_CMDS)
+    set(MAC_LINK_ARCH_CMDS)
+    set(MAC_SWIFT_OBJS)
+    set(MAC_APP_EXECS)
+    foreach(ARCH IN LISTS MAC_ARCHS)
+        list(APPEND MAC_CLANG_ARCH_FLAGS -arch ${ARCH})
+        if (ARCH STREQUAL MAC_PRIMARY_ARCH)
+            set(MAC_SWIFT_HEADER_FLAGS
+                -emit-objc-header -emit-objc-header-path ${MAC_SWIFT_HEADER})
+        else()
+            set(MAC_SWIFT_HEADER_FLAGS)
+        endif()
+        list(APPEND MAC_SWIFT_ARCH_CMDS
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${MAC_OBJ_DIR}/${ARCH}
+            COMMAND ${XCRUN_EXECUTABLE} swiftc
+                -O -parse-as-library -module-name PersonalIME
+                -target ${ARCH}-apple-macos${MAC_DEPLOY_TARGET}
+                -sdk ${MAC_SDK_PATH}
+                ${MAC_SWIFT_HEADER_FLAGS}
+                -c ${MAC_CLIENT_DIR}/CandidateWindow.swift
+                -o ${MAC_OBJ_DIR}/${ARCH}/CandidateWindow.o)
+        list(APPEND MAC_LINK_ARCH_CMDS
+            COMMAND ${XCRUN_EXECUTABLE} swiftc -O
+                -target ${ARCH}-apple-macos${MAC_DEPLOY_TARGET}
+                -sdk ${MAC_SDK_PATH}
+                -o ${MAC_OBJ_DIR}/${ARCH}/PersonalIME
+                ${MAC_OBJ_DIR}/main.o
+                ${MAC_OBJ_DIR}/ImeBridge.o
+                ${MAC_OBJ_DIR}/PersonalIMEInputController.o
+                ${MAC_OBJ_DIR}/${ARCH}/CandidateWindow.o
+                $<TARGET_FILE:ime-core>
+                $<TARGET_FILE:sqlite3>
+                -framework Cocoa
+                -framework InputMethodKit
+                -lc++)
+        list(APPEND MAC_SWIFT_OBJS ${MAC_OBJ_DIR}/${ARCH}/CandidateWindow.o)
+        list(APPEND MAC_APP_EXECS ${MAC_OBJ_DIR}/${ARCH}/PersonalIME)
+    endforeach()
+
+    if (MAC_ARCH_COUNT GREATER 1)
+        set(MAC_MERGE_SWIFT_CMDS
+            COMMAND ${LIPO_EXECUTABLE} -create ${MAC_SWIFT_OBJS} -output ${MAC_SWIFT_OBJ})
+        set(MAC_MERGE_APP_CMDS
+            COMMAND ${LIPO_EXECUTABLE} -create ${MAC_APP_EXECS} -output ${MAC_OBJ_DIR}/PersonalIME)
+    else()
+        set(MAC_MERGE_SWIFT_CMDS
+            COMMAND ${CMAKE_COMMAND} -E copy ${MAC_SWIFT_OBJS} ${MAC_SWIFT_OBJ})
+        set(MAC_MERGE_APP_CMDS
+            COMMAND ${CMAKE_COMMAND} -E copy ${MAC_APP_EXECS} ${MAC_OBJ_DIR}/PersonalIME)
+    endif()
 
     add_custom_command(
         OUTPUT ${MAC_APP_EXEC}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${MAC_OBJ_DIR}
-        # 1. Swift -> object file plus the Objective-C bridging header
-        COMMAND ${XCRUN_EXECUTABLE} swiftc
-            -O -parse-as-library -module-name PersonalIME
-            -emit-objc-header -emit-objc-header-path ${MAC_SWIFT_HEADER}
-            -c ${MAC_CLIENT_DIR}/CandidateWindow.swift
-            -o ${MAC_SWIFT_OBJ}
-        # 2. Objective-C++ -> objects
+        # 1. Per-architecture Swift objects (bridging header emitted once), then merged
+        ${MAC_SWIFT_ARCH_CMDS}
+        ${MAC_MERGE_SWIFT_CMDS}
+        # 2. Objective-C++ objects, emitted as fat objects in a single pass
         COMMAND ${XCRUN_EXECUTABLE} clang++ -c -x objective-c++ -std=c++20 -fobjc-arc -O2
+            -mmacosx-version-min=${MAC_DEPLOY_TARGET}
+            ${MAC_CLANG_ARCH_FLAGS}
             -I${CMAKE_CURRENT_SOURCE_DIR}/src
             -I${MAC_CLIENT_DIR}
             -I${MAC_OBJ_DIR}
             ${MAC_CLIENT_DIR}/ImeBridge.mm
             -o ${MAC_OBJ_DIR}/ImeBridge.o
         COMMAND ${XCRUN_EXECUTABLE} clang++ -c -x objective-c++ -std=c++20 -fobjc-arc -O2
+            -mmacosx-version-min=${MAC_DEPLOY_TARGET}
+            ${MAC_CLANG_ARCH_FLAGS}
             -I${CMAKE_CURRENT_SOURCE_DIR}/src
             -I${MAC_CLIENT_DIR}
             -I${MAC_OBJ_DIR}
             ${MAC_CLIENT_DIR}/PersonalIMEInputController.mm
             -o ${MAC_OBJ_DIR}/PersonalIMEInputController.o
         COMMAND ${XCRUN_EXECUTABLE} clang++ -c -x objective-c++ -std=c++20 -fobjc-arc -O2
+            -mmacosx-version-min=${MAC_DEPLOY_TARGET}
+            ${MAC_CLANG_ARCH_FLAGS}
             -I${CMAKE_CURRENT_SOURCE_DIR}/src
             -I${MAC_CLIENT_DIR}
             ${MAC_CLIENT_DIR}/main.mm
             -o ${MAC_OBJ_DIR}/main.o
-        # 3. Link with swiftc so the Swift runtime is wired up automatically
-        COMMAND ${XCRUN_EXECUTABLE} swiftc -O
-            -o ${MAC_OBJ_DIR}/PersonalIME
-            ${MAC_OBJ_DIR}/main.o
-            ${MAC_OBJ_DIR}/ImeBridge.o
-            ${MAC_OBJ_DIR}/PersonalIMEInputController.o
-            ${MAC_SWIFT_OBJ}
-            $<TARGET_FILE:ime-core>
-            $<TARGET_FILE:sqlite3>
-            -framework Cocoa
-            -framework InputMethodKit
-            -lc++
+        # 3. Link per architecture with swiftc so the Swift runtime is wired up,
+        #    then merge the executables into a universal binary.
+        ${MAC_LINK_ARCH_CMDS}
+        ${MAC_MERGE_APP_CMDS}
         # 4. Assemble the .app bundle
         COMMAND ${CMAKE_COMMAND} -E make_directory ${MAC_APP_BUNDLE}/Contents/MacOS
         COMMAND ${CMAKE_COMMAND} -E make_directory ${MAC_APP_BUNDLE}/Contents/Resources
@@ -284,7 +354,7 @@ if (APPLE)
             ${MAC_CLIENT_DIR}/PersonalIMEInputController.mm
             ${MAC_CLIENT_DIR}/main.mm
             ${MAC_CLIENT_DIR}/Info.plist
-        COMMENT "Building PersonalIME.app (InputMethodKit shell)"
+        COMMENT "Building universal PersonalIME.app (InputMethodKit shell)"
         VERBATIM
     )
 
