@@ -170,6 +170,24 @@ bool PluginRepository::ExecuteCustom(const std::string& name, const std::string&
         std::wstring wPath = Utf8ToWide(execPath);
         std::wstring wArgs = Utf8ToWide(args);
 
+        // Trim leading and trailing whitespace and quotes
+        size_t first = wPath.find_first_not_of(L" \t\r\n\"");
+        if (first != std::wstring::npos) {
+            size_t last = wPath.find_last_not_of(L" \t\r\n\"");
+            wPath = wPath.substr(first, (last - first + 1));
+        }
+
+        // Auto-expand environment variables (e.g. %LOCALAPPDATA%, %APPDATA%, %SystemRoot%)
+        wchar_t expandedPath[MAX_PATH * 2] = {0};
+        if (ExpandEnvironmentStringsW(wPath.c_str(), expandedPath, ARRAYSIZE(expandedPath)) > 0) {
+            wPath = expandedPath;
+        }
+
+        wchar_t expandedArgs[MAX_PATH * 2] = {0};
+        if (!wArgs.empty() && ExpandEnvironmentStringsW(wArgs.c_str(), expandedArgs, ARRAYSIZE(expandedArgs)) > 0) {
+            wArgs = expandedArgs;
+        }
+
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
         sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
