@@ -24,6 +24,8 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>LSBackgroundOnly</key>
+    <false/>
     <key>LSUIElement</key>
     <true/>
     <key>TICapsLockLanguageSwitchCapable</key>
@@ -48,10 +50,10 @@
     <dict>
         <key>tsInputModeListKey</key>
         <dict>
-            <key>com.personalime.inputmethod.PersonalIME</key>
+            <key>com.personalime.inputmethod.Hans</key>
             <dict>
                 <key>TISInputSourceID</key>
-                <string>com.personalime.inputmethod.PersonalIME</string>
+                <string>com.personalime.inputmethod.Hans</string>
                 <key>TISIntendedLanguage</key>
                 <string>zh-Hans</string>
                 <key>tsInputModeCharacterRepertoireKey</key>
@@ -65,12 +67,12 @@
                 <key>tsInputModePrimaryInScriptKey</key>
                 <true/>
                 <key>tsInputModeScriptKey</key>
-                <string>smSimpChinese</string>
+                <string>smUnicodeScript</string>
             </dict>
         </dict>
         <key>tsVisibleInputModeOrderedArrayKey</key>
         <array>
-            <string>com.personalime.inputmethod.PersonalIME</string>
+            <string>com.personalime.inputmethod.Hans</string>
         </array>
     </dict>
 </dict>

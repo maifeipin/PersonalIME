@@ -358,6 +358,8 @@ if (APPLE)
         COMMAND ${CMAKE_COMMAND} -E copy
             ${MAC_CLIENT_DIR}/PkgInfo ${MAC_APP_BUNDLE}/Contents/PkgInfo
         COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${MAC_CLIENT_DIR}/Resources ${MAC_APP_BUNDLE}/Contents/Resources
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/data/dictionaries
             ${MAC_APP_BUNDLE}/Contents/Resources/dictionaries
         COMMAND ${CODESIGN_EXECUTABLE} --force --sign - ${MAC_APP_BUNDLE}
