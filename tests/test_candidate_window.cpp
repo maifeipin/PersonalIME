@@ -151,6 +151,59 @@ int main() {
     }
     std::wcout << L"[PASS] Verified: Plugin list loaded on candidate bar, aligned with settings button, and executes cleanly." << std::endl;
 
+    // 7. Candidate selection (keyboard SetSelectedIndex, mouse hover selection, click commit & wheel scroll)
+    {
+        CCandidateWindow win;
+        std::vector<std::wstring> cands = { L"1. 人人", L"2. 输入法", L"3. 测试 [cs]" };
+        POINT pt = { 100, 100 };
+        win.Show(cands, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+
+        CHECK_EQ(win.GetCandidateCount(), 3, L"Candidate count must be 3");
+        CHECK_EQ(win.GetSelectedIndex(), 0, L"Initial selected index must be 0");
+        CHECK_EQ((int)win.GetCandidateRects().size(), 3, L"Candidate rects size must match candidate count");
+
+        // Programmatic / Keyboard selection switch
+        win.SetSelectedIndex(1);
+        CHECK_EQ(win.GetSelectedIndex(), 1, L"SetSelectedIndex(1) must update selected index to 1");
+        win.SetSelectedIndex(99);
+        CHECK_EQ(win.GetSelectedIndex(), 2, L"SetSelectedIndex out-of-range must clamp to last candidate");
+        win.SetSelectedIndex(-5);
+        CHECK_EQ(win.GetSelectedIndex(), 0, L"SetSelectedIndex negative must clamp to 0");
+
+        // Mouse hover over candidate 2 switches active selection
+        const auto& rects = win.GetCandidateRects();
+        POINT ptCand2 = { (rects[2].left + rects[2].right) / 2, (rects[2].top + rects[2].bottom) / 2 };
+        SendMessageW(win.GetHwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(ptCand2.x, ptCand2.y));
+        CHECK_EQ(win.GetHoveredIndex(), 2, L"Hovering candidate 2 must set hoveredIndex=2");
+        CHECK_EQ(win.GetSelectedIndex(), 2, L"Hovering candidate 2 must switch selectedIndex=2");
+
+        // Mouse click on candidate 1 triggers OnSelectCandidate(1)
+        int selectedCallbackIdx = -1;
+        win.SetOnSelectCandidate([&](int idx) {
+            selectedCallbackIdx = idx;
+        });
+        POINT ptCand1 = { (rects[1].left + rects[1].right) / 2, (rects[1].top + rects[1].bottom) / 2 };
+        SendMessageW(win.GetHwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(ptCand1.x, ptCand1.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptCand1.x, ptCand1.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptCand1.x, ptCand1.y));
+        CHECK_EQ(selectedCallbackIdx, 1, L"Clicking candidate 1 must invoke OnSelectCandidate(1)");
+
+        // Mouse wheel scroll triggers OnPageScroll
+        int scrollDirection = 0; // 1 = nextPage, -1 = prevPage
+        win.SetOnPageScroll([&](bool nextPage) {
+            scrollDirection = nextPage ? 1 : -1;
+        });
+        SendMessageW(win.GetHwnd(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), MAKELPARAM(ptCand1.x, ptCand1.y));
+        CHECK_EQ(scrollDirection, 1, L"Wheel down (-WHEEL_DELTA) must trigger OnPageScroll(nextPage=true)");
+        SendMessageW(win.GetHwnd(), WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), MAKELPARAM(ptCand1.x, ptCand1.y));
+        CHECK_EQ(scrollDirection, -1, L"Wheel up (+WHEEL_DELTA) must trigger OnPageScroll(nextPage=false)");
+
+        win.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+    }
+    std::wcout << L"[PASS] Verified: Candidate keyboard/mouse selection switch, click commit, and wheel paging." << std::endl;
+
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
 }

@@ -136,9 +136,31 @@ void CCandidateWindow::Hide() {
         ShowWindow(m_hWnd, SW_HIDE);
     }
     m_candidates.clear();
+    m_candidateRects.clear();
+    m_selectedIndex = 0;
+    m_hoveredIndex = -1;
+    m_pressedIndex = -1;
     m_isHoveringMgrBtn = false;
     m_isPressedMgrBtn = false;
     m_trackingMouse = false;
+}
+
+void CCandidateWindow::SetSelectedIndex(int index) {
+    if (m_candidates.empty()) {
+        m_selectedIndex = 0;
+        return;
+    }
+    int clamped = index;
+    if (clamped < 0) clamped = 0;
+    if (clamped >= static_cast<int>(m_candidates.size())) {
+        clamped = static_cast<int>(m_candidates.size()) - 1;
+    }
+    if (m_selectedIndex != clamped) {
+        m_selectedIndex = clamped;
+        if (m_hWnd && IsWindow(m_hWnd)) {
+            InvalidateRect(m_hWnd, nullptr, FALSE);
+        }
+    }
 }
 
 void CCandidateWindow::TriggerManagerButton() {
@@ -159,37 +181,66 @@ void CCandidateWindow::Show(const std::vector<std::wstring>& candidates, POINT p
     }
 
     m_candidates = candidates;
+    m_selectedIndex = 0;
+    m_hoveredIndex = -1;
+    m_pressedIndex = -1;
+    m_candidateRects.clear();
 
-    // Calculate dimensions
+    // Calculate dimensions using bold font so switching selection never shifts candidate layout
     HDC hdc = GetDC(m_hWnd);
-    HFONT hOldFont = (HFONT)SelectObject(hdc, m_hFont);
+    HFONT hMeasureFont = m_hBoldFont ? m_hBoldFont : m_hFont;
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hMeasureFont);
 
-    int totalWidth = 14;
     int maxHeight = 24;
+    std::vector<int> candWidths(m_candidates.size(), 0);
 
     for (size_t i = 0; i < m_candidates.size(); ++i) {
         const auto& cand = m_candidates[i];
-        RECT rcText = { 0, 0, 0, 0 };
-        DrawTextW(hdc, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_CALCRECT | DT_SINGLELINE);
-        int itemW = (rcText.right - rcText.left) + 16;
-        if (i == 0) itemW += 6; // Extra breathing room for the first candidate badge
-        totalWidth += itemW;
-        if (rcText.bottom - rcText.top > maxHeight) {
-            maxHeight = rcText.bottom - rcText.top;
+        size_t bracketPos = cand.find(L'[');
+        if (bracketPos != std::wstring::npos) {
+            std::wstring mainPart = cand.substr(0, bracketPos);
+            std::wstring hintPart = cand.substr(bracketPos);
+            SelectObject(hdc, hMeasureFont);
+            RECT rcMain = { 0, 0, 0, 0 };
+            DrawTextW(hdc, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_CALCRECT | DT_SINGLELINE);
+            SelectObject(hdc, m_hSubFont ? m_hSubFont : m_hFont);
+            RECT rcHint = { 0, 0, 0, 0 };
+            DrawTextW(hdc, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_CALCRECT | DT_SINGLELINE);
+            candWidths[i] = (rcMain.right - rcMain.left) + 2 + (rcHint.right - rcHint.left);
+            if (rcMain.bottom - rcMain.top > maxHeight) {
+                maxHeight = rcMain.bottom - rcMain.top;
+            }
+        } else {
+            SelectObject(hdc, hMeasureFont);
+            RECT rcText = { 0, 0, 0, 0 };
+            DrawTextW(hdc, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_CALCRECT | DT_SINGLELINE);
+            candWidths[i] = (rcText.right - rcText.left);
+            if (rcText.bottom - rcText.top > maxHeight) {
+                maxHeight = rcText.bottom - rcText.top;
+            }
         }
     }
 
     SelectObject(hdc, hOldFont);
     ReleaseDC(m_hWnd, hdc);
 
+    int totalHeight = maxHeight + 14;
+    if (totalHeight < 34) totalHeight = 34;
+
+    int curX = 8;
+    m_candidateRects.resize(m_candidates.size());
+    for (size_t i = 0; i < m_candidates.size(); ++i) {
+        int candW = candWidths[i];
+        m_candidateRects[i] = { curX - 4, 4, curX + candW + 6, totalHeight - 4 };
+        curX += candW + 16;
+    }
+    int totalWidth = curX + 4;
+
     // Reserve space for Manager button (30px) and Plugin buttons (28px each)
     constexpr int MGR_BTN_WIDTH = 30;
     constexpr int PLUGIN_BTN_WIDTH = 28;
     int pluginTotalWidth = static_cast<int>(m_plugins.size()) * PLUGIN_BTN_WIDTH;
     totalWidth += MGR_BTN_WIDTH + pluginTotalWidth;
-
-    int totalHeight = maxHeight + 14;
-    if (totalHeight < 34) totalHeight = 34;
 
     // Immediately establish button rectangles so geometry checks and mouse hits succeed before WM_PAINT
     int btnStartX = totalWidth - (MGR_BTN_WIDTH + pluginTotalWidth);
@@ -249,6 +300,12 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         POINT pt;
         GetCursorPos(&pt);
         ScreenToClient(hWnd, &pt);
+        for (const auto& rcCand : pThis->m_candidateRects) {
+            if (PtInRect(&rcCand, pt)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+        }
         if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
@@ -261,8 +318,31 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         }
     }
 
+    if (uMsg == WM_MOUSEWHEEL && pThis) {
+        short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (zDelta != 0 && pThis->m_onPageScroll) {
+            pThis->m_onPageScroll(zDelta < 0);
+        }
+        return 0;
+    }
+
     if (uMsg == WM_MOUSEMOVE && pThis) {
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        int newHovered = -1;
+        for (size_t i = 0; i < pThis->m_candidateRects.size(); ++i) {
+            if (PtInRect(&pThis->m_candidateRects[i], pt)) {
+                newHovered = static_cast<int>(i);
+                break;
+            }
+        }
+        if (newHovered != pThis->m_hoveredIndex || (newHovered >= 0 && newHovered != pThis->m_selectedIndex)) {
+            pThis->m_hoveredIndex = newHovered;
+            if (newHovered >= 0) {
+                pThis->m_selectedIndex = newHovered;
+            }
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+
         bool inside = PtInRect(&pThis->m_rcMgrBtn, pt);
         if (inside != pThis->m_isHoveringMgrBtn) {
             pThis->m_isHoveringMgrBtn = inside;
@@ -285,6 +365,11 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
     if (uMsg == WM_MOUSELEAVE && pThis) {
         pThis->m_trackingMouse = false;
+        if (pThis->m_hoveredIndex != -1 || pThis->m_pressedIndex != -1) {
+            pThis->m_hoveredIndex = -1;
+            pThis->m_pressedIndex = -1;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
         if (pThis->m_isHoveringMgrBtn || pThis->m_isPressedMgrBtn) {
             pThis->m_isHoveringMgrBtn = false;
             pThis->m_isPressedMgrBtn = false;
@@ -302,6 +387,15 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
     if (uMsg == WM_LBUTTONDOWN && pThis) {
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        for (size_t i = 0; i < pThis->m_candidateRects.size(); ++i) {
+            if (PtInRect(&pThis->m_candidateRects[i], pt)) {
+                pThis->m_pressedIndex = static_cast<int>(i);
+                pThis->m_selectedIndex = static_cast<int>(i);
+                SetCapture(hWnd);
+                InvalidateRect(hWnd, nullptr, FALSE);
+                return 0;
+            }
+        }
         if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
             pThis->m_isPressedMgrBtn = true;
             SetCapture(hWnd);
@@ -323,6 +417,18 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             ReleaseCapture();
         }
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        if (pThis->m_pressedIndex >= 0) {
+            int clickedIdx = pThis->m_pressedIndex;
+            pThis->m_pressedIndex = -1;
+            if (clickedIdx < static_cast<int>(pThis->m_candidateRects.size()) &&
+                PtInRect(&pThis->m_candidateRects[clickedIdx], pt)) {
+                if (pThis->m_onSelectCandidate) {
+                    pThis->m_onSelectCandidate(clickedIdx);
+                }
+                return 0;
+            }
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
         if (pThis->m_isPressedMgrBtn) {
             pThis->m_isPressedMgrBtn = false;
             if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
@@ -371,25 +477,29 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
         SetBkMode(memDC, TRANSPARENT);
 
-        int curX = 8;
         int centerY = (clientRc.bottom - clientRc.top) / 2;
 
         for (size_t i = 0; i < pThis->m_candidates.size(); ++i) {
             const auto& cand = pThis->m_candidates[i];
+            bool isSelected = (static_cast<int>(i) == pThis->m_selectedIndex);
+            bool isHovered = (static_cast<int>(i) == pThis->m_hoveredIndex);
 
-            // Measure item
-            SelectObject(memDC, (i == 0 && pThis->m_hBoldFont) ? pThis->m_hBoldFont : pThis->m_hFont);
+            HFONT hItemFont = (isSelected && pThis->m_hBoldFont) ? pThis->m_hBoldFont : pThis->m_hFont;
+            SelectObject(memDC, hItemFont);
             RECT rcCalc = { 0, 0, 0, 0 };
             DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcCalc, DT_CALCRECT | DT_SINGLELINE);
-            int candW = rcCalc.right - rcCalc.left;
             int candH = rcCalc.bottom - rcCalc.top;
             int textY = centerY - (candH / 2);
 
-            if (i == 0) {
-                // First candidate: modern soft-blue accent pill
-                RECT rcPill = { curX - 3, 4, curX + candW + 5, clientRc.bottom - 4 };
+            RECT rcPill = (i < pThis->m_candidateRects.size())
+                ? pThis->m_candidateRects[i]
+                : RECT{ 5, 4, 60, clientRc.bottom - 4 };
+            int curX = rcPill.left + 4;
+
+            if (isSelected) {
+                // Selected candidate: modern soft-blue accent pill
                 HBRUSH hPillBrush = CreateSolidBrush(RGB(240, 246, 255));
-                HPEN hPillPen = CreatePen(PS_SOLID, 1, RGB(212, 230, 255));
+                HPEN hPillPen = CreatePen(PS_SOLID, 1, RGB(190, 220, 255));
                 HPEN hOldPillPen = (HPEN)SelectObject(memDC, hPillPen);
                 HBRUSH hOldPillBrush = (HBRUSH)SelectObject(memDC, hPillBrush);
                 RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, 6, 6);
@@ -398,7 +508,6 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 DeleteObject(hPillPen);
                 DeleteObject(hPillBrush);
 
-                // Check for reverse lookup hint (e.g. "1. 供 [wawy]")
                 size_t bracketPos = cand.find(L'[');
                 if (bracketPos != std::wstring::npos) {
                     std::wstring mainPart = cand.substr(0, bracketPos);
@@ -413,17 +522,27 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
                     SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
                     RECT rcHint = { curX + (rcMainCalc.right - rcMainCalc.left) + 2, textY + 2, clientRc.right, clientRc.bottom };
-                    SetTextColor(memDC, RGB(140, 146, 156));
+                    SetTextColor(memDC, RGB(100, 130, 165));
                     DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE);
-                    SelectObject(memDC, (i == 0 && pThis->m_hBoldFont) ? pThis->m_hBoldFont : pThis->m_hFont);
+                    SelectObject(memDC, hItemFont);
                 } else {
                     SetTextColor(memDC, RGB(0, 102, 204));
                     RECT rcText = { curX, textY, clientRc.right, clientRc.bottom };
                     DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE);
                 }
-                curX += candW + 18;
             } else {
-                // Secondary candidates
+                if (isHovered) {
+                    HBRUSH hHoverBrush = CreateSolidBrush(RGB(245, 247, 250));
+                    HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(220, 226, 235));
+                    HPEN hOldHoverPen = (HPEN)SelectObject(memDC, hHoverPen);
+                    HBRUSH hOldHoverBrush = (HBRUSH)SelectObject(memDC, hHoverBrush);
+                    RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, 6, 6);
+                    SelectObject(memDC, hOldHoverPen);
+                    SelectObject(memDC, hOldHoverBrush);
+                    DeleteObject(hHoverPen);
+                    DeleteObject(hHoverBrush);
+                }
+
                 size_t bracketPos = cand.find(L'[');
                 if (bracketPos != std::wstring::npos) {
                     std::wstring mainPart = cand.substr(0, bracketPos);
@@ -446,7 +565,6 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                     RECT rcText = { curX, textY, clientRc.right, clientRc.bottom };
                     DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE);
                 }
-                curX += candW + 14;
             }
         }
 

@@ -35,6 +35,26 @@ CTextInputProcessor::CTextInputProcessor() {
                           nullptr, SW_SHOWNORMAL);
         }
     });
+
+    m_candidateWindow.SetOnSelectCandidate([this](int index) {
+        ITfContext* pCtx = m_pCompositionContext;
+        if (pCtx && index >= 0 && index < 9) {
+            pCtx->AddRef();
+            BOOL eaten = FALSE;
+            OnKeyDown(pCtx, static_cast<WPARAM>('1' + index), 0, &eaten);
+            pCtx->Release();
+        }
+    });
+
+    m_candidateWindow.SetOnPageScroll([this](bool nextPage) {
+        ITfContext* pCtx = m_pCompositionContext;
+        if (pCtx) {
+            pCtx->AddRef();
+            BOOL eaten = FALSE;
+            OnKeyDown(pCtx, nextPage ? VK_NEXT : VK_PRIOR, 0, &eaten);
+            pCtx->Release();
+        }
+    });
 }
 
 void CTextInputProcessor::OpenManagerFromTray() {
@@ -78,6 +98,8 @@ void CTextInputProcessor::OpenManagerFromTray() {
 CTextInputProcessor::~CTextInputProcessor() {
     m_candidateWindow.SetOnOpenManager(nullptr);
     m_candidateWindow.SetOnExecutePlugin(nullptr);
+    m_candidateWindow.SetOnSelectCandidate(nullptr);
+    m_candidateWindow.SetOnPageScroll(nullptr);
     // Final Release must not create sessions that AddRef a TIP already being destroyed.
     DrainUnconfirmedCommits(false);
     for (const auto& c : m_unconfirmedCommits) {
@@ -530,6 +552,12 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
         return S_OK;
     }
 
+    if (m_candidateWindow.GetCandidateCount() > 0 &&
+        (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN)) {
+        *pfEaten = TRUE;
+        return S_OK;
+    }
+
     IpcKeyRequest req{};
     req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
     req.session_id = m_sessionId;
@@ -715,6 +743,42 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
         m_activeContextId = contextId;
     }
 
+    bool selectLastOnPageUp = false;
+    if (m_candidateWindow.GetCandidateCount() > 0) {
+        int count = m_candidateWindow.GetCandidateCount();
+        int sel = m_candidateWindow.GetSelectedIndex();
+        if (wParam == VK_RIGHT || wParam == VK_DOWN) {
+            if (sel + 1 < count) {
+                m_candidateWindow.SetSelectedIndex(sel + 1);
+                *pfEaten = TRUE;
+                return S_OK;
+            } else if (m_currentPageIndex + 1 < m_currentPageCount) {
+                wParam = VK_NEXT;
+            } else {
+                m_candidateWindow.SetSelectedIndex(0);
+                *pfEaten = TRUE;
+                return S_OK;
+            }
+        } else if (wParam == VK_LEFT || wParam == VK_UP) {
+            if (sel > 0) {
+                m_candidateWindow.SetSelectedIndex(sel - 1);
+                *pfEaten = TRUE;
+                return S_OK;
+            } else if (m_currentPageIndex > 0) {
+                wParam = VK_PRIOR;
+                selectLastOnPageUp = true;
+            } else {
+                m_candidateWindow.SetSelectedIndex(count - 1);
+                *pfEaten = TRUE;
+                return S_OK;
+            }
+        } else if ((wParam == VK_SPACE || wParam == VK_RETURN) && (GetKeyState(VK_SHIFT) & 0x8000) == 0) {
+            if (sel >= 0 && sel < count && sel < 9) {
+                wParam = static_cast<WPARAM>('1' + sel);
+            }
+        }
+    }
+
     IpcKeyRequest req{};
     req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
     req.session_id = m_sessionId;
@@ -743,8 +807,12 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
 
         if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
             m_contextCandidateVersions[contextId] = resp.candidate_version;
+            m_currentPageIndex = resp.page_index;
+            m_currentPageCount = resp.page_count;
         } else if (resp.has_composition && resp.composition[0] == L'\0') {
             m_contextCandidateVersions[contextId] = 0;
+            m_currentPageIndex = 0;
+            m_currentPageCount = 0;
         }
 
         std::vector<std::wstring> cands;
@@ -770,7 +838,17 @@ STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPAR
             HRESULT hrSession = S_OK;
             HRESULT hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
             EditSessionResult result = pSession->GetResult();
+            if (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS) {
+                hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_ASYNC | TF_ES_READWRITE, &hrSession);
+                if (SUCCEEDED(hr) && SUCCEEDED(hrSession)) {
+                    result = EditSessionResult::Success;
+                }
+            }
             pSession->Release();
+
+            if (selectLastOnPageUp && m_candidateWindow.GetCandidateCount() > 0) {
+                m_candidateWindow.SetSelectedIndex(m_candidateWindow.GetCandidateCount() - 1);
+            }
 
             if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && result == EditSessionResult::Success) {
                 *pfEaten = TRUE;

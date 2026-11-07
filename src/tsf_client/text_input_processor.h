@@ -193,6 +193,8 @@ private:
 
     // Context-isolated candidate snapshot versions
     std::map<uint64_t, uint32_t> m_contextCandidateVersions;
+    uint32_t m_currentPageIndex = 0;
+    uint32_t m_currentPageCount = 0;
 
     // Taskbar Tray / Language Bar button
     class CLangBarItemButton* m_pLangBarButton = nullptr;
