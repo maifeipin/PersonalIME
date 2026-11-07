@@ -37,7 +37,6 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; Admin privileges used strictly for Program Files & Machine COM Registration.
 ; User data (%APPDATA%) and user profile registry are untouched by admin installer.
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=dialog
 
 ; Safety & In-Use Handling:
 ; Never forcefully kill third-party host applications (Explorer, browsers, terminals).
@@ -49,7 +48,7 @@ UninstallDisplayIcon={app}\manager\{#MyAppExeName}
 
 [Registry]
 ; 开机静默自动启动输入法后台核心服务
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PersonalIMEService"; ValueData: """{app}\ime-service.exe"""; Flags: uninsdeletevalue
+Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "PersonalIMEService"; ValueData: """{app}\ime-service.exe"""; Flags: uninsdeletevalue dontcreatekey
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
