@@ -68,11 +68,17 @@ public class UserEntryItem
     [JsonPropertyName("text")]
     public string Text { get; set; } = string.Empty;
 
+    [JsonPropertyName("source")]
+    public int Source { get; set; } = 1;
+
     [JsonPropertyName("codes")]
     public List<EntryCodeItem> Codes { get; set; } = [];
 
     public string FormattedCodes => string.Join(", ", Codes.Select(c => $"{c.SchemeDisplayName}: {c.Code}"));
     public string SummaryText => Text.Length > 30 ? Text[..30] + "..." : Text;
+
+    public bool IsSystem => Source == 0 || Id.StartsWith("builtin:");
+    public string SourceDisplayName => IsSystem ? "系统内置" : "用户词库";
 }
 
 public class PinnedItem

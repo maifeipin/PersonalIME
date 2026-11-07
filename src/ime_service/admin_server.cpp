@@ -725,6 +725,34 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
                 }
             }
 
+            // Include matching system built-in entries when searching with a keyword
+            if (!keyword.empty() && m_engine.GetBuiltinDict().IsLoaded()) {
+                std::wstring wKw = Utf8ToWide(keyword);
+                auto builtinMatches = m_engine.GetBuiltinDict().SearchEntries(wKw, keyword, 100);
+                for (const auto& be : builtinMatches) {
+                    bool alreadyIn = false;
+                    for (const auto& fe : filtered) {
+                        if (fe.text == be.text) {
+                            alreadyIn = true;
+                            break;
+                        }
+                    }
+                    if (!alreadyIn) {
+                        if (!schemeFilter.empty()) {
+                            bool hasScheme = false;
+                            for (const auto& c : be.codes) {
+                                if (c.first == reqScheme) {
+                                    hasScheme = true;
+                                    break;
+                                }
+                            }
+                            if (!hasScheme) continue;
+                        }
+                        filtered.push_back(be);
+                    }
+                }
+            }
+
             size_t total = filtered.size();
             size_t start = static_cast<size_t>(page) * pageSize;
             nlohmann::json entriesArr = nlohmann::json::array();

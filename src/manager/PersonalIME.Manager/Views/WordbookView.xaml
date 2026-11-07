@@ -50,6 +50,7 @@
             <!-- Entries DataGrid -->
             <DataGrid Grid.Row="1" ItemsSource="{Binding Entries}" SelectedItem="{Binding SelectedEntry}" AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single" GridLinesVisibility="Horizontal" HeadersVisibility="Column" Background="White" RowHeight="32">
                 <DataGrid.Columns>
+                    <DataGridTextColumn Header="来源" Binding="{Binding SourceDisplayName}" Width="85"/>
                     <DataGridTextColumn Header="条目 ID" Binding="{Binding Id}" Width="160"/>
                     <DataGridTextColumn Header="词条正文" Binding="{Binding SummaryText}" Width="250"/>
                     <DataGridTextColumn Header="绑定编码" Binding="{Binding FormattedCodes}" Width="*"/>

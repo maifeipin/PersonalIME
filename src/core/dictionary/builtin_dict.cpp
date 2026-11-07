@@ -548,5 +548,89 @@ std::vector<std::string> BuiltinDictionary::ReverseLookupShuangpin(const std::ws
     return codes;
 }
 
+std::vector<Entry> BuiltinDictionary::SearchEntries(const std::wstring& keywordText, const std::string& keywordCode, size_t maxResults) const {
+    std::vector<Entry> results;
+    if (keywordText.empty() && keywordCode.empty()) {
+        return results;
+    }
+
+    std::vector<std::wstring> matchedTexts;
+    std::unordered_set<std::wstring> seenTexts;
+
+    auto addMatch = [&](const std::wstring& text) {
+        if (!text.empty() && seenTexts.insert(text).second) {
+            matchedTexts.push_back(text);
+        }
+    };
+
+    // 1. Text lookup: exact match first
+    if (!keywordText.empty()) {
+        if (m_pinyinByText.find(keywordText) != m_pinyinByText.end() ||
+            m_wubiByText.find(keywordText) != m_wubiByText.end()) {
+            addMatch(keywordText);
+        }
+
+        // Substring matches in pinyin dictionary
+        for (const auto& pair : m_pinyinByText) {
+            if (matchedTexts.size() >= maxResults) break;
+            if (pair.first.find(keywordText) != std::wstring::npos) {
+                addMatch(pair.first);
+            }
+        }
+
+        // Substring matches in wubi dictionary
+        for (const auto& pair : m_wubiByText) {
+            if (matchedTexts.size() >= maxResults) break;
+            if (pair.first.find(keywordText) != std::wstring::npos) {
+                addMatch(pair.first);
+            }
+        }
+    }
+
+    // 2. Code lookup (if keywordCode provided)
+    if (!keywordCode.empty() && matchedTexts.size() < maxResults) {
+        // Continuous pinyin exact match
+        auto itP = m_pinyinExactContinuous.find(keywordCode);
+        if (itP != m_pinyinExactContinuous.end()) {
+            for (const auto& item : itP->second) {
+                if (matchedTexts.size() >= maxResults) break;
+                addMatch(item.text);
+            }
+        }
+
+        // Wubi exact match
+        auto itW = m_wubiExact.find(keywordCode);
+        if (itW != m_wubiExact.end()) {
+            for (const auto& item : itW->second) {
+                if (matchedTexts.size() >= maxResults) break;
+                addMatch(item.text);
+            }
+        }
+    }
+
+    // 3. Assemble Entry objects with their respective codes
+    results.reserve(matchedTexts.size());
+    for (const auto& text : matchedTexts) {
+        Entry e;
+        e.id = "builtin:" + WideToUtf8(text);
+        e.text = text;
+        e.source = EntrySource::Builtin;
+
+        auto wubiCodes = ReverseLookupWubi(text);
+        for (const auto& c : wubiCodes) {
+            e.codes.push_back({InputScheme::Wubi86, c});
+        }
+
+        auto pyCodes = ReverseLookupPinyin(text);
+        for (const auto& c : pyCodes) {
+            e.codes.push_back({InputScheme::Pinyin, c});
+        }
+
+        results.push_back(std::move(e));
+    }
+
+    return results;
+}
+
 } // namespace ime
 

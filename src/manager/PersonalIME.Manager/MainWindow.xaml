@@ -7,7 +7,7 @@
         xmlns:views="clr-namespace:PersonalIME.Manager.Views"
         mc:Ignorable="d"
         d:DataContext="{d:DesignInstance Type=vm:MainViewModel}"
-        Title="人人 设置" Height="720" Width="980" MinHeight="580" MinWidth="820"
+        Title="设置" Height="720" Width="980" MinHeight="580" MinWidth="820"
         WindowStartupLocation="CenterScreen"
         Icon="Assets/app.ico"
         Background="#F9FAFB">
@@ -116,7 +116,7 @@
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                         <TextBlock Text="人人" FontSize="18" FontWeight="Bold" Foreground="#111827"/>
                         <Border Margin="8,0,0,0" Background="#EEF2F6" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
-                            <TextBlock Text="人人 · 智能五笔 / 拼音混输" FontSize="11" Foreground="#4B5563" FontWeight="SemiBold"/>
+                            <TextBlock Text="智能五笔 / 拼音混输" FontSize="11" Foreground="#4B5563" FontWeight="SemiBold"/>
                         </Border>
                     </StackPanel>
                     <TextBlock Text="现代中文输入法与个性化词库管理" FontSize="11" Foreground="#6B7280" Margin="0,2,0,0"/>

@@ -62,6 +62,9 @@ public:
     std::vector<std::string> ReverseLookupPinyin(const std::wstring& text) const;
     std::vector<std::string> ReverseLookupShuangpin(const std::wstring& text, const ShuangpinDecoder& decoder) const;
 
+    // Search builtin entries by text and/or code for wordbook queries
+    std::vector<Entry> SearchEntries(const std::wstring& keywordText, const std::string& keywordCode, size_t maxResults = 100) const;
+
     // Stage 6 Sentence DAG & Viterbi helper
     const std::vector<BuiltinPinyinItem>* FindPinyinExactSpaced(const std::string& spacedSyllables) const {
         auto it = m_pinyinExactSpaced.find(spacedSyllables);

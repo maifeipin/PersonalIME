@@ -291,8 +291,8 @@ public class WordbookViewModel : ViewModelBase
         Interlocked.Increment(ref _editorSessionToken);
         Interlocked.Increment(ref _reverseLookupGeneration);
         _reverseLookupCts?.Cancel();
-        EditorTitle = "编辑自定义词条";
-        EditorEntryId = SelectedEntry.Id;
+        EditorTitle = SelectedEntry.IsSystem ? "自定义系统词条" : "编辑自定义词条";
+        EditorEntryId = SelectedEntry.IsSystem ? string.Empty : SelectedEntry.Id;
         EditorText = SelectedEntry.Text;
         EditorCodes.Clear();
         foreach (var c in SelectedEntry.Codes)
@@ -476,6 +476,11 @@ public class WordbookViewModel : ViewModelBase
     public async Task DeleteEntryAsync()
     {
         if (SelectedEntry == null) return;
+        if (SelectedEntry.IsSystem)
+        {
+            _banner.ShowWarning("系统内置词条受保护，无需删除。如需自定义，可直接编辑保存为用户词条。");
+            return;
+        }
         string id = SelectedEntry.Id;
         string text = SelectedEntry.Text;
 
