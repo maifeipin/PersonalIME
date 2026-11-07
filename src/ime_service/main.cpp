@@ -921,6 +921,8 @@ void HandleClient(HANDLE hPipe) {
                 // English mode
                 if (state.full_width && !MapFullWidthChar(vk, mods).empty()) {
                     resp.handled = 1;
+                } else if (!state.full_width && (mods & (2 | 4 | 8)) == 0 && (vk >= 'A' && vk <= 'Z')) {
+                    resp.handled = 1;
                 } else {
                     resp.handled = 0;
                 }
@@ -1014,6 +1016,14 @@ void HandleClient(HANDLE hPipe) {
                     } else {
                         resp.handled = 0;
                     }
+                } else if ((mods & (2 | 4 | 8)) == 0 && (vk >= 'A' && vk <= 'Z')) {
+                    // English half-width mode:
+                    // Commit LOWERCASE by default; require Shift for UPPERCASE!
+                    bool isShift = (mods & 1) != 0;
+                    wchar_t ch = isShift ? static_cast<wchar_t>(vk) : static_cast<wchar_t>(std::tolower(static_cast<char>(vk)));
+                    SafeCopyCommitText(resp, std::wstring(1, ch));
+                    resp.commit_event_id = 0;
+                    resp.handled = 1;
                 } else {
                     resp.handled = 0;
                 }

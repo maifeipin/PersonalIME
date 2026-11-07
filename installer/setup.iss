@@ -5,7 +5,7 @@
 ; =====================================================================
 
 #ifndef MyAppVersion
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.9"
 #endif
 
 #define MyAppName "人人"
@@ -32,6 +32,15 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+
+; Executable Metadata & Version Information:
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoTextVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} 输入法安装程序
+VersionInfoCopyright=Copyright (C) 2026 {#MyAppPublisher}
+VersionInfoProductName={#MyAppName}
+VersionInfoProductVersion={#MyAppVersion}
 
 ; Clean Machine-Level Privileges Model:
 ; Admin privileges used strictly for Program Files & Machine COM Registration.

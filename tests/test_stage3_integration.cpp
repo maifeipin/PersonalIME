@@ -733,6 +733,33 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition cleared after committing raw input");
         CHECK_EQUAL(resp.status_flags & IPC_MODE_CHINESE, 0u, L"Context switched to English mode on CapsLock");
 
+        // 2c. Verify English mode lowercase default and Shift uppercase assistance
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
+        req.vk_code = 'A';
+        req.modifiers = 0;
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"TestKeyDown for 'A' in English mode must be handled");
+
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"KeyDown for 'A' in English mode must be handled");
+        CHECK_EQUAL(resp.has_commit, 1, L"English 'A' must commit");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"a") == 0, L"English 'A' without Shift must commit lowercase 'a'");
+
+        // Shift + 'A' must commit uppercase 'A'
+        req.modifiers = 1; // Shift
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"KeyDown for Shift+'A' in English mode must be handled");
+        CHECK_EQUAL(resp.has_commit, 1, L"Shift+'A' must commit");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"A") == 0, L"Shift+'A' must commit uppercase 'A'");
+
+        // Shortcuts like Ctrl+C must NOT be handled (pass through to OS)
+        req.modifiers = 2; // Ctrl
+        req.vk_code = 'C';
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 0, L"Ctrl+C in English mode must pass through (handled = 0)");
+        req.modifiers = 0;
+
         // Press VK_CAPITAL again to return to Chinese mode
         client.SendRequest(req, resp, 80);
         CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Second VK_CAPITAL returns to Chinese mode");
