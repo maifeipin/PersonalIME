@@ -4,14 +4,15 @@ project(PersonalIME LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Enforce static runtime (/MT in Release, /MTd in Debug) for zero external CRT dependency
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
 if (MSVC)
+    # Enforce static runtime (/MT in Release, /MTd in Debug) for zero external CRT dependency
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_options(/utf-8)
 endif()
 
-add_definitions(-DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN)
+if (WIN32)
+    add_definitions(-DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN)
+endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -69,6 +70,7 @@ target_link_libraries(test_ime_core PRIVATE
     ime-core
 )
 
+if (WIN32)
 # --- Stage 1 Targets ---
 
 # 1. Thin TSF In-process DLL
@@ -192,15 +194,18 @@ target_link_libraries(test_receipt_durability PRIVATE user32)
 
 add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/lang_bar_item.cpp src/tsf_client/ipc_client.cpp)
 target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32 shell32)
+endif() # WIN32
 
 # Stage 4A: Input Policy & Shuangpin Test
 add_executable(test_input_policy tests/test_input_policy.cpp)
 target_link_libraries(test_input_policy PRIVATE ime-core sqlite3)
 
 # Stage 4B: Admin IPC & Service Integration Test
+if (WIN32)
 add_executable(test_admin_ipc
     tests/test_admin_ipc.cpp
     src/ime_service/admin_server.cpp
 )
 target_link_libraries(test_admin_ipc PRIVATE ime-core sqlite3 advapi32 user32)
+endif()
 

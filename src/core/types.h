@@ -180,6 +180,7 @@ struct QueryResult {
 };
 
 // UTF-8 / UTF-16 Conversion Helpers
+#ifdef _WIN32
 inline std::wstring Utf8ToWide(const std::string& str) {
     if (str.empty()) return L"";
     int req = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(), static_cast<int>(str.length()), nullptr, 0);
@@ -197,6 +198,76 @@ inline std::string WideToUtf8(const std::wstring& wstr) {
     WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wstr.c_str(), static_cast<int>(wstr.length()), &str[0], req, nullptr, nullptr);
     return str;
 }
+#else // !_WIN32 — portable implementation (wchar_t is UTF-32 on macOS/Linux, UTF-16 elsewhere)
+inline std::wstring Utf8ToWide(const std::string& str) {
+    std::wstring out;
+    for (size_t i = 0; i < str.size();) {
+        unsigned char c = static_cast<unsigned char>(str[i]);
+        uint32_t cp;
+        size_t len;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c >> 5) == 0x6) { cp = c & 0x1F; len = 2; }
+        else if ((c >> 4) == 0xE) { cp = c & 0x0F; len = 3; }
+        else if ((c >> 3) == 0x1E) { cp = c & 0x07; len = 4; }
+        else return L""; // invalid lead byte, mirrors MB_ERR_INVALID_CHARS
+        if (i + len > str.size()) return L"";
+        for (size_t j = 1; j < len; ++j) {
+            unsigned char cc = static_cast<unsigned char>(str[i + j]);
+            if ((cc >> 6) != 0x2) return L"";
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) || (len == 4 && cp < 0x10000)) return L""; // overlong
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return L"";
+        i += len;
+        if constexpr (sizeof(wchar_t) == 2) {
+            if (cp > 0xFFFF) {
+                cp -= 0x10000;
+                out.push_back(static_cast<wchar_t>(0xD800 + (cp >> 10)));
+                out.push_back(static_cast<wchar_t>(0xDC00 + (cp & 0x3FF)));
+            } else {
+                out.push_back(static_cast<wchar_t>(cp));
+            }
+        } else {
+            out.push_back(static_cast<wchar_t>(cp));
+        }
+    }
+    return out;
+}
+
+inline std::string WideToUtf8(const std::wstring& wstr) {
+    std::string out;
+    for (size_t i = 0; i < wstr.size(); ++i) {
+        uint32_t cp = static_cast<uint32_t>(wstr[i]);
+        if constexpr (sizeof(wchar_t) == 2) {
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (i + 1 >= wstr.size()) return "";
+                uint32_t low = static_cast<uint32_t>(wstr[i + 1]);
+                if (low < 0xDC00 || low > 0xDFFF) return "";
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                ++i;
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                return "";
+            }
+        }
+        if (cp < 0x80) {
+            out.push_back(static_cast<char>(cp));
+        } else if (cp < 0x800) {
+            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else if (cp < 0x10000) {
+            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+    return out;
+}
+#endif
 
 } // namespace ime
 

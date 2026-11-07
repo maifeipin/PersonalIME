@@ -3,12 +3,29 @@
 #include <sstream>
 #include <vector>
 #include <iomanip>
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#else
+#include <chrono>
+#endif
 #include "../core/engine/ime_engine.h"
 #include "../core/types.h"
 
 using namespace ime;
+
+// Cross-platform monotonic clock in milliseconds
+static double NowMs() {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = []() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return static_cast<double>(now.QuadPart) * 1000.0 / freq.QuadPart;
+#else
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
 
 static void PrintHelp() {
     std::cout << "=================================================================\n";
@@ -285,17 +302,14 @@ static CommandResult ExecuteCommand(ImeEngine& engine, const std::vector<std::st
 
     if (cmd == "bench") {
         std::cout << "Running benchmark on 1,000 queries...\n";
-        LARGE_INTEGER freq, start, end;
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&start);
+        double startMs = NowMs();
 
         for (int i = 0; i < 500; ++i) {
             engine.Query(InputScheme::Pinyin, "zhongwen");
             engine.Query(InputScheme::Wubi86, "aaaa");
         }
 
-        QueryPerformanceCounter(&end);
-        double totalMs = (end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+        double totalMs = NowMs() - startMs;
         double avgUs = (totalMs * 1000.0) / 1000.0;
         std::cout << "1,000 queries completed in " << totalMs << " ms (Average: " << avgUs << " us per query!)\n";
         return {false, true};
@@ -306,18 +320,24 @@ static CommandResult ExecuteCommand(ImeEngine& engine, const std::vector<std::st
 }
 
 int main(int argc, char* argv[]) {
+    std::vector<std::string> allArgs;
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 
     int wargc = 0;
     LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
-    std::vector<std::string> allArgs;
     if (wargv) {
         for (int i = 0; i < wargc; ++i) {
             allArgs.push_back(WideToUtf8(wargv[i]));
         }
         LocalFree(wargv);
     }
+#else
+    for (int i = 0; i < argc; ++i) {
+        allArgs.emplace_back(argv[i]);
+    }
+#endif
 
     std::string dbPath = "personal_ime.db";
     std::string dictDir = "data/dictionaries";
@@ -336,17 +356,14 @@ int main(int argc, char* argv[]) {
     }
 
     ImeEngine engine;
-    LARGE_INTEGER freq, t0, t1;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
+    double t0Ms = NowMs();
 
     if (!engine.Initialize(dbPath, dictDir)) {
         std::cerr << "[FATAL] Failed to initialize PersonalIME Engine with DB: " << dbPath << ", Dict: " << dictDir << "\n";
         return 1;
     }
 
-    QueryPerformanceCounter(&t1);
-    double initMs = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+    double initMs = NowMs() - t0Ms;
 
     if (!cmdArgs.empty()) {
         // Direct command mode

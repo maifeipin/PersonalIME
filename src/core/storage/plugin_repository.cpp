@@ -1,7 +1,20 @@
 #include "plugin_repository.h"
 #include "../types.h"
+#ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#else
+#include <spawn.h>
+#include <cerrno>
+#include <cstring>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define IME_ENVIRON (*_NSGetEnviron())
+#else
+extern char** environ;
+#define IME_ENVIRON environ
+#endif
+#endif
 
 namespace ime {
 
@@ -167,6 +180,7 @@ bool PluginRepository::ExecuteCustom(const std::string& name, const std::string&
     if (m_processLauncher) {
         ok = m_processLauncher(execPath, args, pid, win32Err);
     } else {
+#ifdef _WIN32
         std::wstring wPath = Utf8ToWide(execPath);
         std::wstring wArgs = Utf8ToWide(args);
 
@@ -207,11 +221,44 @@ bool PluginRepository::ExecuteCustom(const std::string& name, const std::string&
                 CloseHandle(sei.hProcess);
             }
         }
+#else
+        // POSIX fallback: naive whitespace split of args, no shell expansion
+        std::vector<std::string> parts;
+        parts.push_back(execPath);
+        std::string cur;
+        for (char c : args) {
+            if (c == ' ' || c == '\t') {
+                if (!cur.empty()) { parts.push_back(cur); cur.clear(); }
+            } else {
+                cur.push_back(c);
+            }
+        }
+        if (!cur.empty()) parts.push_back(cur);
+
+        std::vector<char*> argv;
+        argv.reserve(parts.size() + 1);
+        for (auto& p : parts) argv.push_back(const_cast<char*>(p.c_str()));
+        argv.push_back(nullptr);
+
+        pid_t child = -1;
+        int spawnErr = posix_spawnp(&child, execPath.c_str(), nullptr, nullptr, argv.data(), IME_ENVIRON);
+        if (spawnErr != 0) {
+            win32Err = static_cast<uint32_t>(spawnErr);
+            ok = false;
+        } else {
+            ok = true;
+            pid = static_cast<uint32_t>(child);
+        }
+#endif
     }
 
     if (!ok) {
         if (outStatus) *outStatus = PluginExecStatus::LaunchFailed;
+#ifdef _WIN32
         outMessage = "Failed to launch process (Windows error code: " + std::to_string(win32Err) + ")";
+#else
+        outMessage = "Failed to launch process (posix_spawnp error: " + std::string(std::strerror(static_cast<int>(win32Err))) + ")";
+#endif
         AddPluginLog(pluginId, name, cmdLine, "FAILED", outMessage);
         return false;
     }

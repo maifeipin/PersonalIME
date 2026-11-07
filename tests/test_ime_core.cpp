@@ -997,7 +997,9 @@ static int TestStage4C2ReverseLookupCore(ImeEngine& engine) {
 }
 
 int main() {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
     std::cout << "=== Running PersonalIME Stage 2 (ime-core) Test Suite ===" << std::endl;
 
     std::cout << "Step 1: Initializing ImeEngine..." << std::endl;
