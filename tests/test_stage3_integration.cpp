@@ -761,6 +761,7 @@ int main(int argc, char* argv[]) {
         req.modifiers = 0;
 
         // Press VK_CAPITAL again to return to Chinese mode
+        req.vk_code = VK_CAPITAL;
         client.SendRequest(req, resp, 80);
         CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Second VK_CAPITAL returns to Chinese mode");
 
