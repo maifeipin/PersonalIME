@@ -38,10 +38,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; User data (%APPDATA%) and user profile registry are untouched by admin installer.
 PrivilegesRequired=admin
 
-; Safety & In-Use Handling:
-; Never forcefully kill third-party host applications (Explorer, browsers, terminals).
-; Locked DLLs use Windows MoveFileEx delay until system restart.
-CloseApplications=no
+; Safety & Clean In-Use Handling:
+; Enable Windows Restart Manager to detect and safely close locking processes (such as Explorer),
+; allowing PersonalIME.dll to be cleanly deleted without requiring a system reboot.
+CloseApplications=yes
+RestartApplications=yes
 RestartIfNeededByRun=no
 SetupLogging=yes
 UninstallDisplayIcon={app}\manager\{#MyAppExeName}
@@ -85,6 +86,16 @@ Name: "{group}\启动后台服务"; Filename: "{app}\{#MyServiceExeName}"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Personal IME 管理器"; Filename: "{app}\manager\{#MyAppExeName}"; Tasks: desktopicon
 
+[UninstallDelete]
+; Clean up dynamically generated dictionaries, cache, logs, and empty directories
+Type: filesandordirs; Name: "{app}\dictionaries"
+Type: filesandordirs; Name: "{app}\manager"
+Type: filesandordirs; Name: "{app}\logs"
+Type: files; Name: "{app}\*.log"
+Type: files; Name: "{app}\*.tmp"
+Type: files; Name: "{app}\*.db*"
+Type: filesandordirs; Name: "{app}"
+
 [Run]
 ; Launch service and manager under original user session context unless reboot pending
 Filename: "{app}\{#MyServiceExeName}"; Description: "立即启动后台输入服务"; Flags: nowait postinstall skipifsilent runasoriginaluser; Check: NotRestarting
@@ -94,6 +105,23 @@ Filename: "{app}\manager\{#MyAppExeName}"; Description: "打开 Personal IME 管
 var
   G_InitialChecksum: String;
   G_RestartNeeded: Boolean;
+  G_PurgeUserData: Boolean;
+
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  G_PurgeUserData := False;
+  if not UninstallSilent() then
+  begin
+    if MsgBox('是否同时删除个人词库与自定义配置数据？' + #13#10 + #13#10 +
+              '【是 (Y)】：彻底清除所有用户数据、词库数据库与配置记录（%APPDATA%\PersonalIME）。' + #13#10 +
+              '【否 (N)】：保留个人词库（推荐，方便后续重新安装时自动恢复使用）。',
+              mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      G_PurgeUserData := True;
+    end;
+  end;
+end;
 
 procedure InitializeWizard();
 begin
@@ -120,27 +148,71 @@ begin
   Result := G_RestartNeeded;
 end;
 
-// Stop any currently running ime-service strictly belonging to this application directory
-procedure StopAppServiceIfRunning();
+// Stop all running PersonalIME processes (ime-service and PersonalIME.Manager)
+procedure StopAllAppProcesses();
 var
   ResultCode: Integer;
   AppPath: String;
 begin
   AppPath := ExpandConstant('{app}');
-  Exec('powershell.exe', '-NoProfile -Command "Get-Process -Name ime-service -ErrorAction SilentlyContinue | Where-Object { try { $_.MainModule.FileName -like ''' + AppPath + '\*'' } catch { $false } } | Stop-Process -Force"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(200);
+  // 1. Terminate processes belonging to this installation
+  Exec('powershell.exe', '-NoProfile -Command "Get-Process -Name ime-service, PersonalIME.Manager -ErrorAction SilentlyContinue | Where-Object { try { $_.MainModule.FileName -like ''' + AppPath + '\*'' } catch { $true } } | Stop-Process -Force"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // 2. Also run taskkill for lingering processes
+  Exec('taskkill.exe', '/F /IM ime-service.exe /IM PersonalIME.Manager.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(300);
+end;
+
+// Deep cleanup for machine and user registry keys
+procedure CleanResidualRegistry();
+var
+  ResultCode: Integer;
+begin
+  // 1. Clean HKLM CTF TIP and COM Registration
+  RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, 'SOFTWARE\Microsoft\CTF\TIP\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}');
+  RegDeleteKeyIncludingSubkeys(HKEY_LOCAL_MACHINE, 'SOFTWARE\Classes\CLSID\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}');
+  RegDeleteKeyIncludingSubkeys(HKEY_CLASSES_ROOT, 'CLSID\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}');
+  RegDeleteValue(HKEY_LOCAL_MACHINE, 'Software\Microsoft\Windows\CurrentVersion\Run', 'PersonalIMEService');
+
+  // 2. Clean HKCU CTF TIP and COM Registration for current user context
+  RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, 'Software\Microsoft\CTF\TIP\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}');
+  RegDeleteKeyIncludingSubkeys(HKEY_CURRENT_USER, 'Software\Classes\CLSID\{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}');
+
+  // 3. Remove PersonalIME GUID from HKCU CTF SortOrder AssemblyItem
+  Exec('powershell.exe', '-NoProfile -Command "Get-ChildItem -Path ''HKCU:\Software\Microsoft\CTF\SortOrder\AssemblyItem'' -Recurse -ErrorAction SilentlyContinue | Where-Object { (Get-ItemProperty -Path $_.PsPath -Name ''CLSID'' -ErrorAction SilentlyContinue).CLSID -eq ''{7A5074A1-4F29-4FBE-A2D0-244D42B28B01}'' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  StopAppServiceIfRunning();
+  StopAllAppProcesses();
   Result := '';
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
+  UserDataDir: String;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    StopAppServiceIfRunning();
+    // 1. Terminate all related processes first
+    StopAllAppProcesses();
+
+    // 2. Explicitly unregister COM / TSF profile before file deletion
+    Exec('regsvr32.exe', '/u /s "' + ExpandConstant('{app}\PersonalIME.dll') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end
+  else if CurUninstallStep = usPostUninstall then
+  begin
+    // 3. Deep Registry Cleanup
+    CleanResidualRegistry();
+
+    // 4. Clean user data if confirmed by user
+    if G_PurgeUserData then
+    begin
+      UserDataDir := ExpandConstant('{userappdata}\PersonalIME');
+      if DirExists(UserDataDir) then
+      begin
+        DelTree(UserDataDir, True, True, True);
+      end;
+    end;
   end;
 end;
