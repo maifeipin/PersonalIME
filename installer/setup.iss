@@ -47,7 +47,7 @@ VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 输入法安装程序
 VersionInfoCopyright=Copyright (C) 2026 {#MyAppPublisher}
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersionInfoVersion}
 
 ; Clean Machine-Level Privileges Model:
 ; Admin privileges used strictly for Program Files & Machine COM Registration.
