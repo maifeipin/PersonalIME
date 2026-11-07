@@ -235,6 +235,21 @@ if (APPLE)
     set(MAC_SWIFT_OBJ ${MAC_OBJ_DIR}/CandidateWindow.o)
     set(MAC_DEPLOY_TARGET ${CMAKE_OSX_DEPLOYMENT_TARGET})
 
+    add_executable(test_mac_bridge
+        tests/test_mac_bridge.mm
+        src/mac_client/ImeBridge.mm
+    )
+    target_compile_options(test_mac_bridge PRIVATE -fobjc-arc)
+    target_include_directories(test_mac_bridge PRIVATE
+        src
+        src/mac_client
+    )
+    target_link_libraries(test_mac_bridge PRIVATE
+        ime-core
+        sqlite3
+        "-framework Foundation"
+    )
+
     execute_process(
         COMMAND ${XCRUN_EXECUTABLE} --show-sdk-path
         OUTPUT_VARIABLE MAC_SDK_PATH
@@ -340,6 +355,8 @@ if (APPLE)
             ${MAC_OBJ_DIR}/PersonalIME ${MAC_APP_EXEC}
         COMMAND ${CMAKE_COMMAND} -E copy
             ${MAC_CLIENT_DIR}/Info.plist ${MAC_APP_BUNDLE}/Contents/Info.plist
+        COMMAND ${CMAKE_COMMAND} -E copy
+            ${MAC_CLIENT_DIR}/PkgInfo ${MAC_APP_BUNDLE}/Contents/PkgInfo
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_CURRENT_SOURCE_DIR}/data/dictionaries
             ${MAC_APP_BUNDLE}/Contents/Resources/dictionaries
@@ -354,6 +371,7 @@ if (APPLE)
             ${MAC_CLIENT_DIR}/PersonalIMEInputController.mm
             ${MAC_CLIENT_DIR}/main.mm
             ${MAC_CLIENT_DIR}/Info.plist
+            ${MAC_CLIENT_DIR}/PkgInfo
         COMMENT "Building universal PersonalIME.app (InputMethodKit shell)"
         VERBATIM
     )

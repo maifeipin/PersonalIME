@@ -81,11 +81,14 @@ jobs:
         run: |
           ./build/test_ime_core
           ./build/test_input_policy
+          ./build/test_mac_bridge
 
       - name: Verify macOS Input Method Bundle
         run: |
           test -x build/PersonalIME.app/Contents/MacOS/PersonalIME
           test -f build/PersonalIME.app/Contents/Info.plist
+          test -f build/PersonalIME.app/Contents/PkgInfo
+          test "$(cat build/PersonalIME.app/Contents/PkgInfo)" = "APPL????"
           test -d build/PersonalIME.app/Contents/Resources/dictionaries
           /usr/libexec/PlistBuddy -c "Print :InputMethodConnectionName" build/PersonalIME.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Print :InputMethodServerControllerClass" build/PersonalIME.app/Contents/Info.plist
@@ -105,11 +108,29 @@ jobs:
           echo "input method into ~/Library/Input Methods and typing in TextEdit)"
           echo "must be performed interactively on a Mac."
 
+      - name: Package macOS DMG
+        run: |
+          mkdir -p build/dist
+          DMG="build/dist/PersonalIME-macOS.dmg"
+          hdiutil create -volname "PersonalIME" -srcfolder build/PersonalIME.app \
+            -ov -format UDZO "${DMG}"
+          shasum -a 256 "${DMG}" > build/dist/SHA256SUMS-macOS.txt
+          cat build/dist/SHA256SUMS-macOS.txt
+
       - name: Upload macOS App
         uses: actions/upload-artifact@v4
         with:
           name: PersonalIME-macOS-app
           path: build/PersonalIME.app
+          retention-days: 14
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersonalIME-macOS-dmg
+          path: |
+            build/dist/PersonalIME-macOS.dmg
+            build/dist/SHA256SUMS-macOS.txt
           retention-days: 14
 
   package-and-release:
@@ -262,6 +283,8 @@ jobs:
 
       - name: Verify Bundle
         run: |
+          test -f build/PersonalIME.app/Contents/PkgInfo
+          test "$(cat build/PersonalIME.app/Contents/PkgInfo)" = "APPL????"
           codesign --verify --verbose build/PersonalIME.app
           /usr/libexec/PlistBuddy -c "Print :InputMethodConnectionName" build/PersonalIME.app/Contents/Info.plist
 

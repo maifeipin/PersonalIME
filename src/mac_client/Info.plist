@@ -13,27 +13,65 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>PersonalIME</string>
+    <string>人人输入法</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
-    <key>LSBackgroundOnly</key>
-    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>TICapsLockLanguageSwitchCapable</key>
+    <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>InputMethodConnectionName</key>
     <string>PersonalIME_1_Connection</string>
     <key>InputMethodServerControllerClass</key>
     <string>PersonalIMEInputController</string>
+    <key>InputMethodServerDelegateClass</key>
+    <string>PersonalIMEInputController</string>
+    <key>TISIntendedLanguage</key>
+    <string>zh-Hans</string>
+    <key>TISInputSourceID</key>
+    <string>com.personalime.inputmethod</string>
     <key>tsInputMethodCharacterRepertoireKey</key>
     <array>
-        <string>Latn</string>
         <string>Hans</string>
     </array>
+    <key>ComponentInputModeDict</key>
+    <dict>
+        <key>tsInputModeListKey</key>
+        <dict>
+            <key>com.personalime.inputmethod.PersonalIME</key>
+            <dict>
+                <key>TISInputSourceID</key>
+                <string>com.personalime.inputmethod.PersonalIME</string>
+                <key>TISIntendedLanguage</key>
+                <string>zh-Hans</string>
+                <key>tsInputModeCharacterRepertoireKey</key>
+                <array>
+                    <string>Hans</string>
+                </array>
+                <key>tsInputModeDefaultStateKey</key>
+                <true/>
+                <key>tsInputModeIsVisibleKey</key>
+                <true/>
+                <key>tsInputModePrimaryInScriptKey</key>
+                <true/>
+                <key>tsInputModeScriptKey</key>
+                <string>smSimpChinese</string>
+            </dict>
+        </dict>
+        <key>tsVisibleInputModeOrderedArrayKey</key>
+        <array>
+            <string>com.personalime.inputmethod.PersonalIME</string>
+        </array>
+    </dict>
 </dict>
 </plist>

@@ -1,6 +1,7 @@
 # 人人 (RenRen IME)
 
 [![Windows 10/11 x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D4.svg)](https://microsoft.com/windows)
+[![macOS Universal](https://img.shields.io/badge/Platform-macOS%20Universal-000000.svg)](https://apple.com/macos)
 [![C++20 Core](https://img.shields.io/badge/Core-C%2B%2B20%20%2FMT-purple.svg)](https://en.cppreference.com/w/cpp/20)
 [![WPF .NET 10](https://img.shields.io/badge/Manager-WPF%20.NET%2010-512BD4.svg)](https://dotnet.microsoft.com/)
 [![SQLite WAL](https://img.shields.io/badge/Storage-SQLite3%20WAL-003B57.svg)](https://sqlite.org/)
@@ -85,7 +86,7 @@
 
 ## 🚀 快速开始
 
-### 方式一：普通用户安装体验
+### 方式一：Windows 用户安装体验
 1. **安装包安装（推荐）**：
    下载并运行 `PersonalIME-Setup-x64.exe`，向导将自动完成组件部署、TSF 输入法注册与开机静默自启配置。
 2. **绿色便携版免安装体验**：
@@ -95,7 +96,15 @@
 3. **开始打字**：
    打开任意文本框或编辑器（如记事本），按 `Win + 空格` 切换至 **人人** 即可开始输入；点击候选框右侧 `⚙` 或任务栏托盘图标可随时打开设置中心。
 
-### 方式二：开发者本地极速迭代 (`dev.ps1`)
+### 方式二：macOS 用户安装体验
+1. **DMG 镜像安装**：
+   下载并挂载 `PersonalIME-macOS.dmg`，将 `PersonalIME.app` 复制至 `~/Library/Input Methods/` 目录。
+2. **本地一键安装脚本**：
+   在终端执行 `./scripts/install_mac.sh`，脚本将自动完成向 `~/Library/Input Methods/` 的安装、系统注册与服务拉起。
+3. **启用并开始输入**：
+   打开 macOS「系统设置」->「键盘」->「文字输入」->「编辑...」，点击「+」在「简体中文」中添加「人人输入法」，切换即可畅享五笔/拼音/双拼混合输入；点击候选栏右侧 `⚙` 可打开原生设置中心。
+
+### 方式三：开发者本地极速迭代 (`dev.ps1` / `install_mac.sh`)
 为方便日常开发与人工测试，项目提供了独立于 CI 的秒级开发脚本 `scripts/dev.ps1`：
 
 ```powershell
