@@ -1267,6 +1267,129 @@ static void TestFallbackThresholdAndSecondaryReverseLookup(InputCoordinator& coo
     std::cout << "  [PASS] Stage 6 Waterfall Recall, Fallback Threshold & Secondary Reverse Lookup verified!" << std::endl;
 }
 
+void TestDynamicSmartMacroExpansion(InputCoordinator& coordinator) {
+    std::cout << "[TEST 22] Testing Stage 6 Dynamic Smart Macro Expansion (date/rq, time/sj, week/xq, v-number)..." << std::endl;
+
+    // 1. Date macros: 'date' and 'rq'
+    auto resDate = coordinator.Query("date");
+    AssertCondition(resDate.status == CoordinatorStatus::Success, "Query 'date' succeeds");
+    AssertCondition(!resDate.candidates.empty(), "Query 'date' returns candidates");
+    AssertCondition(resDate.candidates[0].text.find(L"年") != std::wstring::npos, "Candidate 1 contains '年'");
+    AssertCondition(resDate.candidates[1].text.find(L"-") != std::wstring::npos, "Candidate 2 contains '-'");
+
+    auto resRq = coordinator.Query("rq");
+    AssertCondition(resRq.status == CoordinatorStatus::Success, "Query 'rq' succeeds");
+    AssertCondition(!resRq.candidates.empty(), "Query 'rq' returns candidates");
+    AssertCondition(resRq.candidates[0].text.find(L"年") != std::wstring::npos, "Query 'rq' candidate 1 contains '年'");
+    AssertCondition(resRq.candidates.size() > 1, "Query 'rq' returns multiple candidates (macro + words)");
+
+    // 2. Time macros: 'time' and 'sj'
+    auto resTime = coordinator.Query("time");
+    AssertCondition(resTime.status == CoordinatorStatus::Success, "Query 'time' succeeds");
+    AssertCondition(!resTime.candidates.empty(), "Query 'time' returns candidates");
+    AssertCondition(resTime.candidates[0].text.find(L":") != std::wstring::npos, "Query 'time' candidate 1 contains ':'");
+
+    auto resSj = coordinator.Query("sj");
+    AssertCondition(resSj.status == CoordinatorStatus::Success, "Query 'sj' succeeds");
+    AssertCondition(!resSj.candidates.empty(), "Query 'sj' returns candidates");
+    AssertCondition(resSj.candidates[0].text.find(L":") != std::wstring::npos, "Query 'sj' candidate 1 contains ':'");
+
+    // 3. Week macros: 'week' and 'xq'
+    auto resWeek = coordinator.Query("week");
+    AssertCondition(resWeek.status == CoordinatorStatus::Success, "Query 'week' succeeds");
+    AssertCondition(resWeek.candidates.size() >= 2, "Query 'week' returns at least 2 candidates");
+    AssertCondition(resWeek.candidates[0].text.find(L"星期") != std::wstring::npos, "Candidate 0 contains '星期'");
+    AssertCondition(resWeek.candidates[1].text.find(L"周") != std::wstring::npos, "Candidate 1 contains '周'");
+
+    // 4. Datetime macro: 'now'
+    auto resNow = coordinator.Query("now");
+    AssertCondition(resNow.status == CoordinatorStatus::Success, "Query 'now' succeeds");
+    AssertCondition(!resNow.candidates.empty(), "Query 'now' returns candidates");
+    AssertCondition(resNow.candidates[0].text.find(L":") != std::wstring::npos &&
+                    resNow.candidates[0].text.find(L"-") != std::wstring::npos, "Query 'now' candidate 0 has date and time");
+
+    // 5. Financial uppercase numbers: 'v12345'
+    auto resV1 = coordinator.Query("v12345");
+    AssertCondition(resV1.status == CoordinatorStatus::Success, "Query 'v12345' succeeds");
+    AssertCondition(resV1.candidates.size() >= 3, "Query 'v12345' returns at least 3 candidates");
+    AssertCondition(resV1.candidates[0].text == L"壹万贰仟叁佰肆拾伍元整", "v12345 produces 壹万贰仟叁佰肆拾伍元整");
+    AssertCondition(resV1.candidates[1].text == L"壹万贰仟叁佰肆拾伍", "v12345 produces 壹万贰仟叁佰肆拾伍");
+    AssertCondition(resV1.candidates[2].text == L"一万二千三百四十五", "v12345 produces 一万二千三百四十五");
+
+    // 6. Decimal currency numbers: 'v12345.67'
+    auto resV2 = coordinator.Query("v12345.67");
+    AssertCondition(resV2.status == CoordinatorStatus::Success, "Query 'v12345.67' succeeds");
+    AssertCondition(resV2.candidates[0].text == L"壹万贰仟叁佰肆拾伍元陆角柒分", "v12345.67 produces 壹万贰仟叁佰肆拾伍元陆角柒分");
+    AssertCondition(resV2.candidates[1].text == L"壹万贰仟叁佰肆拾伍点陆柒", "v12345.67 produces 壹万贰仟叁佰肆拾伍点陆柒");
+    AssertCondition(resV2.candidates[2].text == L"一万二千三百四十五点六七", "v12345.67 produces 一万二千三百四十五点六七");
+
+    // 7. Non-macro check
+    auto resA = coordinator.Query("a");
+    for (const auto& c : resA.candidates) {
+        AssertCondition(c.entry_id.rfind("macro_", 0) != 0, "Non-macro query 'a' contains no macro candidates");
+    }
+
+    // 8. Commit candidate durability without db crash
+    bool commitOk = coordinator.CommitCandidate(resV1.candidates[0], "event_macro_test");
+    AssertCondition(commitOk, "Commit macro candidate succeeds idempotently");
+
+    std::cout << "  [PASS] Stage 6 Dynamic Smart Macro Expansion verified!" << std::endl;
+}
+
+void TestContinuousSentenceAndAutoPhraseLearning(InputCoordinator& coordinator, EntryRepository& repo) {
+    std::cout << "[TEST 23] Testing Stage 6 Continuous Sentence Viterbi Decoding & Auto Phrase Learning..." << std::endl;
+
+    InputPolicy policy = *coordinator.GetPolicySnapshot();
+    policy.primary_method = InputScheme::Pinyin;
+    policy.learning_enabled = true;
+    coordinator.SetPolicy(policy);
+
+    // 1. Long continuous phrase recall for un-indexed long combination 'renrenshurufa'
+    auto res1 = coordinator.Query("renrenshurufa");
+    AssertCondition(res1.status == CoordinatorStatus::Success, "Query 'renrenshurufa' succeeds via Viterbi DAG");
+    AssertCondition(!res1.candidates.empty(), "Query 'renrenshurufa' returns candidates");
+    AssertCondition(res1.candidates[0].text == L"人人输入法", "Candidate 1 is full sentence 人人输入法");
+    AssertCondition(res1.candidates.size() >= 2, "Returns sub-candidates for partial commit");
+
+    // 2. Continuous multi-syllable phrase 'jintianshiyigehaorizi'
+    auto res2 = coordinator.Query("jintianshiyigehaorizi");
+    AssertCondition(res2.status == CoordinatorStatus::Success, "Query 'jintianshiyigehaorizi' succeeds");
+    AssertCondition(!res2.candidates.empty(), "Query 'jintianshiyigehaorizi' returns candidates");
+    std::cout << "DEBUG res2 cand0 text=" << WideToUtf8(res2.candidates[0].text) << " matched=" << res2.candidates[0].matched_code << " resolved=" << res2.candidates[0].resolved_code << std::endl;
+    AssertCondition(res2.candidates[0].text == L"今天是一个好日子", "Candidate 1 is 今天是一个好日子");
+
+    // 3. Explicit apostrophe separators 'xi'an'ren'
+    auto res3 = coordinator.Query("xi'an'ren");
+    AssertCondition(res3.status == CoordinatorStatus::Success, "Query 'xi'an'ren' succeeds");
+    AssertCondition(!res3.candidates.empty(), "Query 'xi'an'ren' returns candidates");
+    AssertCondition(res3.candidates[0].text == L"西安人", "Candidate 1 is 西安人");
+
+    // 4. Auto Phrase Composition & Learning
+    Candidate candToCommit = res1.candidates[0];
+    AssertCondition(candToCommit.entry_id.rfind("sentence_", 0) == 0, "Candidate is sentence candidate");
+    bool commitOk = coordinator.CommitCandidate(candToCommit, "ev_sentence_learn_1");
+    AssertCondition(commitOk, "Commit sentence candidate succeeds");
+
+    // After commit, user dictionary has learned '人人输入法' with code 'renrenshurufa'
+    auto userEntries = repo.GetAllUserEntries();
+    bool foundLearned = false;
+    for (const auto& u : userEntries) {
+        if (u.text == L"人人输入法") {
+            foundLearned = true;
+            break;
+        }
+    }
+    AssertCondition(foundLearned, "Auto-phrase learning saved 人人输入法 into user dictionary");
+
+    // Subsequent query 'renrenshurufa' recalls '人人输入法' directly from custom dictionary
+    auto res4 = coordinator.Query("renrenshurufa");
+    AssertCondition(!res4.candidates.empty() && res4.candidates[0].text == L"人人输入法",
+                    "Subsequent query recalls learned 人人输入法 at top rank");
+    AssertCondition(res4.candidates[0].dict_id == DICT_ID_CUSTOM, "Candidate source is custom dictionary");
+
+    std::cout << "  [PASS] Stage 6 Continuous Sentence Viterbi Decoding & Auto Phrase Learning verified!" << std::endl;
+}
+
 // Main Test Runner
 // -----------------------------------------------------------------------------
 int main() {
@@ -1319,6 +1442,8 @@ int main() {
     TestFinalizationPinyinPrefixesAndBoundaries();
     TestInputMethodEnablingDisablingAndValidation(coordinator, repo);
     TestFallbackThresholdAndSecondaryReverseLookup(coordinator, repo);
+    TestDynamicSmartMacroExpansion(coordinator);
+    TestContinuousSentenceAndAutoPhraseLearning(coordinator, repo);
 
     db.Close();
     std::filesystem::remove(testDb);

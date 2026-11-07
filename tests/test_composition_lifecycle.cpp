@@ -230,6 +230,9 @@ static bool g_failEndComposition = false;
 static bool g_failSetSelection = false;
 static std::wstring g_lastCommittedText = L"";
 
+class MockContext;
+static MockContext* g_lastActiveMockContext = nullptr;
+
 // 1. Mock ITfRange
 class MockRange : public ITfRange {
 public:
@@ -263,12 +266,7 @@ public:
         return S_OK;
     }
 
-    STDMETHODIMP SetText(TfEditCookie ec, DWORD dwFlags, const WCHAR* pchText, LONG cch) override {
-        if (g_failSetText) return E_FAIL;
-        m_text = (pchText && cch > 0) ? std::wstring(pchText, cch) : L"";
-        g_lastCommittedText = m_text;
-        return S_OK;
-    }
+    STDMETHODIMP SetText(TfEditCookie ec, DWORD dwFlags, const WCHAR* pchText, LONG cch) override;
 
     STDMETHODIMP GetFormattedText(TfEditCookie ec, IDataObject **ppDataObject) override { return E_NOTIMPL; }
     STDMETHODIMP GetEmbedded(TfEditCookie ec, REFGUID rguidService, REFIID riid, IUnknown **ppunk) override { return E_NOTIMPL; }
@@ -353,12 +351,16 @@ class MockContext : public ITfContext, public ITfContextComposition {
 public:
     MockContext() : m_cRef(1) {}
     virtual ~MockContext() {
+        if (g_lastActiveMockContext == this) {
+            g_lastActiveMockContext = nullptr;
+        }
         if (m_pDeferredSession) {
             m_pDeferredSession->Release();
             m_pDeferredSession = nullptr;
         }
     }
 
+    std::wstring m_activeCompRange;
     bool m_forceSyncBlocked = false;
     bool m_failAsyncRequest = false;
     bool m_deferAsyncSession = false;
@@ -398,6 +400,7 @@ public:
 
     // ITfContext methods
     STDMETHODIMP RequestEditSession(TfClientId tid, ITfEditSession* pes, DWORD dwFlags, HRESULT* phrSession) override {
+        g_lastActiveMockContext = this;
         if (!pes || !phrSession) return E_INVALIDARG;
         if ((dwFlags & TF_ES_SYNC) && m_forceSyncBlocked) {
             *phrSession = TF_E_SYNCHRONOUS;
@@ -468,6 +471,16 @@ public:
     MockComposition* m_lastCreatedComposition = nullptr;
     LONG m_cRef = 1;
 };
+
+inline HRESULT MockRange::SetText(TfEditCookie ec, DWORD dwFlags, const WCHAR* pchText, LONG cch) {
+    if (g_failSetText) return E_FAIL;
+    m_text = (pchText && cch > 0) ? std::wstring(pchText, cch) : L"";
+    g_lastCommittedText = m_text;
+    if (g_lastActiveMockContext) {
+        g_lastActiveMockContext->m_activeCompRange = m_text;
+    }
+    return S_OK;
+}
 
 // =========================================================================
 // Tests

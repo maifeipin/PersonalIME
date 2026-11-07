@@ -36,6 +36,7 @@ public:
 
     std::recursive_mutex& GetMutex() { return m_mutex; }
     sqlite3* GetRawHandle() { return m_db; }
+    sqlite3* GetHandle() { return m_db; }
 
     class Transaction {
     public:

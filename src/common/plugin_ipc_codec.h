@@ -4,7 +4,7 @@
 #include "ipc_protocol.h"
 #include "../core/types.h"
 #include "../core/storage/plugin_repository.h"
-#include "../../third_party/nlohmann/json.hpp"
+#include "../third_party/nlohmann/json.hpp"
 
 namespace ime {
 

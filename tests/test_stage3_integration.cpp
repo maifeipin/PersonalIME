@@ -1952,6 +1952,7 @@ int main(int argc, char* argv[]) {
             auto pol = *seed.GetPolicy();
             pol.mixed_input_enabled = true;
             pol.SetMethodEnabled(ime::InputScheme::Pinyin, false);
+            pol.SetMethodEnabled(ime::InputScheme::Shuangpin, false);
             CHECK_TRUE(seed.SavePolicy(pol), L"Save policy with Pinyin disabled");
         }
 
@@ -1980,6 +1981,7 @@ int main(int argc, char* argv[]) {
             auto pol = *seed.GetPolicy();
             pol.mixed_input_enabled = true;
             pol.SetMethodEnabled(ime::InputScheme::Pinyin, true);
+            pol.SetMethodEnabled(ime::InputScheme::Shuangpin, true);
             CHECK_TRUE(seed.SavePolicy(pol), L"Save persisted policy");
         }
 

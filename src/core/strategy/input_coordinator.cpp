@@ -1,4 +1,6 @@
 #include "input_coordinator.h"
+#include "smart_macro.h"
+#include "sentence_decoder.h"
 #include <algorithm>
 #include <unordered_set>
 #include <stdexcept>
@@ -819,6 +821,18 @@ InputCoordinator::Query(const std::string& rawCode,
     // Resolve input methods
     auto methods = ResolveInputMethods(rawCode, *policySnapshot);
     if (methods.empty()) {
+        if (SmartMacroProcessor::IsMacroQuery(rawCode)) {
+            auto macroCands = SmartMacroProcessor::ExpandMacro(rawCode);
+            if (!macroCands.empty()) {
+                result.candidates = std::move(macroCands);
+                result.status = CoordinatorStatus::Success;
+                result.active_dict_id = DICT_ID_CUSTOM;
+                result.current_dict_index = 0;
+                result.total_enabled_dicts = static_cast<int>(policySnapshot->GetEnabledDictionaryOrder().size());
+                return result;
+            }
+        }
+
         if (rawCode.length() > MAX_SHUANGPIN_INPUT_LENGTH) {
             result.status = CoordinatorStatus::InputLengthExceeded;
             result.error_message = "Input length exceeds maximum supported limit of " + std::to_string(MAX_SHUANGPIN_INPUT_LENGTH) + " characters";
@@ -959,22 +973,39 @@ InputCoordinator::Query(const std::string& rawCode,
             }
         }
 
-        // Append Wubi86 prefix completions from selected dictionaries
+        // Append Wubi86 prefix completions from selected dictionaries and custom dictionary
         if (!selectedExactDicts.empty()) {
             std::unordered_set<std::string> seenIds;
             for (const auto& ec : chosenCandidates) {
                 seenIds.insert(ec.entry_id);
             }
+            bool anyWubiExact = false;
             for (const auto& dictId : selectedExactDicts) {
-                bool hasWubi = false;
                 for (const auto& ec : exactCache[dictId]) {
-                    if (ec.scheme == InputScheme::Wubi86) { hasWubi = true; break; }
+                    if (ec.scheme == InputScheme::Wubi86) { anyWubiExact = true; break; }
                 }
-                if (hasWubi) {
+                if (anyWubiExact) break;
+            }
+
+            if (anyWubiExact) {
+                // First append custom dictionary Wubi prefix completions only if custom dict is in search scope
+                if (std::find(searchDicts.begin(), searchDicts.end(), DICT_ID_CUSTOM) != searchDicts.end()) {
+                    auto itCustomPref = prefixCache.find(DICT_ID_CUSTOM);
+                    if (itCustomPref != prefixCache.end() && !itCustomPref->second.empty()) {
+                        for (auto& pc : itCustomPref->second) {
+                            if (pc.scheme == InputScheme::Wubi86 && seenIds.insert(pc.entry_id).second) {
+                                chosenCandidates.push_back(std::move(pc));
+                            }
+                        }
+                    }
+                }
+                // Then append builtin Wubi prefix completions from selectedExactDicts
+                for (const auto& dictId : selectedExactDicts) {
+                    if (dictId == DICT_ID_CUSTOM) continue;
                     auto itPref = prefixCache.find(dictId);
                     if (itPref != prefixCache.end() && !itPref->second.empty()) {
                         for (auto& pc : itPref->second) {
-                            if (seenIds.insert(pc.entry_id).second) {
+                            if (pc.scheme == InputScheme::Wubi86 && seenIds.insert(pc.entry_id).second) {
                                 chosenCandidates.push_back(std::move(pc));
                             }
                         }
@@ -1004,6 +1035,49 @@ InputCoordinator::Query(const std::string& rawCode,
         }
 
         if (chosenCandidates.empty()) {
+            if (SmartMacroProcessor::IsMacroQuery(rawCode)) {
+                auto macroCands = SmartMacroProcessor::ExpandMacro(rawCode);
+                if (!macroCands.empty()) {
+                    result.candidates = std::move(macroCands);
+                    result.status = CoordinatorStatus::Success;
+                    result.active_dict_id = DICT_ID_CUSTOM;
+                    result.current_dict_index = 0;
+                    return result;
+                }
+            }
+
+            // Continuous sentence decode if input has >= 2 syllables
+            for (const auto& m : methods) {
+                if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
+                    auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, const_cast<EntryRepository&>(m_repo), m_clock);
+                    if (dec.has_value()) {
+                        Candidate sentCand;
+                        sentCand.entry_id = "sentence_" + rawCode;
+                        sentCand.text = dec->text;
+                        sentCand.raw_code = rawCode;
+                        sentCand.matched_code = rawCode;
+                        sentCand.resolved_code = m.resolved_code;
+                        sentCand.dict_id = DICT_ID_BUILTIN_PINYIN;
+                        sentCand.scheme = m.scheme;
+                        sentCand.quality = MatchQuality::ExactFull;
+                        sentCand.score = 50000.0;
+                        sentCand.dict_priority = 0;
+                        sentCand.method_priority = m.method_priority;
+
+                        result.candidates.push_back(std::move(sentCand));
+                        for (auto& sc : dec->sub_candidates) {
+                            sc.method_priority = m.method_priority;
+                            sc.raw_code = rawCode;
+                            result.candidates.push_back(std::move(sc));
+                        }
+                        result.status = CoordinatorStatus::Success;
+                        result.active_dict_id = DICT_ID_BUILTIN_PINYIN;
+                        result.current_dict_index = 0;
+                        return result;
+                    }
+                }
+            }
+
             if (result.is_truncated) {
                 result.status = CoordinatorStatus::BudgetTruncated;
                 result.error_message = "No candidates found within evaluated branch budget (16 branches)";
@@ -1076,6 +1150,57 @@ InputCoordinator::Query(const std::string& rawCode,
         }
 
         result.candidates = std::move(deduped);
+
+        // Stage 6: Continuous sentence recall if input has >= 2 syllables
+        for (const auto& m : methods) {
+            if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
+                // If a higher priority method (e.g. primary Wubi86) already produced exact matches, do not override it
+                if (!result.candidates.empty() && result.candidates[0].method_priority < m.method_priority && result.candidates[0].quality == MatchQuality::ExactFull) {
+                    break;
+                }
+
+                bool hasFullExact = !result.candidates.empty() && 
+                    result.candidates[0].quality == MatchQuality::ExactFull &&
+                    (result.candidates[0].matched_code.length() >= rawCode.length() ||
+                     result.candidates[0].text.length() >= m.syllables.size());
+
+                if (!hasFullExact) {
+                    auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, const_cast<EntryRepository&>(m_repo), m_clock);
+                    if (dec.has_value()) {
+                        bool alreadyHas = false;
+                        for (const auto& c : result.candidates) {
+                            if (c.text == dec->text) { alreadyHas = true; break; }
+                        }
+                        if (!alreadyHas) {
+                            Candidate sentCand;
+                            sentCand.entry_id = "sentence_" + rawCode;
+                            sentCand.text = dec->text;
+                            sentCand.raw_code = rawCode;
+                            sentCand.matched_code = rawCode;
+                            sentCand.resolved_code = m.resolved_code;
+                            sentCand.dict_id = DICT_ID_BUILTIN_PINYIN;
+                            sentCand.scheme = m.scheme;
+                            sentCand.quality = MatchQuality::ExactFull;
+                            sentCand.score = 50000.0;
+                            sentCand.dict_priority = 0;
+                            sentCand.method_priority = m.method_priority;
+
+                            result.candidates.insert(result.candidates.begin(), std::move(sentCand));
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Smart Dynamic Macros Expansion (e.g. date, rq, time, sj, week, xq, v12345)
+        if (SmartMacroProcessor::IsMacroQuery(rawCode)) {
+            auto macroCands = SmartMacroProcessor::ExpandMacro(rawCode);
+            if (!macroCands.empty()) {
+                result.candidates.insert(result.candidates.begin(), macroCands.begin(), macroCands.end());
+            }
+        }
+
         result.status = result.candidates.empty() ? CoordinatorStatus::NoCandidates : CoordinatorStatus::Success;
 
         // Stage 4C-2 & Stage 6: Reverse lookup annotation
@@ -1161,8 +1286,57 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
                                        uint64_t sessionId,
                                        uint64_t contextId,
                                        std::shared_ptr<const InputPolicy> policySnapshot) {
+    if (candidate.entry_id.rfind("macro_", 0) == 0) {
+        // Dynamic smart macros expand transiently and do not require repository learning or persistence
+        return true;
+    }
+
     if (!policySnapshot) {
         policySnapshot = GetPolicySnapshot();
+    }
+
+    // Stage 6 Sentence auto-phrase learning
+    if (candidate.entry_id.rfind("sentence_", 0) == 0) {
+        if (policySnapshot->learning_enabled) {
+            std::string cleanCode = candidate.raw_code;
+            std::transform(cleanCode.begin(), cleanCode.end(), cleanCode.begin(), [](unsigned char c) { return std::tolower(c); });
+            std::string storageCode;
+            for (char ch : cleanCode) { if (ch != '\'') storageCode.push_back(ch); }
+
+            std::vector<std::pair<InputScheme, std::string>> codes = {
+                { InputScheme::Pinyin, storageCode }
+            };
+            if (cleanCode.find('\'') != std::string::npos) {
+                codes.push_back({ InputScheme::Pinyin, cleanCode });
+            }
+            auto wubiCodes = m_builtinDict.ReverseLookupWubi(candidate.text);
+            if (!wubiCodes.empty()) {
+                codes.push_back({ InputScheme::Wubi86, wubiCodes[0] });
+            }
+            std::string newId = m_repo.AddEntry(candidate.text, codes, EntrySource::User);
+            if (!newId.empty()) {
+                m_repo.RecordCommit(eventId, sessionId, contextId,
+                                    candidate.scheme, storageCode, newId,
+                                    true, candidate.scheme, storageCode);
+            }
+        }
+        return true;
+    }
+
+    // Sub-candidate commit forwarding
+    if (candidate.entry_id.rfind("sub_", 0) == 0) {
+        Candidate realCand = candidate;
+        realCand.entry_id = candidate.entry_id.substr(4);
+        if (realCand.entry_id.rfind("b_", 0) == 0) {
+            m_repo.EnsureBuiltinEntryExists(realCand.entry_id, realCand.text);
+        }
+        std::string rawOrMatched = !realCand.raw_code.empty() ? realCand.raw_code
+            : (!realCand.matched_code.empty() ? realCand.matched_code : realCand.resolved_code);
+        std::string learningCode = BuildScopedCode(realCand.scheme, realCand.layout_id, rawOrMatched);
+        return m_repo.RecordCommit(eventId, sessionId, contextId,
+                                  realCand.scheme, learningCode, realCand.entry_id,
+                                  policySnapshot->learning_enabled,
+                                  realCand.scheme, rawOrMatched);
     }
 
     // Ensure builtin entry row exists in SQLite for foreign key integrity (both when learning is on or off)

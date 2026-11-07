@@ -627,7 +627,10 @@ static void TestUserDictionaryCrud(AdminServer& server, const std::wstring& pipe
         AssertCondition(client.SendFrame(3084, reqPin.dump(), resp), "SetPin for rrsyf");
         AssertCondition(nlohmann::json::parse(resp)["success"] == true, "SetPin affiliation verification accepts 5-char Wubi86 code rrsyf");
 
-        // 7f. Learning progression via CommitCandidate
+        // 7f. Learning progression via CommitCandidate (enable learning for stat recording)
+        InputPolicy pol = *engine.GetCoordinator()->GetPolicySnapshot();
+        pol.learning_enabled = true;
+        engine.GetCoordinator()->SetPolicy(pol);
         AssertCondition(engine.GetCoordinator()->CommitCandidate(rrsyfCand, "ev_rrsyf_learn_1", 1, 1),
                         "CommitCandidate learning succeeds for 5-char Wubi86 code rrsyf");
         auto statAfter = engine.GetRepo()->GetStat(InputScheme::Wubi86, "rrsyf", longWbId);
