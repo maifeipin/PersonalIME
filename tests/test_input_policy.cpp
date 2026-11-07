@@ -1829,6 +1829,46 @@ void TestSentenceReceiptImmutabilityAndConcurrency(InputCoordinator& coordinator
         AssertCondition(!hasPendingEvent("ev_rollback_test"), "Pending cleaned up after retry");
     }
 
+    // 6. Fault Injection: Verify SavePendingCommit fails on read failure (no silent epoch=1 corruption)
+    {
+        std::vector<std::pair<S, std::string>> codes = {{S::Pinyin, "readfault"}};
+        auto rfId = repo.AddEntry(L"读故障词", codes, EntrySource::User);
+        repo.ResetStats(rfId);
+
+        EntryRepository::PendingCommitRecord p{};
+        p.event_id = "ev_read_fault_test";
+        p.session_id = 88; p.context_id = 99; p.scheme = S::Pinyin;
+        p.query_code = "readfault"; p.entry_id = "sentence_rf";
+        p.text = L"读故障词"; p.learning_enabled = true;
+
+        auto denyEntriesRead = [](void*, int op, const char* arg1, const char*, const char*, const char*) -> int {
+            if (op == SQLITE_READ && arg1 && std::string(arg1) == "entries") {
+                return SQLITE_DENY;
+            }
+            return SQLITE_OK;
+        };
+        sqlite3_set_authorizer(db.GetRawHandle(), denyEntriesRead, nullptr);
+
+        bool saveResult = repo.SavePendingCommit(p);
+        AssertCondition(!saveResult, "SavePendingCommit must return false on DB read failure (cannot save with corrupt default epoch)");
+
+        sqlite3_set_authorizer(db.GetRawHandle(), nullptr, nullptr);
+
+        // Verify no orphaned pending was created
+        AssertCondition(!hasPendingEvent("ev_read_fault_test"), "No corrupted pending record saved");
+
+        // Subsequent ACK without pending must be rejected
+        bool ackWithoutPending = repo.RecordSentenceCommit("ev_read_fault_test", 88, 99, S::Pinyin, "readfault", L"读故障词", "readfault", "sentence_rf", codes, true);
+        AssertCondition(!ackWithoutPending, "ACK without pending rejected with zero side effects");
+
+        // Retry saving after fault cleared succeeds with correct post-reset epoch
+        AssertCondition(repo.SavePendingCommit(p), "Retry SavePendingCommit after fault cleared succeeds");
+        bool ackAfterRetry = repo.RecordSentenceCommit("ev_read_fault_test", 88, 99, S::Pinyin, "readfault", L"读故障词", "readfault", "sentence_rf", codes, true);
+        AssertCondition(ackAfterRetry, "ACK after clean save succeeds");
+        auto rfStat = repo.GetStat(S::Pinyin, "readfault", rfId);
+        AssertCondition(rfStat.has_value() && rfStat->selected_count == 1, "Learned count correctly incremented to 1");
+    }
+
     std::cout << "  [PASS] Test 24 Sentence Receipt Immutability, Normalization & Concurrency verified!" << std::endl;
 }
 

@@ -674,7 +674,23 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     stmt->BindText(11, rec.matched_code);
     stmt->BindText(12, rec.resolved_code);
 
-    int64_t gEpoch = rec.global_epoch > 0 ? rec.global_epoch : GetGlobalStatsResetEpoch();
+    int64_t gEpoch = rec.global_epoch > 0 ? rec.global_epoch : 1;
+    if (rec.global_epoch <= 0) {
+        auto stmtGlobal = m_db.Prepare("SELECT value FROM meta_settings WHERE key = 'global_stats_reset_epoch';");
+        if (!stmtGlobal) {
+            return false;
+        }
+        if (stmtGlobal->Step()) {
+            try {
+                gEpoch = std::stoll(stmtGlobal->ColumnText(0));
+            } catch (...) {
+                gEpoch = 1;
+            }
+        } else if (stmtGlobal->HasError()) {
+            return false;
+        }
+    }
+
     int64_t eEpoch = rec.entry_epoch > 0 ? rec.entry_epoch : 1;
     if (rec.entry_epoch <= 0) {
         if (rec.entry_id.rfind("sentence_", 0) == 0) {
@@ -692,17 +708,38 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
                 "SELECT e.id FROM entries e JOIN entry_codes ec ON e.id = ec.entry_id "
                 "WHERE e.text = ? AND ec.scheme = 1 AND (ec.code = ? OR ec.code = ?) LIMIT 1;"
             );
-            if (stmtFind) {
-                stmtFind->BindText(1, textUtf8);
-                stmtFind->BindText(2, storageCode);
-                stmtFind->BindText(3, rec.query_code);
-                if (stmtFind->Step()) {
-                    std::string existingId = stmtFind->ColumnText(0);
-                    eEpoch = GetEntryStatsResetEpoch(existingId);
+            if (!stmtFind) {
+                return false;
+            }
+            stmtFind->BindText(1, textUtf8);
+            stmtFind->BindText(2, storageCode);
+            stmtFind->BindText(3, rec.query_code);
+            if (stmtFind->Step()) {
+                std::string existingId = stmtFind->ColumnText(0);
+                auto stmtEpoch = m_db.Prepare("SELECT reset_epoch FROM entry_resets WHERE entry_id = ?;");
+                if (!stmtEpoch) {
+                    return false;
                 }
+                stmtEpoch->BindText(1, existingId);
+                if (stmtEpoch->Step()) {
+                    eEpoch = stmtEpoch->ColumnInt64(0);
+                } else if (stmtEpoch->HasError()) {
+                    return false;
+                }
+            } else if (stmtFind->HasError()) {
+                return false;
             }
         } else {
-            eEpoch = GetEntryStatsResetEpoch(rec.entry_id);
+            auto stmtEpoch = m_db.Prepare("SELECT reset_epoch FROM entry_resets WHERE entry_id = ?;");
+            if (!stmtEpoch) {
+                return false;
+            }
+            stmtEpoch->BindText(1, rec.entry_id);
+            if (stmtEpoch->Step()) {
+                eEpoch = stmtEpoch->ColumnInt64(0);
+            } else if (stmtEpoch->HasError()) {
+                return false;
+            }
         }
     }
     stmt->BindInt64(13, gEpoch);
@@ -1528,12 +1565,39 @@ bool EntryRepository::RecordSentenceCommit(const std::string& eventId, uint64_t 
 
     // 4. Reset Epoch Verification across identities
     bool shouldUpdateStats = true;
-    int64_t curGlobalEpoch = GetGlobalStatsResetEpoch();
+    int64_t curGlobalEpoch = 1;
+    auto stmtGlobalEpoch = m_db.Prepare("SELECT value FROM meta_settings WHERE key = 'global_stats_reset_epoch';");
+    if (!stmtGlobalEpoch) {
+        tx.Rollback();
+        return false;
+    }
+    if (stmtGlobalEpoch->Step()) {
+        try {
+            curGlobalEpoch = std::stoll(stmtGlobalEpoch->ColumnText(0));
+        } catch (...) {
+            curGlobalEpoch = 1;
+        }
+    } else if (stmtGlobalEpoch->HasError()) {
+        tx.Rollback();
+        return false;
+    }
     if (pendGlobalEpoch > 0 && pendGlobalEpoch < curGlobalEpoch) {
         shouldUpdateStats = false; // Global stats reset occurred while pending
     }
     if (!isNewEntryCreated) {
-        int64_t curEntryEpoch = GetEntryStatsResetEpoch(targetId);
+        int64_t curEntryEpoch = 1;
+        auto stmtEntryEpoch = m_db.Prepare("SELECT reset_epoch FROM entry_resets WHERE entry_id = ?;");
+        if (!stmtEntryEpoch) {
+            tx.Rollback();
+            return false;
+        }
+        stmtEntryEpoch->BindText(1, targetId);
+        if (stmtEntryEpoch->Step()) {
+            curEntryEpoch = stmtEntryEpoch->ColumnInt64(0);
+        } else if (stmtEntryEpoch->HasError()) {
+            tx.Rollback();
+            return false;
+        }
         if (pendEntryEpoch > 0 && pendEntryEpoch < curEntryEpoch) {
             shouldUpdateStats = false; // Target entry reset occurred while pending
         }
