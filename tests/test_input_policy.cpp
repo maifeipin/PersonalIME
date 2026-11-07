@@ -1193,6 +1193,80 @@ static void TestInputMethodEnablingDisablingAndValidation(InputCoordinator& coor
     std::cout << "  [PASS] Input method enabling/disabling, validation, and JSON roundtrip verified!" << std::endl;
 }
 
+// -----------------------------------------------------------------------------
+// Test 21: Stage 6 Multi-Source Waterfall Recall, Fallback Threshold & Secondary Reverse Lookup
+// -----------------------------------------------------------------------------
+static void TestFallbackThresholdAndSecondaryReverseLookup(InputCoordinator& coordinator, EntryRepository& repo) {
+    std::cout << "[TEST 21] Testing Stage 6 Waterfall Recall, Fallback Threshold & Reverse Lookup..." << std::endl;
+
+    InputPolicy policy;
+    policy.primary_method = InputScheme::Wubi86;
+    policy.mixed_input_enabled = true;
+    policy.fallback_candidate_threshold = 3;
+    policy.input_method_order = {InputScheme::Wubi86, InputScheme::Pinyin, InputScheme::Shuangpin};
+    policy.dictionary_order = {
+        {DICT_ID_CUSTOM, true},
+        {DICT_ID_BUILTIN_WUBI, true},
+        {DICT_ID_BUILTIN_PINYIN, true}
+    };
+    coordinator.SetPolicy(policy);
+
+    // 1. Custom overlay does NOT block builtin Wubi:
+    // Add 1 custom entry for 'aaaa'. Both the custom entry AND builtin Wubi '工' must appear!
+    std::string custId = repo.AddEntry(L"我的专属工", {{InputScheme::Wubi86, "aaaa"}});
+    auto qOverlay = coordinator.Query("aaaa");
+    AssertCondition(qOverlay.status == CoordinatorStatus::Success, "Query 'aaaa' succeeded");
+    bool hasCustom = false;
+    bool hasBuiltinGong = false;
+    for (const auto& c : qOverlay.candidates) {
+        if (c.text == L"我的专属工") hasCustom = true;
+        if (c.text == L"工") hasBuiltinGong = true;
+    }
+    AssertCondition(hasCustom && hasBuiltinGong, "Custom dictionary acts as overlay and does not block builtin Wubi");
+    AssertCondition(qOverlay.candidates[0].text == L"我的专属工", "Custom exact match ranks ahead of builtin exact match");
+    repo.DeleteEntry(custId);
+
+    // 2. Primary Wubi has < 3 exact matches for 'ni' ('展' is the only Wubi exact match for 'ni').
+    // Because 1 < fallback_candidate_threshold (3), Pinyin exact matches ('你', '泥', etc.) MUST be supplemented,
+    // ranked right after Wubi exact match '展' (ahead of Wubi prefix completions), and annotated with Wubi reverse lookup codes!
+    auto qNi = coordinator.Query("ni");
+    AssertCondition(qNi.status == CoordinatorStatus::Success, "Query 'ni' succeeded");
+    AssertCondition(qNi.candidates.size() >= 2, "Query 'ni' has primary and supplemented secondary candidates");
+    AssertCondition(qNi.candidates[0].scheme == InputScheme::Wubi86 && qNi.candidates[0].quality == MatchQuality::ExactFull,
+                    "Candidate #0 is Wubi86 ExactFull ('展')");
+    AssertCondition(qNi.candidates[0].reverse_lookup_code.empty(),
+                    "Primary input method candidate does NOT have redundant reverse lookup annotation");
+
+    bool foundPinyinNi = false;
+    for (const auto& c : qNi.candidates) {
+        if (c.text == L"你" && c.scheme == InputScheme::Pinyin) {
+            foundPinyinNi = true;
+            AssertCondition(!c.reverse_lookup_code.empty(), "Supplemented Pinyin candidate '你' has Wubi86 reverse_lookup_code populated");
+            break;
+        }
+    }
+    AssertCondition(foundPinyinNi, "Pinyin candidate '你' supplemented when Wubi exact count (1) < threshold (3)");
+
+    // 3. When fallback_candidate_threshold is set to 1, 'ni' (which has 1 Wubi exact match >= 1) does NOT cascade to builtin Pinyin!
+    policy.fallback_candidate_threshold = 1;
+    coordinator.SetPolicy(policy);
+    auto qNiThresh1 = coordinator.Query("ni");
+    bool foundPinyinWhenThresh1 = false;
+    for (const auto& c : qNiThresh1.candidates) {
+        if (c.dict_id == DICT_ID_BUILTIN_PINYIN) {
+            foundPinyinWhenThresh1 = true;
+            break;
+        }
+    }
+    AssertCondition(!foundPinyinWhenThresh1, "When threshold=1 and Wubi has 1 exact match, builtin Pinyin is not supplemented");
+
+    // Restore threshold=3
+    policy.fallback_candidate_threshold = 3;
+    coordinator.SetPolicy(policy);
+
+    std::cout << "  [PASS] Stage 6 Waterfall Recall, Fallback Threshold & Secondary Reverse Lookup verified!" << std::endl;
+}
+
 // Main Test Runner
 // -----------------------------------------------------------------------------
 int main() {
@@ -1244,6 +1318,7 @@ int main() {
     TestReviewRound4Regressions(repo, clock);
     TestFinalizationPinyinPrefixesAndBoundaries();
     TestInputMethodEnablingDisablingAndValidation(coordinator, repo);
+    TestFallbackThresholdAndSecondaryReverseLookup(coordinator, repo);
 
     db.Close();
     std::filesystem::remove(testDb);

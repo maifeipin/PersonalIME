@@ -1,0 +1,59 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <ProjectOutputs>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\x64\Release\ZERO_CHECK</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\PersonalIME.dll</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\ime-cli.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\ime-service.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_admin_ipc.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_candidate_window.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_com_lifecycle.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_composition_lifecycle.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_ime_core.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_input_policy.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_ipc_runner.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_receipt_durability.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_receipt_handover.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_receipt_journal.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_stage3_integration.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\Release\test_tip_candidate_snapshot.exe</FullPath>
+    </ProjectOutput>
+    <ProjectOutput>
+      <FullPath>C:\Projects\AITools\PersonalIME\build_ci\x64\Release\ALL_BUILD</FullPath>
+    </ProjectOutput>
+  </ProjectOutputs>
+  <ContentFiles />
+  <SatelliteDlls />
+  <NonRecipeFileRefs />
+</Project>

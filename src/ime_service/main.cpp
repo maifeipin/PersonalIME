@@ -207,7 +207,7 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
     for (uint32_t i = 0; i < count; ++i) {
         const auto& cand = st.cached_coord_query.candidates[startIdx + i];
         std::wstring label = std::to_wstring(i + 1) + L". " + cand.text;
-        if (st.policy_snapshot && st.policy_snapshot->reverse_lookup.enabled && !cand.reverse_lookup_code.empty()) {
+        if (!cand.reverse_lookup_code.empty()) {
             label += L" [" + ime::Utf8ToWide(cand.reverse_lookup_code) + L"]";
         }
         SafeCopyCandidateText(resp.candidates[i], sizeof(resp.candidates[i])/sizeof(wchar_t), label);

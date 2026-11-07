@@ -62,6 +62,20 @@
                         <TextBlock Grid.Column="3" Text="（每页显示候选词条数，严格限制为 5 至 9）" Foreground="#777" VerticalAlignment="Center"/>
                     </Grid>
 
+                    <Grid Margin="0,0,0,10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="160"/>
+                            <ColumnDefinition Width="200"/>
+                            <ColumnDefinition Width="50"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <TextBlock Grid.Column="0" Text="次级补全阈值 (0-9):" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <Slider Grid.Column="1" Minimum="0" Maximum="9" Value="{Binding FallbackCandidateThreshold}" IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="2" Text="{Binding FallbackCandidateThreshold}" FontWeight="Bold" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                        <TextBlock Grid.Column="3" Text="（当主输入法精确候选小于此数量时，自动补充次级输入法候选并附带反查码）" Foreground="#777" VerticalAlignment="Center"/>
+                    </Grid>
+
                     <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
                         <CheckBox Content="启用自学习词频调整 (动态靠前)" IsChecked="{Binding FrequencyEnabled}" Margin="0,0,24,0" FontWeight="SemiBold"/>
                         <CheckBox Content="启用新词习惯学习 (学习开关)" IsChecked="{Binding LearningEnabled}" Margin="0,0,24,0" FontWeight="SemiBold"/>

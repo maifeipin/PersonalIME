@@ -149,6 +149,9 @@ public class InputPolicyConfig
     [JsonPropertyName("candidate_page_size")]
     public int CandidatePageSize { get; set; } = 5;
 
+    [JsonPropertyName("fallback_candidate_threshold")]
+    public int FallbackCandidateThreshold { get; set; } = 3;
+
     [JsonPropertyName("primary_input_method")]
     public string PrimaryInputMethod { get; set; } = InputSchemes.Wubi86;
 

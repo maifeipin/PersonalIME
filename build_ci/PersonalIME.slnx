@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Solution>
+	<Configurations>
+		<BuildType Name="Debug"/>
+		<BuildType Name="Release"/>
+		<BuildType Name="MinSizeRel"/>
+		<BuildType Name="RelWithDebInfo"/>
+		<Platform Name="x64"/>
+	</Configurations>
+	<Project Path="ALL_BUILD.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="0a96f017-80a7-320f-a06c-d256bee98b60" DefaultStartup="true">
+		<BuildDependency Project="PersonalIME.vcxproj"/>
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-cli.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="ime-service.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+		<BuildDependency Project="test_admin_ipc.vcxproj"/>
+		<BuildDependency Project="test_candidate_window.vcxproj"/>
+		<BuildDependency Project="test_com_lifecycle.vcxproj"/>
+		<BuildDependency Project="test_composition_lifecycle.vcxproj"/>
+		<BuildDependency Project="test_ime_core.vcxproj"/>
+		<BuildDependency Project="test_input_policy.vcxproj"/>
+		<BuildDependency Project="test_ipc_runner.vcxproj"/>
+		<BuildDependency Project="test_receipt_durability.vcxproj"/>
+		<BuildDependency Project="test_receipt_handover.vcxproj"/>
+		<BuildDependency Project="test_receipt_journal.vcxproj"/>
+		<BuildDependency Project="test_stage3_integration.vcxproj"/>
+		<BuildDependency Project="test_tip_candidate_snapshot.vcxproj"/>
+		<Build Solution="Debug|*" Project="false"/>
+		<Build Solution="Release|*" Project="false"/>
+		<Build Solution="MinSizeRel|*" Project="false"/>
+		<Build Solution="RelWithDebInfo|*" Project="false"/>
+	</Project>
+	<Project Path="PersonalIME.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="aa10485b-6f49-380d-af5c-2d16390048f3">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="ZERO_CHECK.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="2bd791ef-2442-3d11-8f1b-46144653e9d8"/>
+	<Project Path="ime-cli.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="1b0376b2-414b-3f82-8a44-8a2b4800fe6b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="ime-core.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="80386cc2-db37-370b-a35a-33589f220851">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="ime-service.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="13faa29f-7033-3d37-b35d-d4f99c259e61">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="sqlite3.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="4adc7d92-8e1d-3976-840c-0b449bd20860">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_admin_ipc.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="639c456b-01ca-3401-8deb-9af05bf088a4">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="test_candidate_window.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="8570cbf0-9e66-3001-a4e1-43a866bb6348">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_com_lifecycle.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="d5887f3a-b6ec-3449-b8db-69338d64c616">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_composition_lifecycle.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="c666d4d2-8a9d-3814-9ab7-d131b1147171">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_ime_core.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="116b3291-aa7d-372e-90b2-ae742095262d">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="test_input_policy.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="f64c80dd-ee9c-3b0e-8135-ad9e17c642c4">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="test_ipc_runner.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="eae15019-c5e8-34ab-b1f3-df3ab174f5e9">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_receipt_durability.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="abb8e60c-c36d-3876-a191-3c874b8e578b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_receipt_handover.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="7cdb7b35-2904-390c-915c-79b388b86dc9">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_receipt_journal.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="bab0a21c-b128-302b-8271-7bacf20a5f8b">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+	<Project Path="test_stage3_integration.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="b7bf7412-3ce4-3d32-a8a0-abe61b7f8da3">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+		<BuildDependency Project="ime-core.vcxproj"/>
+		<BuildDependency Project="sqlite3.vcxproj"/>
+	</Project>
+	<Project Path="test_tip_candidate_snapshot.vcxproj" Type="8bc9ceb8-8b4a-11d0-8d11-00a0c91bc942" Id="ee93b2e2-ae86-3289-b197-78e4a2904538">
+		<BuildDependency Project="ZERO_CHECK.vcxproj"/>
+	</Project>
+</Solution>

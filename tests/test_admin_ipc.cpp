@@ -1755,15 +1755,15 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     AssertCondition(pluginsArr[1]["name"] == "画图", "Plugin 1 is 画图");
     AssertCondition(pluginsArr[2]["name"] == "Edge浏览器", "Plugin 2 is Edge浏览器");
 
-    // 2. AddPlugin
+    // 2. AddPlugin (use headless cmd.exe /c exit 0 so CI runners never launch GUI calc.exe)
     nlohmann::json addReq;
     addReq["action"] = "add_plugin";
     addReq["request_id"] = 5002;
     addReq["parameters"] = {
-        {"name", "截图"},
-        {"icon", "✂️"},
-        {"exec_path", "snippingtool.exe"},
-        {"arguments", "/clip"},
+        {"name", "CI静默测试插件"},
+        {"icon", "⚙️"},
+        {"exec_path", "cmd.exe"},
+        {"arguments", "/c exit 0"},
         {"is_enabled", true},
         {"sort_order", 3}
     };
@@ -1778,7 +1778,7 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     updateReq["request_id"] = 5003;
     updateReq["parameters"] = {
         {"id", addedId},
-        {"name", "极速截图"},
+        {"name", "CI静默验证插件"},
         {"is_enabled", false}
     };
     auto updateResp = SendJson(updateReq);
@@ -1792,11 +1792,11 @@ static void TestPluginManagement(AdminServer& server, const std::wstring& pipeNa
     auto getEnabledResp = SendJson(getEnabledReq);
     AssertCondition(getEnabledResp["data"]["plugins"].size() == 3, "Only enabled plugins must exclude disabled 4th plugin");
 
-    // 4. ExecutePlugin (calc.exe)
+    // 4. ExecutePlugin (execute headless addedId -> cmd.exe /c exit 0 instead of GUI calc.exe)
     nlohmann::json execReq;
     execReq["action"] = "execute_plugin";
     execReq["request_id"] = 5005;
-    execReq["parameters"] = { {"id", pluginsArr[0]["id"].get<int64_t>()} };
+    execReq["parameters"] = { {"id", addedId} };
     auto execResp = SendJson(execReq);
     AssertCondition(execResp.value("success", false), "ExecutePlugin executed successfully");
 

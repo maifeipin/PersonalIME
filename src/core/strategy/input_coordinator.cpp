@@ -888,10 +888,13 @@ InputCoordinator::Query(const std::string& rawCode,
         std::unordered_map<std::string, std::vector<Candidate>> exactCache;
         std::unordered_map<std::string, std::vector<Candidate>> prefixCache;
 
-        for (const auto& dictId : enabledDicts) {
+        for (size_t dIdx = 0; dIdx < enabledDicts.size(); ++dIdx) {
+            const auto& dictId = enabledDicts[dIdx];
+            int dictPriority = static_cast<int>(dIdx);
             std::vector<Candidate> exactCandidates;
             for (const auto& m : methods) {
                 auto c = QuerySingleDictionary(dictId, m, true);
+                for (auto& item : c) item.dict_priority = dictPriority;
                 exactCandidates.insert(exactCandidates.end(), c.begin(), c.end());
             }
             if (!exactCandidates.empty()) {
@@ -903,6 +906,7 @@ InputCoordinator::Query(const std::string& rawCode,
             std::vector<Candidate> prefixCandidates;
             for (const auto& m : methods) {
                 auto c = QuerySingleDictionary(dictId, m, false);
+                for (auto& item : c) item.dict_priority = dictPriority;
                 prefixCandidates.insert(prefixCandidates.end(), c.begin(), c.end());
             }
             if (!prefixCandidates.empty()) {
@@ -919,29 +923,52 @@ InputCoordinator::Query(const std::string& rawCode,
             }
         }
 
-        // 2. Cascading candidate selection
+        // 2. Waterfall & Threshold-Aware Cascading Candidate Selection
         std::string chosenDict;
         std::vector<Candidate> chosenCandidates;
+        bool isAutoCascade = (manualDictIndex < 0 && targetDictId.empty());
+        uint32_t threshold = policySnapshot ? policySnapshot->fallback_candidate_threshold : 3;
+        std::unordered_set<std::wstring> exactTexts;
+        std::vector<std::string> selectedExactDicts;
 
-        // Stage 1: Exact matches in searchDicts
+        // Stage 1: Exact matches in searchDicts (merge custom overlay + supplement secondary if < threshold)
         for (const auto& dictId : searchDicts) {
             auto it = exactCache.find(dictId);
             if (it != exactCache.end() && !it->second.empty()) {
-                chosenDict = dictId;
-                chosenCandidates = it->second;
+                if (chosenDict.empty()) {
+                    chosenDict = dictId;
+                }
+                selectedExactDicts.push_back(dictId);
+                for (const auto& ec : it->second) {
+                    chosenCandidates.push_back(ec);
+                    exactTexts.insert(ec.text);
+                }
 
-                // For Wubi86, also append prefix completions from the same chosen dictionary
+                if (!isAutoCascade) {
+                    break;
+                }
+                // Custom dictionary is an overlay (never blocks builtin dictionaries).
+                // For builtin dictionaries, stop cascading once exact candidates meet threshold.
+                if (dictId != DICT_ID_CUSTOM && exactTexts.size() >= threshold) {
+                    break;
+                }
+            }
+        }
+
+        // Append Wubi86 prefix completions from selected dictionaries
+        if (!selectedExactDicts.empty()) {
+            std::unordered_set<std::string> seenIds;
+            for (const auto& ec : chosenCandidates) {
+                seenIds.insert(ec.entry_id);
+            }
+            for (const auto& dictId : selectedExactDicts) {
                 bool hasWubi = false;
-                for (const auto& ec : chosenCandidates) {
+                for (const auto& ec : exactCache[dictId]) {
                     if (ec.scheme == InputScheme::Wubi86) { hasWubi = true; break; }
                 }
                 if (hasWubi) {
                     auto itPref = prefixCache.find(dictId);
                     if (itPref != prefixCache.end() && !itPref->second.empty()) {
-                        std::unordered_set<std::string> seenIds;
-                        for (const auto& ec : chosenCandidates) {
-                            seenIds.insert(ec.entry_id);
-                        }
                         for (auto& pc : itPref->second) {
                             if (seenIds.insert(pc.entry_id).second) {
                                 chosenCandidates.push_back(std::move(pc));
@@ -949,18 +976,25 @@ InputCoordinator::Query(const std::string& rawCode,
                         }
                     }
                 }
-                break;
             }
         }
 
         // Stage 2: Prefix completions in searchDicts (only if Stage 1 returned no exact candidates)
         if (chosenCandidates.empty()) {
+            std::unordered_set<std::wstring> prefixTexts;
             for (const auto& dictId : searchDicts) {
                 auto it = prefixCache.find(dictId);
                 if (it != prefixCache.end() && !it->second.empty()) {
-                    chosenDict = dictId;
-                    chosenCandidates = it->second;
-                    break;
+                    if (chosenDict.empty()) {
+                        chosenDict = dictId;
+                    }
+                    for (const auto& pc : it->second) {
+                        chosenCandidates.push_back(pc);
+                        prefixTexts.insert(pc.text);
+                    }
+                    if (!isAutoCascade || (dictId != DICT_ID_CUSTOM && prefixTexts.size() >= threshold)) {
+                        break;
+                    }
                 }
             }
         }
@@ -1040,7 +1074,7 @@ InputCoordinator::Query(const std::string& rawCode,
         result.candidates = std::move(deduped);
         result.status = result.candidates.empty() ? CoordinatorStatus::NoCandidates : CoordinatorStatus::Success;
 
-        // Stage 4C-2: Reverse lookup annotation if enabled in policy
+        // Stage 4C-2 & Stage 6: Reverse lookup annotation
         if (policySnapshot && policySnapshot->reverse_lookup.enabled) {
             InputScheme targetScheme = policySnapshot->reverse_lookup.target_method;
             ShuangpinLayout spLayout = policySnapshot->reverse_lookup.shuangpin_layout;
@@ -1049,6 +1083,22 @@ InputCoordinator::Query(const std::string& rawCode,
                 if (rl.found && !rl.primary_code.empty()) {
                     cand.reverse_lookup_code = rl.primary_code;
                     cand.is_reverse_char_by_char = !rl.is_phrase;
+                }
+            }
+        } else if (policySnapshot && policySnapshot->mixed_input_enabled) {
+            // Automatically annotate candidates recalled from secondary input methods
+            // with their corresponding code in the primary input method (e.g., Wubi86 code when recalled via Pinyin/Shuangpin)
+            InputScheme primaryScheme = policySnapshot->primary_method;
+            ShuangpinLayout spLayout = policySnapshot->shuangpin_layout;
+            size_t annotateLimit = (std::min)(result.candidates.size(), static_cast<size_t>(50));
+            for (size_t i = 0; i < annotateLimit; ++i) {
+                auto& cand = result.candidates[i];
+                if (cand.method_priority > 0 && cand.scheme != primaryScheme && cand.scheme != InputScheme::Custom) {
+                    auto rl = ReverseLookup(cand.text, primaryScheme, spLayout);
+                    if (rl.found && !rl.primary_code.empty()) {
+                        cand.reverse_lookup_code = rl.primary_code;
+                        cand.is_reverse_char_by_char = !rl.is_phrase;
+                    }
                 }
             }
         }

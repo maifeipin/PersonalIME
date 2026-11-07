@@ -158,6 +158,7 @@ struct Candidate {
     std::string raw_code;        // User typed raw input
     std::string resolved_code;   // Actual resolved code/syllable used for lookup
     int method_priority = 0;     // 0 = primary method, 1, 2... for active input methods order
+    int dict_priority = 0;       // 0, 1, 2... order in dictionary_order
 
     // Stage 4C-2 reverse lookup linkage
     std::string reverse_lookup_code;      // Reverse lookup code (e.g. "aaaa" or "gong")

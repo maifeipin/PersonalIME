@@ -59,6 +59,11 @@ inline bool ValidateInputPolicy(const InputPolicy& p, std::string* errorOut = nu
         return false;
     }
 
+    if (p.fallback_candidate_threshold > 9) {
+        if (errorOut) *errorOut = "fallback_candidate_threshold must be between 0 and 9";
+        return false;
+    }
+
     if (p.dictionary_order.empty()) {
         if (errorOut) *errorOut = "dictionary_order cannot be empty";
         return false;
@@ -148,6 +153,7 @@ inline nlohmann::json InputPolicyToJson(const InputPolicy& policy) {
     j["frequency_enabled"] = policy.frequency_enabled;
     j["learning_enabled"] = policy.learning_enabled;
     j["candidate_page_size"] = policy.page_size;
+    j["fallback_candidate_threshold"] = policy.fallback_candidate_threshold;
 
     j["initial_mode"] = {
         {"chinese", policy.initial_mode.chinese},
@@ -447,6 +453,29 @@ inline bool InputPolicyFromJson(const nlohmann::json& j, InputPolicy& policy, st
                     return false;
                 }
                 p.page_size = static_cast<uint32_t>(val);
+            }
+        }
+
+        if (j.contains("fallback_candidate_threshold")) {
+            const auto& v = j["fallback_candidate_threshold"];
+            if (!v.is_number_integer() && !v.is_number_unsigned()) {
+                if (errorOut) *errorOut = "Field 'fallback_candidate_threshold' must be an integer";
+                return false;
+            }
+            if (v.is_number_integer()) {
+                int64_t val = v.get<int64_t>();
+                if (val < 0 || val > 9) {
+                    if (errorOut) *errorOut = "fallback_candidate_threshold must be between 0 and 9";
+                    return false;
+                }
+                p.fallback_candidate_threshold = static_cast<uint32_t>(val);
+            } else {
+                uint64_t val = v.get<uint64_t>();
+                if (val > 9) {
+                    if (errorOut) *errorOut = "fallback_candidate_threshold must be between 0 and 9";
+                    return false;
+                }
+                p.fallback_candidate_threshold = static_cast<uint32_t>(val);
             }
         }
 

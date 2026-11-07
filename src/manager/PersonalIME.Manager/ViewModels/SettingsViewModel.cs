@@ -11,6 +11,7 @@ public class SettingsViewModel : ViewModelBase
 
     private uint _currentRevision = 0;
     private int _candidatePageSize = 5;
+    private int _fallbackCandidateThreshold = 3;
     private string _primaryInputMethod = InputSchemes.Wubi86;
     private string _shuangpinLayout = ShuangpinLayouts.Xiaohe;
     private bool _frequencyEnabled = true;
@@ -67,6 +68,12 @@ public class SettingsViewModel : ViewModelBase
     {
         get => _candidatePageSize;
         set => SetProperty(ref _candidatePageSize, Math.Clamp(value, 5, 9));
+    }
+
+    public int FallbackCandidateThreshold
+    {
+        get => _fallbackCandidateThreshold;
+        set => SetProperty(ref _fallbackCandidateThreshold, Math.Clamp(value, 0, 9));
     }
 
     public string PrimaryInputMethod
@@ -220,6 +227,7 @@ public class SettingsViewModel : ViewModelBase
             var policy = await _client.GetPolicyAsync();
             CurrentRevision = policy.Revision;
             CandidatePageSize = policy.CandidatePageSize;
+            FallbackCandidateThreshold = policy.FallbackCandidateThreshold;
             PrimaryInputMethod = policy.PrimaryInputMethod;
             ShuangpinLayout = policy.ShuangpinLayout;
             FrequencyEnabled = policy.FrequencyEnabled;
@@ -354,6 +362,7 @@ public class SettingsViewModel : ViewModelBase
             {
                 Revision = CurrentRevision,
                 CandidatePageSize = CandidatePageSize,
+                FallbackCandidateThreshold = FallbackCandidateThreshold,
                 PrimaryInputMethod = PrimaryInputMethod,
                 ShuangpinLayout = ShuangpinLayouts.Canonicalize(ShuangpinLayout),
                 FrequencyEnabled = FrequencyEnabled,

@@ -51,8 +51,9 @@ struct InputPolicy {
     bool frequency_enabled = true; // false = freeze frequency weighting, keep base/manual order
     bool learning_enabled = true;  // false = do not record commit to stats
 
-    // 4. Candidate Page Size (Supported 5 to 9)
+    // 4. Candidate Page Size (Supported 5 to 9) & Secondary Fallback Threshold (Supported 0 to 9)
     uint32_t page_size = 5;
+    uint32_t fallback_candidate_threshold = 3;
 
     // 5. Initial Mode Flags
     struct InitialModeConfig {

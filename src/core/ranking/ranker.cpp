@@ -81,9 +81,13 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
                 existing.method_priority = c.method_priority;
                 existing.scheme = c.scheme;
                 existing.dict_id = c.dict_id;
+                existing.dict_priority = c.dict_priority;
                 existing.layout_id = c.layout_id;
                 existing.raw_code = c.raw_code;
                 existing.resolved_code = c.resolved_code;
+            } else if (c.method_priority == existing.method_priority && c.dict_priority < existing.dict_priority) {
+                existing.dict_id = c.dict_id;
+                existing.dict_priority = c.dict_priority;
             }
             // Better match quality takes precedence
             if (static_cast<int>(c.quality) < static_cast<int>(existing.quality)) {
@@ -99,7 +103,7 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
         ComputeScore(c, now);
     }
 
-    // 3. Strict Deterministic Sorter with Input Method Priority
+    // 3. Strict Deterministic Sorter with Input Method Priority & Dictionary Priority
     std::sort(uniqueCandidates.begin(), uniqueCandidates.end(), [](const Candidate& a, const Candidate& b) {
         // Level 1: Pinned status
         if (a.is_pinned != b.is_pinned) {
@@ -122,6 +126,11 @@ std::vector<Candidate> Ranker::Rank(std::vector<Candidate> candidates) const {
         // Level 3: Input Method Priority (cascade within same match quality tier)
         if (a.method_priority != b.method_priority) {
             return a.method_priority < b.method_priority; // Higher priority method (e.g. 0 before 1) comes first
+        }
+
+        // Level 3.5: Dictionary Source Priority (e.g. dict_custom before builtin dictionaries)
+        if (a.dict_priority != b.dict_priority) {
+            return a.dict_priority < b.dict_priority;
         }
 
         // Level 4: Score (DESC)
