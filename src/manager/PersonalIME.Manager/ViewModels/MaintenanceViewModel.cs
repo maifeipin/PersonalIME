@@ -66,11 +66,17 @@ public class MaintenanceViewModel : ViewModelBase
     public RelayCommand RequestResetStatsCommand { get; }
     public AsyncRelayCommand ConfirmActionCommand { get; }
     public RelayCommand CancelActionCommand { get; }
+    public AsyncRelayCommand? RestartServiceCommand { get; }
 
-    public MaintenanceViewModel(IAdminClient client, NotificationBanner banner)
+    public MaintenanceViewModel(IAdminClient client, NotificationBanner banner, Func<Task>? restartServiceAction = null)
     {
         _client = client;
         _banner = banner;
+
+        if (restartServiceAction != null)
+        {
+            RestartServiceCommand = new AsyncRelayCommand(restartServiceAction);
+        }
 
         RefreshStatusCommand = new AsyncRelayCommand(() => RefreshStatusAsync(true));
         CopyDiagnosticsCommand = new RelayCommand(CopyDiagnostics);

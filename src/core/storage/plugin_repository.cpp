@@ -218,7 +218,10 @@ bool PluginRepository::ExecuteCustom(const std::string& name, const std::string&
             ok = true;
             if (sei.hProcess) {
                 pid = GetProcessId(sei.hProcess);
+                AllowSetForegroundWindow(pid);
                 CloseHandle(sei.hProcess);
+            } else {
+                AllowSetForegroundWindow(ASFW_ANY);
             }
         }
 #else

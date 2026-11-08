@@ -23,7 +23,7 @@ enum class EditSessionResult {
 };
 
 class CTextInputProcessor : 
-    public ITfTextInputProcessor,
+    public ITfTextInputProcessorEx,
     public ITfKeyEventSink,
     public ITfCompositionSink {
 public:
@@ -35,9 +35,10 @@ public:
     STDMETHODIMP_(ULONG) AddRef() override;
     STDMETHODIMP_(ULONG) Release() override;
 
-    // ITfTextInputProcessor
+    // ITfTextInputProcessor & ITfTextInputProcessorEx
     STDMETHODIMP Activate(ITfThreadMgr* ptim, TfClientId tid) override;
     STDMETHODIMP Deactivate() override;
+    STDMETHODIMP ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD dwFlags) override;
 
     // ITfKeyEventSink
     STDMETHODIMP OnSetFocus(BOOL fForeground) override;

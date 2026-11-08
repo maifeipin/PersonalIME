@@ -99,7 +99,9 @@ VALUES ('custom_preset_email', 3, ';mail', strftime('%s', 'now'));
 
 -- 示例词条 2：快捷输入地址（输入 ;dz 输出示例地址，您可在后续随时在设置中修改）
 INSERT OR IGNORE INTO entries (id, text, source, created_at, updated_at)
-VALUES ('custom_preset_addr', '北京市海淀区中关村南大街', 1, strftime('%s', 'now'), strftime('%s', 'now'));
+VALUES ('custom_preset_addr', '北京市海淀区中关村南大街1号', 1, strftime('%s', 'now'), strftime('%s', 'now'));
+
+UPDATE entries SET text = '北京市海淀区中关村南大街1号' WHERE id = 'custom_preset_addr';
 
 INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at)
 VALUES ('custom_preset_addr', 3, ';dz', strftime('%s', 'now'));

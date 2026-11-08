@@ -292,35 +292,74 @@
                     </Border>
                 </StackPanel>
 
-                <!-- Right Section: Reconnect / Refresh Action -->
-                <Button Grid.Column="1" Content="刷新连接" Command="{Binding CheckConnectionCommand}" 
-                        Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand">
-                    <Button.Style>
-                        <Style TargetType="Button">
-                            <Setter Property="Background" Value="#F9FAFB"/>
-                            <Setter Property="BorderBrush" Value="#D1D5DB"/>
-                            <Setter Property="Foreground" Value="#374151"/>
-                            <Setter Property="Template">
-                                <Setter.Value>
-                                    <ControlTemplate TargetType="Button">
-                                        <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
-                                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                                        </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter Property="Background" Value="#E5E7EB"/>
-                                                <Setter Property="BorderBrush" Value="#9CA3AF"/>
-                                            </Trigger>
-                                            <Trigger Property="IsPressed" Value="True">
-                                                <Setter Property="Background" Value="#D1D5DB"/>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
-                                    </ControlTemplate>
-                                </Setter.Value>
-                            </Setter>
-                        </Style>
-                    </Button.Style>
-                </Button>
+                <!-- Right Section: Reconnect / Restart Actions -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Content="🔄 重启服务" Command="{Binding RestartServiceCommand}" Margin="0,0,8,0"
+                            Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand"
+                            ToolTip="重新启动后台输入法服务进程 (ime-service.exe)">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="#F9FAFB"/>
+                                <Setter Property="BorderBrush" Value="#D1D5DB"/>
+                                <Setter Property="Foreground" Value="#374151"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="Button">
+                                            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="Background" Value="#E5E7EB"/>
+                                                    <Setter Property="BorderBrush" Value="#9CA3AF"/>
+                                                </Trigger>
+                                                <Trigger Property="IsPressed" Value="True">
+                                                    <Setter Property="Background" Value="#D1D5DB"/>
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </Button.Style>
+                    </Button>
+
+                    <Button Content="{Binding ConnectionActionButtonText}" Command="{Binding CheckConnectionCommand}" 
+                            Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Background" Value="#F9FAFB"/>
+                                <Setter Property="BorderBrush" Value="#D1D5DB"/>
+                                <Setter Property="Foreground" Value="#374151"/>
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="Button">
+                                            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6" Padding="{TemplateBinding Padding}">
+                                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                            </Border>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="Background" Value="#E5E7EB"/>
+                                                    <Setter Property="BorderBrush" Value="#9CA3AF"/>
+                                                </Trigger>
+                                                <Trigger Property="IsPressed" Value="True">
+                                                    <Setter Property="Background" Value="#D1D5DB"/>
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsConnected}" Value="False">
+                                        <Setter Property="Background" Value="#DC2626"/>
+                                        <Setter Property="BorderBrush" Value="#B91C1C"/>
+                                        <Setter Property="Foreground" Value="#FFFFFF"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
+                </StackPanel>
             </Grid>
         </Border>
     </Grid>

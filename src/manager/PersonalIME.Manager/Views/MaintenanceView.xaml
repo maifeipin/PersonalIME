@@ -24,6 +24,9 @@
                         <Grid Margin="0,0,0,12">
                             <TextBlock Text="PersonalIME 运行诊断" FontSize="15" FontWeight="Bold" VerticalAlignment="Center"/>
                             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                <Button Content="🔄 重启服务" Command="{Binding RestartServiceCommand}" Padding="12,4" Margin="0,0,8,0"
+                                        ToolTip="强制重启后台 ime-service.exe 进程并重新连接"
+                                        Background="#EFF6FF" BorderBrush="#BFDBFE" Foreground="#1D4ED8" FontWeight="SemiBold" Cursor="Hand"/>
                                 <Button Content="刷新状态" Command="{Binding RefreshStatusCommand}" Padding="12,4" Margin="0,0,8,0"/>
                                 <Button Content="复制诊断信息" Command="{Binding CopyDiagnosticsCommand}" Padding="12,4"/>
                             </StackPanel>

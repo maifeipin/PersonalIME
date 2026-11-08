@@ -28,6 +28,7 @@ CTextInputProcessor::CTextInputProcessor() {
 
     m_candidateWindow.SetOnExecutePlugin([this](const CandidatePluginItem& item) {
         TerminateCompositionOnHost();
+        AllowSetForegroundWindow(ASFW_ANY);
         uint32_t execStatus = 0;
         bool ok = false;
         if (m_pluginExecuteOverride) {
@@ -689,8 +690,10 @@ STDMETHODIMP CTextInputProcessor::QueryInterface(REFIID riid, void** ppvObj) {
     if (!ppvObj) return E_POINTER;
     *ppvObj = nullptr;
 
-    if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfTextInputProcessor)) {
-        *ppvObj = static_cast<ITfTextInputProcessor*>(this);
+    if (IsEqualIID(riid, IID_IUnknown) ||
+        IsEqualIID(riid, IID_ITfTextInputProcessor) ||
+        IsEqualIID(riid, IID_ITfTextInputProcessorEx)) {
+        *ppvObj = static_cast<ITfTextInputProcessorEx*>(this);
     } else if (IsEqualIID(riid, IID_ITfKeyEventSink)) {
         *ppvObj = static_cast<ITfKeyEventSink*>(this);
     } else if (IsEqualIID(riid, IID_ITfCompositionSink)) {
@@ -744,6 +747,10 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     }
 
     return S_OK;
+}
+
+STDMETHODIMP CTextInputProcessor::ActivateEx(ITfThreadMgr* ptim, TfClientId tid, DWORD dwFlags) {
+    return Activate(ptim, tid);
 }
 
 STDMETHODIMP CTextInputProcessor::Deactivate() {

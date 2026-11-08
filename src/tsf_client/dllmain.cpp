@@ -145,6 +145,11 @@ STDAPI DllRegisterServer() {
     }
 
     hr = pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIP_KEYBOARD, CLSID_PersonalIME);
+    if (SUCCEEDED(hr)) {
+        pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, CLSID_PersonalIME);
+        pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, CLSID_PersonalIME);
+        pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, CLSID_PersonalIME);
+    }
     pCatMgr->Release();
     if (FAILED(hr)) {
         if (SUCCEEDED(hrCo)) CoUninitialize();
@@ -164,6 +169,9 @@ STDAPI DllUnregisterServer() {
     if (SUCCEEDED(CoCreateInstance(CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
                                    IID_ITfCategoryMgr, (void**)&pCatMgr))) {
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIP_KEYBOARD, CLSID_PersonalIME);
+        pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, CLSID_PersonalIME);
+        pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, CLSID_PersonalIME);
+        pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, CLSID_PersonalIME);
         pCatMgr->Release();
     }
 

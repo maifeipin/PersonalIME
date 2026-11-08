@@ -48,6 +48,7 @@ public class MainViewModel : ViewModelBase, IDisposable
             {
                 OnPropertyChanged(nameof(IsConnected));
                 OnPropertyChanged(nameof(HasOfflineWarning));
+                OnPropertyChanged(nameof(ConnectionActionButtonText));
             }
         }
     }
@@ -62,6 +63,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     }
 
     public bool HasOfflineWarning => !IsConnected;
+    public string ConnectionActionButtonText => IsConnected ? "刷新连接" : "▶ 启动服务";
 
     public string ConnectionStatusText
     {
@@ -118,6 +120,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     }
 
     public AsyncRelayCommand CheckConnectionCommand { get; }
+    public AsyncRelayCommand RestartServiceCommand { get; }
     public ICommand OpenCalendarCommand { get; }
     private Views.CalendarWindow? _calendarWindow;
 
@@ -144,12 +147,13 @@ public class MainViewModel : ViewModelBase, IDisposable
         Wordbook = new WordbookViewModel(_client, Banner);
         Sorting = new SortingViewModel(_client, Banner);
         Settings = new SettingsViewModel(_client, Banner);
-        Maintenance = new MaintenanceViewModel(_client, Banner);
+        Maintenance = new MaintenanceViewModel(_client, Banner, RestartServiceAsync);
         Plugins = new PluginsViewModel(_client, Banner);
 
         Settings.PolicySaved += OnPolicySaved;
 
         CheckConnectionCommand = new AsyncRelayCommand(CheckConnectionAsync);
+        RestartServiceCommand = new AsyncRelayCommand(RestartServiceAsync);
         OpenCalendarCommand = new RelayCommand(() =>
         {
             if (_calendarWindow != null && _calendarWindow.IsLoaded)
@@ -243,7 +247,26 @@ public class MainViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private async Task TryAutoLaunchAndConnectAsync()
+    public async Task RestartServiceAsync()
+    {
+        Banner.ShowInfo("正在重启输入法服务...");
+        ServiceState = ServiceConnectionState.Starting;
+        ConnectionStatusText = "● 正在重启输入法服务...";
+
+        await TryAutoLaunchAndConnectAsync(forceKillExisting: true);
+
+        if (IsConnected)
+        {
+            Banner.ShowSuccess("输入法服务已成功重启并就绪！");
+            _ = Maintenance.RefreshStatusAsync(false);
+        }
+        else
+        {
+            Banner.ShowError("重启服务失败：" + ConnectionStatusText);
+        }
+    }
+
+    private async Task TryAutoLaunchAndConnectAsync(bool forceKillExisting = false)
     {
         string? servicePath = LocateServiceExecutable();
         if (string.IsNullOrEmpty(servicePath))
@@ -255,20 +278,43 @@ public class MainViewModel : ViewModelBase, IDisposable
         }
 
         ServiceState = ServiceConnectionState.Starting;
-        ConnectionStatusText = "● 正在准备输入法引擎...";
+        ConnectionStatusText = forceKillExisting ? "● 正在重启输入法服务..." : "● 正在准备输入法引擎...";
 
-        // Check if an existing ime-service process is already running (e.g. launched by another instance)
+        // Check or kill existing ime-service processes
         Process? startedProcess = null;
         try
         {
             var existingProcesses = Process.GetProcessesByName("ime-service");
             bool hasRunning = existingProcesses.Length > 0;
-            foreach (var p in existingProcesses)
+
+            if (forceKillExisting)
             {
-                p.Dispose();
+                foreach (var p in existingProcesses)
+                {
+                    try
+                    {
+                        if (!p.HasExited)
+                        {
+                            p.Kill();
+                            p.WaitForExit(2000);
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        p.Dispose();
+                    }
+                }
+            }
+            else
+            {
+                foreach (var p in existingProcesses)
+                {
+                    p.Dispose();
+                }
             }
 
-            if (!hasRunning)
+            if (forceKillExisting || !hasRunning)
             {
                 var psi = new ProcessStartInfo
                 {

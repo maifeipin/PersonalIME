@@ -77,4 +77,41 @@ public class MainViewModelTests
             StringAssert.EndsWith(path.ToLowerInvariant(), "ime-service.exe");
         }
     }
+
+    [TestMethod]
+    public async Task TestConnectionActionButtonTextDynamicChanges()
+    {
+        var mock = new MockAdminClient
+        {
+            OnGetStatus = _ => throw new TimeoutException("Connection refused")
+        };
+        using var vm = new MainViewModel(mock);
+        await vm.CheckConnectionAsync();
+
+        Assert.IsFalse(vm.IsConnected);
+        Assert.AreEqual("▶ 启动服务", vm.ConnectionActionButtonText);
+
+        mock.OnGetStatus = _ => Task.FromResult(new ServiceStatusInfo { ServiceVersion = "1.0.0" });
+        await vm.CheckConnectionAsync();
+
+        Assert.IsTrue(vm.IsConnected);
+        Assert.AreEqual("刷新连接", vm.ConnectionActionButtonText);
+    }
+
+    [TestMethod]
+    public async Task TestMaintenanceRestartServiceCommandDelegation()
+    {
+        bool restartCalled = false;
+        var banner = new NotificationBanner();
+        var mock = new MockAdminClient();
+        var vm = new MaintenanceViewModel(mock, banner, () =>
+        {
+            restartCalled = true;
+            return Task.CompletedTask;
+        });
+
+        Assert.IsNotNull(vm.RestartServiceCommand);
+        await vm.RestartServiceCommand.ExecuteAsync(null);
+        Assert.IsTrue(restartCalled);
+    }
 }
