@@ -114,6 +114,9 @@ private:
     bool m_isHoveringNextBtn = false;
     bool m_isPressedPrevBtn = false;
     bool m_isPressedNextBtn = false;
+    CandidateDisplaySnapshot m_pressedArrowSnapshot;
+
+    void ResetAllPressedStates();
     bool m_trackingMouse = false;
     OnOpenManagerCallback m_onOpenManager;
     OnSelectCandidateCallback m_onSelectCandidate;

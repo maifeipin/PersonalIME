@@ -141,8 +141,28 @@ void CCandidateWindow::Destroy() {
     }
 }
 
+void CCandidateWindow::ResetAllPressedStates() {
+    m_pressedIndex = -1;
+    m_pressedVersion = 0;
+    m_pressedContextId = 0;
+    m_pressedPageIndex = 0;
+    m_pressedCandidateText.clear();
+
+    m_isPressedPrevBtn = false;
+    m_isPressedNextBtn = false;
+    m_pressedArrowSnapshot = {};
+
+    m_isPressedMgrBtn = false;
+    for (auto& p : m_plugins) {
+        p.isPressed = false;
+    }
+}
+
 void CCandidateWindow::Hide() {
     if (m_hWnd && IsWindow(m_hWnd)) {
+        if (GetCapture() == m_hWnd) {
+            ReleaseCapture();
+        }
         ShowWindow(m_hWnd, SW_HIDE);
     }
     m_snapshot = {};
@@ -150,14 +170,14 @@ void CCandidateWindow::Hide() {
     m_candidateRects.clear();
     m_selectedIndex = 0;
     m_hoveredIndex = -1;
-    m_pressedIndex = -1;
-    m_pressedVersion = 0;
-    m_pressedContextId = 0;
-    m_pressedPageIndex = 0;
-    m_pressedCandidateText.clear();
     m_isHoveringMgrBtn = false;
-    m_isPressedMgrBtn = false;
+    m_isHoveringPrevBtn = false;
+    m_isHoveringNextBtn = false;
+    for (auto& p : m_plugins) {
+        p.isHovered = false;
+    }
     m_trackingMouse = false;
+    ResetAllPressedStates();
 }
 
 void CCandidateWindow::SetSelectedIndex(int index) {
@@ -202,6 +222,10 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
         return;
     }
 
+    if (m_hWnd && IsWindow(m_hWnd) && GetCapture() == m_hWnd) {
+        ReleaseCapture();
+    }
+
     m_snapshot = snapshot;
     m_lastShowPt = pt;
     m_candidates = snapshot.candidates;
@@ -212,12 +236,14 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     }
     m_selectedIndex = initSel;
     m_hoveredIndex = -1;
-    m_pressedIndex = -1;
-    m_pressedVersion = 0;
-    m_pressedContextId = 0;
-    m_pressedPageIndex = 0;
-    m_pressedCandidateText.clear();
+    m_isHoveringPrevBtn = false;
+    m_isHoveringNextBtn = false;
+    m_isHoveringMgrBtn = false;
+    for (auto& p : m_plugins) {
+        p.isHovered = false;
+    }
     m_candidateRects.clear();
+    ResetAllPressedStates();
 
     // Calculate dimensions using bold font so switching selection never shifts candidate layout
     HDC hdc = GetDC(m_hWnd);
@@ -476,12 +502,14 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         }
         if (PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled()) {
             pThis->m_isPressedPrevBtn = true;
+            pThis->m_pressedArrowSnapshot = pThis->m_snapshot;
             SetCapture(hWnd);
             InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
             return 0;
         }
         if (PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled()) {
             pThis->m_isPressedNextBtn = true;
+            pThis->m_pressedArrowSnapshot = pThis->m_snapshot;
             SetCapture(hWnd);
             InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
             return 0;
@@ -503,9 +531,6 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
     }
 
     if (uMsg == WM_LBUTTONUP && pThis) {
-        if (GetCapture() == hWnd) {
-            ReleaseCapture();
-        }
         POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
         if (pThis->m_pressedIndex >= 0) {
             int clickedIdx = pThis->m_pressedIndex;
@@ -519,6 +544,10 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             pThis->m_pressedContextId = 0;
             pThis->m_pressedPageIndex = 0;
             pThis->m_pressedCandidateText.clear();
+
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
 
             bool hitSameCandidate =
                 clickedIdx < static_cast<int>(pThis->m_candidateRects.size()) &&
@@ -542,12 +571,24 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             InvalidateRect(hWnd, nullptr, FALSE);
         }
         if (pThis->m_isPressedPrevBtn) {
+            bool wasPressed = pThis->m_isPressedPrevBtn;
+            CandidateDisplaySnapshot snapAtDown = pThis->m_pressedArrowSnapshot;
             pThis->m_isPressedPrevBtn = false;
+            pThis->m_pressedArrowSnapshot = {};
+
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
             InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
-            if (PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled()) {
-                CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+
+            if (wasPressed && PtInRect(&pThis->m_rcPrevBtn, pt) &&
+                pThis->m_snapshot.session_id == snapAtDown.session_id &&
+                pThis->m_snapshot.context_id == snapAtDown.context_id &&
+                pThis->m_snapshot.candidate_version == snapAtDown.candidate_version &&
+                pThis->m_snapshot.page_index == snapAtDown.page_index &&
+                pThis->IsPrevButtonEnabled()) {
                 if (pThis->m_onPageScrollSnapshot) {
-                    pThis->m_onPageScrollSnapshot(snapCopy, false);
+                    pThis->m_onPageScrollSnapshot(snapAtDown, false);
                 } else if (pThis->m_onPageScroll) {
                     pThis->m_onPageScroll(false);
                 }
@@ -555,12 +596,24 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             }
         }
         if (pThis->m_isPressedNextBtn) {
+            bool wasPressed = pThis->m_isPressedNextBtn;
+            CandidateDisplaySnapshot snapAtDown = pThis->m_pressedArrowSnapshot;
             pThis->m_isPressedNextBtn = false;
+            pThis->m_pressedArrowSnapshot = {};
+
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
             InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
-            if (PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled()) {
-                CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+
+            if (wasPressed && PtInRect(&pThis->m_rcNextBtn, pt) &&
+                pThis->m_snapshot.session_id == snapAtDown.session_id &&
+                pThis->m_snapshot.context_id == snapAtDown.context_id &&
+                pThis->m_snapshot.candidate_version == snapAtDown.candidate_version &&
+                pThis->m_snapshot.page_index == snapAtDown.page_index &&
+                pThis->IsNextButtonEnabled()) {
                 if (pThis->m_onPageScrollSnapshot) {
-                    pThis->m_onPageScrollSnapshot(snapCopy, true);
+                    pThis->m_onPageScrollSnapshot(snapAtDown, true);
                 } else if (pThis->m_onPageScroll) {
                     pThis->m_onPageScroll(true);
                 }
@@ -569,6 +622,9 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         }
         if (pThis->m_isPressedMgrBtn) {
             pThis->m_isPressedMgrBtn = false;
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
             if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
                 pThis->TriggerManagerButton();
                 return 0;
@@ -578,12 +634,26 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         for (auto& p : pThis->m_plugins) {
             if (p.isPressed) {
                 p.isPressed = false;
+                if (GetCapture() == hWnd) {
+                    ReleaseCapture();
+                }
                 if (PtInRect(&p.rcBtn, pt)) {
                     pThis->TriggerPluginButton(p.id);
                     return 0;
                 }
                 InvalidateRect(hWnd, &p.rcBtn, FALSE);
             }
+        }
+        if (GetCapture() == hWnd) {
+            ReleaseCapture();
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_CAPTURECHANGED && pThis) {
+        if (reinterpret_cast<HWND>(lParam) != hWnd) {
+            pThis->ResetAllPressedStates();
+            InvalidateRect(hWnd, nullptr, FALSE);
         }
         return 0;
     }

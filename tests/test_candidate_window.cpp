@@ -276,6 +276,80 @@ int main() {
     }
     std::wcout << L"[PASS] Verified: Candidate window paging arrows (< and >) rendering, state enable/disable, and mouse click navigation." << std::endl;
 
+    // 9. Regression test: Arrow press lifecycle bound to candidate snapshot and cancelled across Refresh/Hide/Capture loss
+    {
+        CCandidateWindow win;
+        CandidateDisplaySnapshot snapA;
+        snapA.session_id = 1;
+        snapA.context_id = 100;
+        snapA.candidate_version = 10;
+        snapA.page_index = 0;
+        snapA.page_count = 3;
+        snapA.candidates = { L"1. 候选A" };
+
+        POINT pt = { 100, 100 };
+        win.Show(snapA, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+
+        int scrollCalls = 0;
+        uint64_t scrolledContext = 0;
+        win.SetOnPageScrollSnapshot([&](const CandidateDisplaySnapshot& s, bool) {
+            scrollCalls++;
+            scrolledContext = s.context_id;
+        });
+
+        RECT rcNext = win.GetNextButtonRect();
+        POINT ptNext = { (rcNext.left + rcNext.right) / 2, (rcNext.top + rcNext.bottom) / 2 };
+
+        // Test 9.1: Down(A) -> Show(B) -> Up: must NOT trigger page scroll on new snapshot B
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(win.IsPressedNextButton(), true, L"LButtonDown on Next button sets pressed state");
+
+        CandidateDisplaySnapshot snapB = snapA;
+        snapB.context_id = 200;
+        snapB.candidate_version = 20;
+        snapB.candidates = { L"1. 候选B" };
+        win.Show(snapB, pt);
+
+        CHECK_EQ(win.IsPressedNextButton(), false, L"Show with new snapshot must cancel previous pressed state");
+        CHECK_EQ(GetCapture() == win.GetHwnd(), false, L"Show must release any existing mouse capture");
+
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(scrollCalls, 0, L"Mouse Up after snapshot refresh must NOT trigger scroll");
+
+        // Test 9.2: Down(A) -> Hide: must clear pressed and release capture
+        win.Show(snapA, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(win.IsPressedNextButton(), true, L"Next button pressed before Hide");
+
+        win.Hide();
+        CHECK_EQ(win.IsPressedNextButton(), false, L"Hide must reset Next button pressed state");
+        CHECK_EQ(GetCapture() == win.GetHwnd(), false, L"Hide must release mouse capture");
+
+        // Test 9.3: Hide -> Show(B) -> Up: must NOT trigger scroll
+        win.Show(snapB, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(scrollCalls, 0, L"Mouse Up after Hide-Show sequence must NOT trigger scroll");
+
+        // Test 9.4: Down -> WM_CAPTURECHANGED (capture lost) -> Up: must NOT trigger scroll
+        win.Show(snapA, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(win.IsPressedNextButton(), true, L"Next button pressed before capture loss");
+
+        SendMessageW(win.GetHwnd(), WM_CAPTURECHANGED, 0, 0);
+        CHECK_EQ(win.IsPressedNextButton(), false, L"WM_CAPTURECHANGED must reset pressed state");
+
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(scrollCalls, 0, L"Mouse Up after capture loss must NOT trigger scroll");
+
+        win.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+    }
+    std::wcout << L"[PASS] Verified: Paging arrow press lifecycle strictly bound to snapshot, cancels on Refresh/Hide/Capture loss." << std::endl;
+
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
 }
