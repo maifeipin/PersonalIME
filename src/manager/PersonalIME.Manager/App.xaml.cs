@@ -41,6 +41,18 @@ public partial class App : Application
             }
         }
 
+        if (isCalendarMode)
+        {
+            IntPtr existingCal = FindWindowW(null, "中华万年历");
+            if (existingCal != IntPtr.Zero)
+            {
+                ShowWindowAsync(existingCal, SW_RESTORE);
+                SetForegroundWindow(existingCal);
+                Shutdown();
+                return;
+            }
+        }
+
         string mutexName = isCalendarMode
             ? @"Local\PersonalIME_Calendar_SingleInstance_Mutex"
             : @"Local\PersonalIME_Manager_SingleInstance_Mutex";
@@ -57,32 +69,26 @@ public partial class App : Application
             }
             else
             {
-                try
-                {
-                    var currentProc = System.Diagnostics.Process.GetCurrentProcess();
-                    var existingProc = System.Diagnostics.Process.GetProcessesByName(currentProc.ProcessName)
-                                              .FirstOrDefault(p => p.Id != currentProc.Id && p.MainWindowHandle != IntPtr.Zero);
-                    if (existingProc != null)
-                    {
-                        existingWnd = existingProc.MainWindowHandle;
-                    }
-                }
-                catch
-                {
-                    // Process enumeration fallback
-                }
+                existingWnd = FindWindowW(null, "人人 设置");
+                if (existingWnd == IntPtr.Zero) existingWnd = FindWindowW(null, "设置");
+                if (existingWnd == IntPtr.Zero) existingWnd = FindWindowW(null, "PersonalIME 管理器");
 
                 if (existingWnd == IntPtr.Zero)
                 {
-                    existingWnd = FindWindowW(null, "设置");
-                }
-                if (existingWnd == IntPtr.Zero)
-                {
-                    existingWnd = FindWindowW(null, "人人 设置");
-                }
-                if (existingWnd == IntPtr.Zero)
-                {
-                    existingWnd = FindWindowW(null, "PersonalIME 管理器");
+                    try
+                    {
+                        var currentProc = System.Diagnostics.Process.GetCurrentProcess();
+                        var existingProc = System.Diagnostics.Process.GetProcessesByName(currentProc.ProcessName)
+                                                  .FirstOrDefault(p => p.Id != currentProc.Id && p.MainWindowHandle != IntPtr.Zero && p.MainWindowTitle != "中华万年历");
+                        if (existingProc != null)
+                        {
+                            existingWnd = existingProc.MainWindowHandle;
+                        }
+                    }
+                    catch
+                    {
+                        // Process enumeration fallback
+                    }
                 }
             }
 

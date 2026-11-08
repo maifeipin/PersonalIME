@@ -314,9 +314,12 @@ public sealed class CalendarViewModel : ViewModelBase, IDisposable
             {
                 d.IsToday = (d.FullDate.Date == now.Date);
             }
+            if (SelectedDay != null)
+            {
+                UpdateSelectionDetails(SelectedDay);
+            }
         }
-
-        if (now.Hour != _lastCheckedHour)
+        else if (now.Hour != _lastCheckedHour)
         {
             _lastCheckedHour = now.Hour;
             if (SelectedDay != null && SelectedDay.FullDate.Date == now.Date)
@@ -353,18 +356,20 @@ public sealed class CalendarViewModel : ViewModelBase, IDisposable
         string moonSuffix = !string.IsNullOrEmpty(lunar.MoonPhase) ? $" ({lunar.MoonPhase})" : "";
         SelectedLunarDisplay = $"{lunar.FullChineseDate}{moonSuffix}";
 
-        SelectedGanZhiDisplay = $"{lunar.YearGanZhi}年 {lunar.MonthGanZhi}月 {lunar.DayGanZhi}日";
+        // 四柱八字统一基于选定日正午 12:00（消除立春换年及各节交节临界点的时辰不确定性）
+        var noonPillars = ChineseCalendarEngine.GetFourPillars(dt.Date.AddHours(12));
+        SelectedGanZhiDisplay = $"{noonPillars.YearPillar.Name}年 {noonPillars.MonthPillar.Name}月 {noonPillars.DayPillar.Name}日";
         SelectedZodiacDisplay = $"【生肖: {lunar.ZodiacName}】 {lunar.ConstellationName}";
 
         if (lunar.SolarTerm != null)
         {
-            SelectedTermDisplay = $"节气: {lunar.SolarTerm.Name} ({lunar.SolarTerm.ExactTime:yyyy-MM-dd HH:mm})";
+            SelectedTermDisplay = $"节气: {lunar.SolarTerm.Name} (约 {lunar.SolarTerm.ExactTime:yyyy-MM-dd HH:mm})";
         }
         else
         {
             // Show upcoming/neighboring terms in current month
             var (t1, t2) = ChineseCalendarEngine.GetMonthSolarTerms(dt.Year, dt.Month);
-            SelectedTermDisplay = $"本月节气: {t1.Day}日 {t1.Name} · {t2.Day}日 {t2.Name}";
+            SelectedTermDisplay = $"本月节气: {t1.Day}日 {t1.Name} · {t2.Day}日 {t2.Name} (估算)";
         }
 
         SelectedFestDisplay = !string.IsNullOrEmpty(lunar.Festivals) ? $"节日: {lunar.Festivals}" : string.Empty;

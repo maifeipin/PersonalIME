@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Input;
 using PersonalIME.Manager.Ipc;
 using PersonalIME.Manager.Models;
@@ -120,6 +121,17 @@ public class MainViewModel : ViewModelBase, IDisposable
     public ICommand OpenCalendarCommand { get; }
     private Views.CalendarWindow? _calendarWindow;
 
+    [DllImport("user32.dll", EntryPoint = "FindWindowW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindWindowW(string? lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    private const int SW_RESTORE = 9;
+
     public MainViewModel(IAdminClient client)
     {
         _client = client;
@@ -147,6 +159,14 @@ public class MainViewModel : ViewModelBase, IDisposable
                     _calendarWindow.WindowState = System.Windows.WindowState.Normal;
                 }
                 _calendarWindow.Activate();
+                return;
+            }
+
+            IntPtr external = FindWindowW(null, "中华万年历");
+            if (external != IntPtr.Zero)
+            {
+                ShowWindowAsync(external, SW_RESTORE);
+                SetForegroundWindow(external);
                 return;
             }
 

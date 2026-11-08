@@ -124,5 +124,20 @@ public class CalendarViewModelTests
         Assert.AreEqual(1900, vm.CurrentYear);
         Assert.AreEqual(1, vm.CurrentMonth);
     }
+
+    [TestMethod]
+    public void TestFourPillarsDisplayAlignmentWithApi()
+    {
+        using var vm = new CalendarViewModel();
+        vm.ChangeYear(2026 - vm.CurrentYear);
+        vm.ChangeMonth(2 - vm.CurrentMonth);
+
+        var feb4 = vm.Days.First(x => x.IsCurrentMonth && x.DayNumber == 4);
+        vm.SelectDayCommand.Execute(feb4);
+
+        var noonPillars = maifeipin.ChineseCalendar.ChineseCalendarEngine.GetFourPillars(new DateTime(2026, 2, 4, 12, 0, 0));
+        Assert.AreEqual($"{noonPillars.YearPillar.Name}年 {noonPillars.MonthPillar.Name}月 {noonPillars.DayPillar.Name}日", vm.SelectedGanZhiDisplay);
+        StringAssert.StartsWith(vm.SelectedGanZhiDisplay, "丙午年");
+    }
 }
 
