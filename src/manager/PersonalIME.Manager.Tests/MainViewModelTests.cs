@@ -187,4 +187,145 @@ public class MainViewModelTests
         Assert.IsTrue(vm.CheckConnectionCommand.CanExecute(null));
         Assert.IsTrue(vm.RestartServiceCommand.CanExecute(null));
     }
+
+    [TestMethod]
+    public void TestVerifyServiceProcessIdentity_RejectsDifferentDirectorySameName()
+    {
+        string expected = @"C:\Program Files\PersonalIME\ime-service.exe";
+        string actual = @"C:\Portable\PersonalIME\ime-service.exe";
+
+        bool ok = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 1,
+            processPath: actual,
+            hasExited: false,
+            expectedServicePath: expected,
+            expectedSessionId: 1,
+            out string failureReason
+        );
+
+        Assert.IsFalse(ok);
+        StringAssert.Contains(failureReason, "路径不匹配");
+        StringAssert.Contains(failureReason, "C:\\Portable\\PersonalIME\\ime-service.exe");
+    }
+
+    [TestMethod]
+    public void TestVerifyServiceProcessIdentity_RejectsUnreadableOrEmptyPath()
+    {
+        string expected = @"C:\Program Files\PersonalIME\ime-service.exe";
+
+        bool okNull = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 1,
+            processPath: null,
+            hasExited: false,
+            expectedServicePath: expected,
+            expectedSessionId: 1,
+            out string reasonNull
+        );
+        Assert.IsFalse(okNull);
+        StringAssert.Contains(reasonNull, "路径为空或不可读");
+
+        bool okEmpty = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 1,
+            processPath: "   ",
+            hasExited: false,
+            expectedServicePath: expected,
+            expectedSessionId: 1,
+            out string reasonEmpty
+        );
+        Assert.IsFalse(okEmpty);
+        StringAssert.Contains(reasonEmpty, "路径为空或不可读");
+    }
+
+    [TestMethod]
+    public void TestVerifyServiceProcessIdentity_RejectsSessionMismatch()
+    {
+        string expected = @"C:\Program Files\PersonalIME\ime-service.exe";
+
+        bool ok = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 2, // Other session
+            processPath: expected,
+            hasExited: false,
+            expectedServicePath: expected,
+            expectedSessionId: 1, // Current session
+            out string failureReason
+        );
+
+        Assert.IsFalse(ok);
+        StringAssert.Contains(failureReason, "位于其他用户会话");
+        StringAssert.Contains(failureReason, "Session 2");
+    }
+
+    [TestMethod]
+    public void TestVerifyServiceProcessIdentity_RejectsExitedProcess()
+    {
+        string expected = @"C:\Program Files\PersonalIME\ime-service.exe";
+
+        bool ok = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 1,
+            processPath: expected,
+            hasExited: true, // Already exited
+            expectedServicePath: expected,
+            expectedSessionId: 1,
+            out string failureReason
+        );
+
+        Assert.IsFalse(ok);
+        StringAssert.Contains(failureReason, "已退出");
+    }
+
+    [TestMethod]
+    public void TestVerifyServiceProcessIdentity_AcceptsNormalizedMatchingPath()
+    {
+        string expected = @"C:\Program Files\PersonalIME\ime-service.exe";
+        // Mix slashes and cases to verify robust normalization
+        string actual = @"c:/Program Files/PersonalIME/ime-service.exe";
+
+        bool ok = MainViewModel.VerifyServiceProcessIdentity(
+            processId: 1234,
+            processSessionId: 1,
+            processPath: actual,
+            hasExited: false,
+            expectedServicePath: expected,
+            expectedSessionId: 1,
+            out string failureReason
+        );
+
+        Assert.IsTrue(ok);
+        Assert.AreEqual(string.Empty, failureReason);
+    }
+
+    [TestMethod]
+    public async Task TestRestartService_NullStatus_SetsDisconnectedPendingRefresh()
+    {
+        bool firstCall = true;
+        var mock = new MockAdminClient
+        {
+            OnGetStatus = _ =>
+            {
+                if (firstCall)
+                {
+                    firstCall = false;
+                    return Task.FromResult(new ServiceStatusInfo { ServiceVersion = "1.0.0", ProcessId = 1234 });
+                }
+                // Second call (during restart) fails / returns null
+                throw new InvalidOperationException("Connection lost");
+            }
+        };
+        using var vm = new MainViewModel(mock);
+        await vm.CheckConnectionAsync();
+        Assert.IsTrue(vm.IsConnected);
+
+        await vm.RestartServiceAsync();
+
+        Assert.IsTrue(vm.Banner.IsVisible);
+        Assert.AreEqual(BannerType.Error, vm.Banner.Type);
+        StringAssert.Contains(vm.Banner.Message, "连接状态未知");
+        Assert.AreEqual(ServiceConnectionState.Disconnected, vm.ServiceState);
+        StringAssert.Contains(vm.ConnectionStatusText, "待刷新");
+    }
 }

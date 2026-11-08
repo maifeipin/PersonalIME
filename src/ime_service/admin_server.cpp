@@ -465,8 +465,17 @@ void AdminServer::ClientHandlerThread(HANDLE hPipe) {
             }
         }
 
-        std::string respJson = HandleRequest(payloadJson, header.request_id);
+        bool isShutdown = false;
+        std::string respJson = HandleRequest(payloadJson, header.request_id, isShutdown);
         if (!SendFrame(hPipe, header.request_id, respJson, frameDeadline)) {
+            break;
+        }
+
+        if (isShutdown) {
+            DrainOrDisconnect(hPipe, 200, m_stopEvent);
+            if (m_shutdownHandler) {
+                m_shutdownHandler();
+            }
             break;
         }
     }
@@ -556,7 +565,8 @@ static bool CheckBoolField(const nlohmann::json& obj, const char* key, bool& out
     return true;
 }
 
-std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t requestId) {
+std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t requestId, bool& outIsShutdown) {
+    outIsShutdown = false;
     nlohmann::json req;
     try {
         req = nlohmann::json::parse(requestJson);
@@ -1612,16 +1622,9 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             return MakeSuccessResponse(action, requestId, data);
         }
 
-        // 21. Shutdown
+        // 21. Shutdown (Signals graceful stop to main service loop)
         if (action == "Shutdown" || action == "shutdown" || action == "stop") {
-            std::thread([]() {
-                std::this_thread::sleep_for(std::chrono::milliseconds(80));
-#ifdef _WIN32
-                ExitProcess(0);
-#else
-                _exit(0);
-#endif
-            }).detach();
+            outIsShutdown = true;
             nlohmann::json data;
             data["shutting_down"] = true;
             return MakeSuccessResponse(action, requestId, data);

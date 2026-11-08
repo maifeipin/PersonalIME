@@ -99,6 +99,11 @@ static std::atomic<uint64_t> g_nextConnectionEpoch{1};
 static std::mutex g_pendingMutex;
 static std::map<uint64_t, ServerPendingCommit> g_pendingCommits;
 
+static HANDLE g_hServiceStopEvent = nullptr;
+static std::atomic<bool> g_serviceStopping{false};
+static std::mutex g_clientPipesMutex;
+static std::vector<HANDLE> g_activeClientPipes;
+
 // Completed commits cache for idempotency with owner tracking
 static constexpr size_t MAX_COMPLETED_EVENTS = 4096;
 static std::map<uint64_t, CompletedCommitInfo> g_completedEvents;
@@ -350,6 +355,11 @@ static void ResetContextCompositionAndState(ContextState& state) {
 
 // Handles a single client pipe connection with multi-context isolation
 void HandleClient(HANDLE hPipe) {
+    {
+        std::lock_guard<std::mutex> lock(g_clientPipesMutex);
+        g_activeClientPipes.push_back(hPipe);
+    }
+
     uint64_t currentConnEpoch = g_nextConnectionEpoch.fetch_add(1);
     std::map<std::pair<uint64_t, uint64_t>, ContextState> contextStates;
     DWORD bytesRead = 0;
@@ -357,7 +367,7 @@ void HandleClient(HANDLE hPipe) {
 
     std::wcout << L"[ime-service] Client connected to pipe." << std::endl;
 
-    while (true) {
+    while (!g_serviceStopping.load()) {
         IpcKeyRequest req{};
         BOOL success = ReadFile(hPipe, &req, sizeof(req), &bytesRead, nullptr);
         if (!success || bytesRead != sizeof(req)) {
@@ -1419,6 +1429,14 @@ void HandleClient(HANDLE hPipe) {
         FlushFileBuffers(hPipe);
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_clientPipesMutex);
+        auto it = std::find(g_activeClientPipes.begin(), g_activeClientPipes.end(), hPipe);
+        if (it != g_activeClientPipes.end()) {
+            g_activeClientPipes.erase(it);
+        }
+    }
+
     DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
 }
@@ -1562,6 +1580,21 @@ int main(int argc, char* argv[]) {
         adminPipeName = L"\\\\.\\pipe\\" + adminPipeName;
     }
     ime::AdminServer adminServer(g_engine, adminPipeName);
+
+    g_hServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_hServiceStopEvent) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to create service stop event!\n";
+        return 1;
+    }
+
+    adminServer.SetShutdownHandler([]() {
+        std::wcout << L"[ime-service] Graceful shutdown requested via Admin IPC.\n";
+        g_serviceStopping.store(true);
+        if (g_hServiceStopEvent) {
+            SetEvent(g_hServiceStopEvent);
+        }
+    });
+
     if (!adminServer.Start()) {
         std::wcerr << L"[ime-service] [WARNING] Failed to start Admin Named Pipe server!\n";
     } else {
@@ -1595,10 +1628,17 @@ int main(int argc, char* argv[]) {
 
     std::wcout << L"[ime-service] Listening for TSF Client connections (PIPE_REJECT_REMOTE_CLIENTS enabled)...\n";
 
-    while (true) {
+    OVERLAPPED ol{};
+    ol.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ol.hEvent) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to create overlapped pipe event!\n";
+        return 1;
+    }
+
+    while (!g_serviceStopping.load() && WaitForSingleObject(g_hServiceStopEvent, 0) != WAIT_OBJECT_0) {
         HANDLE hPipe = CreateNamedPipeW(
             IME_PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             sizeof(IpcKeyResponse) * 2,
@@ -1608,16 +1648,70 @@ int main(int argc, char* argv[]) {
         );
 
         if (hPipe == INVALID_HANDLE_VALUE) {
+            if (g_serviceStopping.load()) break;
             std::wcout << L"[ime-service] CreateNamedPipe failed: " << GetLastError() << L"\n";
             break;
         }
 
-        BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (connected) {
-            std::thread(HandleClient, hPipe).detach();
-        } else {
-            CloseHandle(hPipe);
+        ResetEvent(ol.hEvent);
+        BOOL connected = ConnectNamedPipe(hPipe, &ol);
+        if (!connected) {
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                HANDLE waitHandles[2] = { g_hServiceStopEvent, ol.hEvent };
+                DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+                if (waitRes == WAIT_OBJECT_0) {
+                    CancelIoEx(hPipe, &ol);
+                    CloseHandle(hPipe);
+                    break;
+                } else if (waitRes == WAIT_OBJECT_0 + 1) {
+                    connected = TRUE;
+                } else {
+                    CancelIoEx(hPipe, &ol);
+                    CloseHandle(hPipe);
+                    break;
+                }
+            } else if (err == ERROR_PIPE_CONNECTED) {
+                connected = TRUE;
+            } else {
+                CloseHandle(hPipe);
+                continue;
+            }
         }
+
+        if (connected) {
+            if (g_serviceStopping.load()) {
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
+                break;
+            }
+            std::thread(HandleClient, hPipe).detach();
+        }
+    }
+
+    CloseHandle(ol.hEvent);
+
+    std::wcout << L"[ime-service] Stopping Admin Server...\n";
+    adminServer.Stop();
+
+    // Disconnect active client pipes and bounded drain
+    {
+        std::lock_guard<std::mutex> lock(g_clientPipesMutex);
+        for (HANDLE h : g_activeClientPipes) {
+            CancelIoEx(h, nullptr);
+            DisconnectNamedPipe(h);
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    std::wcout << L"[ime-service] Checkpointing SQLite database...\n";
+    g_engine.GetDb().Execute("PRAGMA wal_checkpoint(PASSIVE);");
+
+    std::wcout << L"[ime-service] Graceful shutdown completed cleanly.\n";
+
+    if (g_hServiceStopEvent) {
+        CloseHandle(g_hServiceStopEvent);
+        g_hServiceStopEvent = nullptr;
     }
 
     if (pSD) {

@@ -2305,6 +2305,35 @@ static void TestStage4C2ReverseLookupAdminIpc(AdminServer&, const std::wstring& 
 
 // Main Test Runner
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Test 21: Graceful Shutdown Action and Handler Invocation
+// -----------------------------------------------------------------------------
+static void TestGracefulShutdownAction(AdminServer& server, const std::wstring& pipeName) {
+    std::cout << "[TEST 21] Testing Graceful Shutdown IPC and Handler Invocation..." << std::endl;
+    std::atomic<bool> handlerInvoked{false};
+    server.SetShutdownHandler([&handlerInvoked]() {
+        handlerInvoked.store(true);
+    });
+
+    AdminClient client;
+    AssertCondition(client.Connect(pipeName), "Connect client for Shutdown test");
+
+    nlohmann::json req;
+    req["action"] = "Shutdown";
+    std::string respJson;
+    bool sent = client.SendFrame(777, req.dump(), respJson);
+    AssertCondition(sent, "SendFrame for Shutdown must succeed and receive response");
+
+    auto resp = nlohmann::json::parse(respJson);
+    AssertCondition(resp.value("success", false) == true, "Shutdown action returns success=true");
+    AssertCondition(resp.contains("data") && resp["data"].value("shutting_down", false) == true,
+                    "Shutdown response data contains shutting_down=true");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    AssertCondition(handlerInvoked.load() == true, "Shutdown handler was invoked without terminating test process");
+    std::cout << "  [PASS] Graceful Shutdown action verified!" << std::endl;
+}
+
 int main() {
     std::cout << "========================================================" << std::endl;
     std::cout << "  PersonalIME Stage 4B Admin IPC & Service Integration  " << std::endl;
@@ -2349,6 +2378,7 @@ int main() {
         TestInputMethodEnablingDisablingIpc(server, testPipeName, engine);
         TestStage4C2ReverseLookupAdminIpc(server, testPipeName, engine);
         TestPluginManagement(server, testPipeName, engine);
+        TestGracefulShutdownAction(server, testPipeName);
 
         server.Stop();
     }

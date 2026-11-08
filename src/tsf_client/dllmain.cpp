@@ -172,6 +172,8 @@ STDAPI DllUnregisterServer() {
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIP_KEYBOARD, CLSID_PersonalIME);
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, CLSID_PersonalIME);
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, CLSID_PersonalIME);
+        // Idempotently clean up historical input mode compartment category if registered by prior versions
+        pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, CLSID_PersonalIME);
         pCatMgr->Release();
     }
 

@@ -338,11 +338,20 @@ public class MainViewModel : ViewModelBase, IDisposable
             {
             }
 
-            if (status == null || status.ProcessId == 0)
+            if (status == null)
+            {
+                Banner.ShowError("无法获取当前连接服务的状态，连接状态未知，已中止重启。");
+                ServiceState = ServiceConnectionState.Disconnected;
+                ConnectionStatusText = "○ 连接状态未知 (待刷新)";
+                ResetActivePolicyOffline();
+                return;
+            }
+
+            if (status.ProcessId == 0)
             {
                 Banner.ShowError("无法获取当前连接服务的实例身份 (PID)，拒绝重启操作。");
                 ServiceState = ServiceConnectionState.Connected;
-                ConnectionStatusText = "● 输入法已就绪 (无法确认身份已中止重启)";
+                ConnectionStatusText = "● 输入法已连接 (未确认实例 PID 已中止重启)";
                 return;
             }
 
@@ -360,35 +369,17 @@ public class MainViewModel : ViewModelBase, IDisposable
             {
                 using (targetProc)
                 {
-                    // Check Session ID
                     int currentSession = Process.GetCurrentProcess().SessionId;
-                    if (targetProc.SessionId != currentSession)
+                    if (!VerifyServiceProcessIdentity(targetProc, servicePath, currentSession, out string failureReason))
                     {
-                        Banner.ShowError($"目标服务进程 (PID: {status.ProcessId}) 位于其他用户会话 (Session {targetProc.SessionId})，已拒绝重启。");
+                        Banner.ShowError(failureReason);
                         ServiceState = ServiceConnectionState.Connected;
-                        ConnectionStatusText = "● 输入法已就绪 (跨会话拒绝重启)";
+                        ConnectionStatusText = "● 输入法已连接 (身份不符已拒绝重启)";
                         return;
                     }
 
-                    // Check Process Image Path if accessible
-                    string? procPath = null;
-                    try
-                    {
-                        procPath = targetProc.MainModule?.FileName;
-                    }
-                    catch
-                    {
-                    }
-
-                    if (!string.IsNullOrEmpty(procPath) &&
-                        !string.Equals(procPath, servicePath, StringComparison.OrdinalIgnoreCase) &&
-                        !Path.GetFileName(procPath).Equals("ime-service.exe", StringComparison.OrdinalIgnoreCase))
-                    {
-                        Banner.ShowError($"目标进程 (PID: {status.ProcessId}) 路径不匹配 ({procPath})，已拒绝重启。");
-                        ServiceState = ServiceConnectionState.Connected;
-                        ConnectionStatusText = "● 输入法已就绪 (路径不符拒绝重启)";
-                        return;
-                    }
+                    DateTime? targetStartTime = null;
+                    try { targetStartTime = targetProc.StartTime; } catch { }
 
                     // Request graceful shutdown first
                     try
@@ -408,8 +399,18 @@ public class MainViewModel : ViewModelBase, IDisposable
                         {
                             if (!targetProc.HasExited)
                             {
-                                targetProc.Kill();
-                                exited = await WaitForExitAsync(targetProc, 1500);
+                                bool sameProcess = true;
+                                if (targetStartTime.HasValue)
+                                {
+                                    try { sameProcess = (targetProc.StartTime == targetStartTime.Value); }
+                                    catch { sameProcess = false; }
+                                }
+
+                                if (sameProcess && !targetProc.HasExited)
+                                {
+                                    targetProc.Kill();
+                                    exited = await WaitForExitAsync(targetProc, 1500);
+                                }
                             }
                         }
                         catch
@@ -443,6 +444,116 @@ public class MainViewModel : ViewModelBase, IDisposable
         }
     }
 
+    /// <summary>
+    /// Pure identity verification logic: Session must match, executable path must match expected path strictly.
+    /// Unreadable or mismatching paths reject operation without filename fallback.
+    /// </summary>
+    public static bool VerifyServiceProcessIdentity(
+        int processId,
+        int processSessionId,
+        string? processPath,
+        bool hasExited,
+        string expectedServicePath,
+        int expectedSessionId,
+        out string failureReason)
+    {
+        if (hasExited)
+        {
+            failureReason = $"目标服务进程 (PID: {processId}) 已退出。";
+            return false;
+        }
+
+        if (processSessionId != expectedSessionId)
+        {
+            failureReason = $"目标服务进程 (PID: {processId}) 位于其他用户会话 (Session {processSessionId}，当前会话 {expectedSessionId})，已拒绝操作。";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(processPath))
+        {
+            failureReason = $"目标服务进程 (PID: {processId}) 的可执行路径为空或不可读，身份无法确认，已拒绝操作。";
+            return false;
+        }
+
+        string normalizedActual;
+        string normalizedExpected;
+        try
+        {
+            normalizedActual = Path.GetFullPath(processPath).TrimEnd('\\', '/');
+            normalizedExpected = Path.GetFullPath(expectedServicePath).TrimEnd('\\', '/');
+        }
+        catch (Exception ex)
+        {
+            failureReason = $"路径规范化失败: {ex.Message}";
+            return false;
+        }
+
+        if (!string.Equals(normalizedActual, normalizedExpected, StringComparison.OrdinalIgnoreCase))
+        {
+            failureReason = $"目标进程 (PID: {processId}) 路径不匹配 (实际: \"{normalizedActual}\", 预期: \"{normalizedExpected}\")，已拒绝操作。";
+            return false;
+        }
+
+        failureReason = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// Process-level overload verifying Session ID and executable image path.
+    /// </summary>
+    public static bool VerifyServiceProcessIdentity(
+        Process process,
+        string expectedServicePath,
+        int expectedSessionId,
+        out string failureReason)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                failureReason = $"目标服务进程 (PID: {process.Id}) 已退出。";
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            failureReason = $"无法确认目标服务进程状态: {ex.Message}";
+            return false;
+        }
+
+        int sessionId;
+        try
+        {
+            sessionId = process.SessionId;
+        }
+        catch (Exception ex)
+        {
+            failureReason = $"无法获取目标服务进程 (PID: {process.Id}) 会话: {ex.Message}";
+            return false;
+        }
+
+        string? procPath = null;
+        try
+        {
+            procPath = process.MainModule?.FileName;
+        }
+        catch (Exception ex)
+        {
+            failureReason = $"无法读取目标服务进程 (PID: {process.Id}) 路径 ({ex.Message})，身份无法确认，已拒绝操作。";
+            return false;
+        }
+
+        return VerifyServiceProcessIdentity(
+            process.Id,
+            sessionId,
+            procPath,
+            process.HasExited,
+            expectedServicePath,
+            expectedSessionId,
+            out failureReason
+        );
+    }
+
     private async Task TryAutoLaunchAndConnectAsync()
     {
         string? servicePath = LocateServiceExecutable();
@@ -457,7 +568,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         ServiceState = ServiceConnectionState.Starting;
         ConnectionStatusText = "● 正在准备输入法引擎...";
 
-        // Only recognize an existing process if it belongs to our session AND same executable path
+        // Only recognize an existing process if it strictly matches our session AND executable path
         bool isOurInstanceRunning = false;
         try
         {
@@ -467,14 +578,10 @@ public class MainViewModel : ViewModelBase, IDisposable
             {
                 using (p)
                 {
-                    if (p.SessionId == currentSession)
+                    if (VerifyServiceProcessIdentity(p, servicePath, currentSession, out _))
                     {
-                        string? path = null;
-                        try { path = p.MainModule?.FileName; } catch { }
-                        if (string.IsNullOrEmpty(path) || string.Equals(path, servicePath, StringComparison.OrdinalIgnoreCase))
-                        {
-                            isOurInstanceRunning = true;
-                        }
+                        isOurInstanceRunning = true;
+                        break;
                     }
                 }
             }
