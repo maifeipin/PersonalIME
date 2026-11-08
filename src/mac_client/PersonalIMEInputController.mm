@@ -183,6 +183,10 @@ static const NSUInteger kMaxCompositionLength = 32;
     _composition = [_composition substringToIndex:_composition.length - 1];
     _currentPage = 0;
     _selectedIndex = 0;
+    if (_composition.length == 0) {
+        [self resetCompositionWithClient:sender];
+        return;
+    }
     [self refreshCandidatesWithClient:sender];
 }
 
@@ -322,13 +326,12 @@ static const NSUInteger kMaxCompositionLength = 32;
 }
 
 - (void)resetCompositionWithClient:(id<IMKTextInput>)sender {
-    if (_composition.length > 0) {
-        [self clearMarkedTextWithClient:sender];
-    }
+    [self clearMarkedTextWithClient:sender];
     _composition = @"";
     _candidates = @[];
     _selectedIndex = 0;
     _currentPage = 0;
+    [[CandidatePanelController shared] hidePanel];
 }
 
 - (void)clearMarkedTextWithClient:(id<IMKTextInput>)sender {
