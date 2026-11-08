@@ -220,31 +220,42 @@ jobs:
             out/release/PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip
             out/release/SHA256SUMS.txt
           body: |
-            ## 人人 (RenRen IME) Windows 发行版 v${{ env.RELEASE_VERSION }}
+            ## 人人 (RenRen IME) 跨平台发行版 v${{ env.RELEASE_VERSION }}
             
             > **让每个人都能拥有属于自己的输入法，做那个越来越懂你的输入伙伴。**
             
             ### 产物清单与直接下载 (Artifacts & Direct Downloads)
-            - 📦 **标准安装包 (推荐向导安装)**: [PersonalIME-Setup-x64.exe](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-Setup-x64.exe)
-            - 🗜️ **绿色便携包 (解压即用免安装)**: [PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip)
-            - 📄 **哈希校验和**: [SHA256SUMS.txt](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/SHA256SUMS.txt)
             
-            ### 架构与运行环境 (Architecture Scope)
-            - **操作系统**: Windows 10 / Windows 11 (仅限 64 位 x64 / AMD64)
-            - **32位宿主 (x86/WOW64)**: 目前未包含 32 位二进制，不支持 32 位宿主应用。
+            #### 🪟 Windows (x64)
+            - 📦 **标准安装向导 (推荐)**: [PersonalIME-Setup-x64.exe](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-Setup-x64.exe)
+            - 🗜️ **绿色便携包 (解压即用免安装)**: [PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip)
+            - 📄 **Windows 哈希校验和**: [SHA256SUMS.txt](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/SHA256SUMS.txt)
+            
+            #### 🍏 macOS (Universal: Apple Silicon arm64 + Intel x86_64)
+            - 🍏 **DMG 镜像安装包 (推荐拖拽安装)**: [PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg)
+            - 📦 **PKG 系统安装器 (企业/批量安装)**: [PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.pkg](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.pkg)
+            - 📄 **macOS 哈希校验和**: [SHA256SUMS-macOS.txt](https://github.com/maifeipin/PersonalIME/releases/download/${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}/SHA256SUMS-macOS.txt)
+            
+            ---
             
             ### 安装与启用说明 (How to Install & Enable)
-            1. **方式 A (安装包推荐)**:
-               - 点击上方链接下载并运行 `PersonalIME-Setup-x64.exe`，按安装向导完成安装。
-               - 在 Windows“设置 -> 时间和语言 -> 语言和区域 -> 键盘”中可选用“人人 (RenRen IME)”。
-            2. **方式 B (绿色便携免安装)**:
-               - 解压 `PersonalIME-v${{ env.RELEASE_VERSION }}-portable-x64.zip` 到任意目录。
-               - 双击根目录下 `start.bat`（首次运行会自动请求管理员权限注册系统 TSF 输入法驱动并启动后台服务）。
-               - 随时可运行根目录下 `stop.bat` 彻底注销系统驱动并停止服务。
+            
+            #### Windows 启用说明:
+            1. 下载并运行 `PersonalIME-Setup-x64.exe`，按向导完成安装。
+            2. 在 Windows“设置 -> 时间和语言 -> 语言和区域 -> 键盘”中选用“人人 (RenRen IME)”。
+            
+            #### macOS 启用说明:
+            1. 打开 `PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg`，双击或拖拽安装（或双击运行 PKG 安装包）。
+            2. 打开 macOS「系统设置」->「键盘」->「文字输入」-> 点击「编辑...」-> 点击「+」，在「简体中文」列表下方选择「人人输入法」并添加。
+            3. 按 `Control + Space` 切换至人人输入法即可开始输入。
+            
+            ---
             
             ### 代码签名说明 (Code Signing Status)
             > [!WARNING]
-            > 本项目为开源构建产物，尚未附加商业数字签名证书。Windows SmartScreen 下载或首次运行时可能提示“未知发布者”，点击“更多信息” -> “仍要运行”即可。
+            > 本项目为开源构建产物，尚未附加商业数字签名证书。
+            > - Windows SmartScreen 首次运行时若提示“未知发布者”，点击“更多信息” -> “仍要运行”即可。
+            > - macOS 若提示“无法打开，因为无法验证开发者”，在「系统设置」->「隐私与安全性」中点击“仍要打开”即可。
 
   package-macos:
     name: Package macOS DMG & Publish
