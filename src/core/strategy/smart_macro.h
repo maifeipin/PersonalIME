@@ -17,7 +17,8 @@ public:
         std::string lower = rawCode;
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
 
-        if (lower == "date" || lower == "rq" || lower == "time" || lower == "sj" || lower == "week" || lower == "xq" || lower == "now") {
+        // 'date' is supported for date expansion. 'rq' is intentionally excluded to avoid collision with high-frequency Wubi word '换'
+        if (lower == "date" || lower == "time" || lower == "sj" || lower == "week" || lower == "xq" || lower == "now") {
             return true;
         }
 
@@ -80,7 +81,7 @@ public:
             return c;
         };
 
-        if (lower == "date" || lower == "rq") {
+        if (lower == "date") {
             // 1. 2026年11月7日
             std::wstringstream ss1;
             ss1 << year << L"年" << month << L"月" << day << L"日";

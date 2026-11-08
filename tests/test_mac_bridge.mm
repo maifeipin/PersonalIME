@@ -49,10 +49,10 @@ int main(int argc, const char * argv[]) {
         TEST_ASSERT(pinyinUnderWubi.count > 0);
         std::cout << "[PASS] Waterfall recall verified ('zhongwen' returned " << pinyinUnderWubi.count << " candidates)" << std::endl;
 
-        // 4. Smart macros: "rq" (date), "sj" (time)
-        NSArray<ImeCandidate *> *macroCands = [bridge queryCoordinatorWithCode:@"rq"];
+        // 4. Smart macros: "date", "sj" (time)
+        NSArray<ImeCandidate *> *macroCands = [bridge queryCoordinatorWithCode:@"date"];
         TEST_ASSERT(macroCands.count > 0);
-        std::cout << "[PASS] Smart dynamic macro verified ('rq' -> '" << [macroCands[0].text UTF8String] << "')" << std::endl;
+        std::cout << "[PASS] Smart dynamic macro verified ('date' -> '" << [macroCands[0].text UTF8String] << "')" << std::endl;
 
         // 5. Commit candidate
         TEST_ASSERT([bridge commitCandidateAtIndex:0]);

@@ -1225,7 +1225,7 @@ InputCoordinator::Query(const std::string& rawCode,
             }
         }
 
-        // Smart Dynamic Macros Expansion (e.g. date, rq, time, sj, week, xq, v12345)
+        // Smart Dynamic Macros Expansion (e.g. date, time, sj, week, xq, v12345)
         if (SmartMacroProcessor::IsMacroQuery(rawCode)) {
             auto macroCands = SmartMacroProcessor::ExpandMacro(rawCode);
             if (!macroCands.empty()) {

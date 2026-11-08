@@ -1269,20 +1269,22 @@ static void TestFallbackThresholdAndSecondaryReverseLookup(InputCoordinator& coo
 }
 
 void TestDynamicSmartMacroExpansion(InputCoordinator& coordinator, EntryRepository& repo) {
-    std::cout << "[TEST 22] Testing Stage 6 Dynamic Smart Macro Expansion (date/rq, time/sj, week/xq, v-number)..." << std::endl;
+    std::cout << "[TEST 22] Testing Stage 6 Dynamic Smart Macro Expansion (date, time/sj, week/xq, v-number)..." << std::endl;
 
-    // 1. Date macros: 'date' and 'rq'
+    // 1. Date macros: 'date' supported, 'rq' excluded (rq is reserved for high-frequency Wubi word '换')
     auto resDate = coordinator.Query("date");
     AssertCondition(resDate.status == CoordinatorStatus::Success, "Query 'date' succeeds");
     AssertCondition(!resDate.candidates.empty(), "Query 'date' returns candidates");
     AssertCondition(resDate.candidates[0].text.find(L"年") != std::wstring::npos, "Candidate 1 contains '年'");
     AssertCondition(resDate.candidates[1].text.find(L"-") != std::wstring::npos, "Candidate 2 contains '-'");
 
+    AssertCondition(!SmartMacroProcessor::IsMacroQuery("rq"), "IsMacroQuery('rq') must be false (rq belongs to Wubi '换')");
     auto resRq = coordinator.Query("rq");
     AssertCondition(resRq.status == CoordinatorStatus::Success, "Query 'rq' succeeds");
-    AssertCondition(!resRq.candidates.empty(), "Query 'rq' returns candidates");
-    AssertCondition(resRq.candidates[0].text.find(L"年") != std::wstring::npos, "Query 'rq' candidate 1 contains '年'");
-    AssertCondition(resRq.candidates.size() > 1, "Query 'rq' returns multiple candidates (macro + words)");
+    for (const auto& c : resRq.candidates) {
+        AssertCondition(c.dict_id != DICT_ID_CUSTOM || c.entry_id.find("macro_rq") == std::string::npos,
+                        "Query 'rq' must NOT return date macro candidate");
+    }
 
     // 2. Time macros: 'time' and 'sj'
     auto resTime = coordinator.Query("time");
