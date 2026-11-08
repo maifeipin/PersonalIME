@@ -55,21 +55,6 @@ static const NSUInteger kMaxCompositionLength = 32;
 
 #pragma mark - Event Handling
 
-- (BOOL)handleEvent:(NSEvent *)event client:(id)sender {
-    _currentClient = (id<IMKTextInput>)sender;
-    // Shift key toggles Chinese / English mode (matching macOS & Windows convention)
-    if (event.type == NSEventTypeFlagsChanged &&
-        event.keyCode == 56 /* kVK_Shift */) {
-        BOOL shiftDown = (event.modifierFlags & NSEventModifierFlagShift) != 0;
-        if (shiftDown) {
-            [self toggleEnglishModeWithClient:sender];
-            return YES;
-        }
-        return NO;
-    }
-    return [super handleEvent:event client:sender];
-}
-
 - (BOOL)inputText:(NSString *)string client:(id)sender {
     id<IMKTextInput> client = (id<IMKTextInput>)sender;
     _currentClient = client;

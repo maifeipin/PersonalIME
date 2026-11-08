@@ -30,16 +30,41 @@ else
     DEST="${GLOBAL_DIR}/${APP_NAME}"
 fi
 
-# Also keep a copy in user directory for user session fallback
-rm -rf "${USER_DIR}/${APP_NAME}"
-mkdir -p "${USER_DIR}"
-cp -R "${SRC}" "${USER_DIR}/${APP_NAME}"
+# Clean up duplicate copy in user directory if present to avoid duplicate entries in System Settings
+if [ -d "${USER_DIR}/${APP_NAME}" ]; then
+    rm -rf "${USER_DIR}/${APP_NAME}" 2>/dev/null || true
+fi
 
-echo "==> Registering with macOS LaunchServices..."
+echo "==> Re-signing installed bundle..."
+codesign --force --sign - "${DEST}"
+
+echo "==> Registering with macOS TIS and LaunchServices..."
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${DEST}"
+xcrun swift - <<EOF
+import Foundation
+import Carbon
 
-echo "==> Restarting System Settings keyboard cache..."
-killall KeyboardSettings "System Settings" 2>/dev/null || true
+let url = URL(fileURLWithPath: "${DEST}")
+_ = TISRegisterInputSource(url as CFURL)
+if let bundle = Bundle(path: "/System/Library/PrivateFrameworks/IntlPreferences.framework"), bundle.load() {
+    if let cls = NSClassFromString("IPInputSource") as AnyObject as? NSObjectProtocol {
+        let sel = NSSelectorFromString("inputSources")
+        if cls.responds(to: sel), let sources = cls.perform(sel)?.takeUnretainedValue() as? [NSObject] {
+            for s in sources where s.responds(to: NSSelectorFromString("inputSourceID")) {
+                let iid = s.perform(NSSelectorFromString("inputSourceID"))?.takeUnretainedValue() as? String
+                if iid == "com.personalime.inputmethod.PersonalIME.Hans" {
+                    _ = s.perform(NSSelectorFromString("setEnabled:"), with: true as NSNumber)
+                }
+            }
+        }
+    }
+}
+EOF
+
+echo "==> Restarting System Settings & Menu bar keyboard cache..."
+pkill -9 -f "KeyboardSettings" 2>/dev/null || true
+pkill -9 -f "System Settings" 2>/dev/null || true
+killall TextInputMenuAgent 2>/dev/null || true
 
 echo "==> Launching ${APP_NAME}..."
 open "${DEST}" || true
