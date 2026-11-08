@@ -204,6 +204,78 @@ int main() {
     }
     std::wcout << L"[PASS] Verified: Candidate keyboard/mouse selection switch, click commit, and wheel paging." << std::endl;
 
+    // 8. Paging arrow buttons (< and >) rendering, hit test, and click callbacks
+    {
+        CCandidateWindow win;
+        CandidateDisplaySnapshot snap;
+        snap.page_index = 0;
+        snap.page_count = 3;
+        snap.candidate_version = 10;
+        snap.candidates = { L"1. 第一页A", L"2. 第一页B" };
+
+        POINT pt = { 100, 100 };
+        win.Show(snap, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+
+        RECT rcPrev = win.GetPrevButtonRect();
+        RECT rcNext = win.GetNextButtonRect();
+        CHECK_EQ((rcPrev.right - rcPrev.left) >= 18, true, L"Prev button width >= 18px");
+        CHECK_EQ((rcNext.right - rcNext.left) >= 18, true, L"Next button width >= 18px");
+
+        // Page 0 of 3: Prev must be disabled, Next must be enabled
+        CHECK_EQ(win.IsPrevButtonEnabled(), false, L"Page 0 of 3: Prev button must be disabled");
+        CHECK_EQ(win.IsNextButtonEnabled(), true, L"Page 0 of 3: Next button must be enabled");
+
+        bool pageScrolled = false;
+        bool scrolledNext = false;
+        win.SetOnPageScrollSnapshot([&](const CandidateDisplaySnapshot&, bool nextPage) {
+            pageScrolled = true;
+            scrolledNext = nextPage;
+        });
+
+        // Click disabled Prev button -> must NOT scroll
+        POINT ptPrev = { (rcPrev.left + rcPrev.right) / 2, (rcPrev.top + rcPrev.bottom) / 2 };
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptPrev.x, ptPrev.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptPrev.x, ptPrev.y));
+        CHECK_EQ(pageScrolled, false, L"Clicking disabled Prev button must not trigger page scroll");
+
+        // Click enabled Next button -> must scroll to next page
+        POINT ptNext = { (rcNext.left + rcNext.right) / 2, (rcNext.top + rcNext.bottom) / 2 };
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptNext.x, ptNext.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(pageScrolled, true, L"Clicking enabled Next button must trigger page scroll");
+        CHECK_EQ(scrolledNext, true, L"Scrolled direction must be next (true)");
+
+        // Switch to Page 1 of 3: Both Prev and Next enabled
+        snap.page_index = 1;
+        win.Show(snap, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+        CHECK_EQ(win.IsPrevButtonEnabled(), true, L"Page 1 of 3: Prev button must be enabled");
+        CHECK_EQ(win.IsNextButtonEnabled(), true, L"Page 1 of 3: Next button must be enabled");
+
+        pageScrolled = false;
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptPrev.x, ptPrev.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptPrev.x, ptPrev.y));
+        CHECK_EQ(pageScrolled, true, L"Clicking enabled Prev button on page 1 must trigger scroll");
+        CHECK_EQ(scrolledNext, false, L"Scrolled direction must be prev (false)");
+
+        // Switch to Page 2 of 3 (last page): Prev enabled, Next disabled
+        snap.page_index = 2;
+        win.Show(snap, pt);
+        SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
+        CHECK_EQ(win.IsPrevButtonEnabled(), true, L"Page 2 of 3: Prev button must be enabled");
+        CHECK_EQ(win.IsNextButtonEnabled(), false, L"Page 2 of 3: Next button must be disabled");
+
+        pageScrolled = false;
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptNext.x, ptNext.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptNext.x, ptNext.y));
+        CHECK_EQ(pageScrolled, false, L"Clicking disabled Next button on last page must not trigger scroll");
+
+        win.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+    }
+    std::wcout << L"[PASS] Verified: Candidate window paging arrows (< and >) rendering, state enable/disable, and mouse click navigation." << std::endl;
+
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
 }

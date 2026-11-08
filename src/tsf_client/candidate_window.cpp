@@ -269,14 +269,20 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     }
     int totalWidth = curX + 4;
 
-    // Reserve space for Manager button (30px) and Plugin buttons (28px each)
+    // Reserve space for Paging buttons (20px each), Manager button (30px) and Plugin buttons (28px each)
+    constexpr int PAGE_BTN_WIDTH = 20;
     constexpr int MGR_BTN_WIDTH = 30;
     constexpr int PLUGIN_BTN_WIDTH = 28;
+    int pagingTotalWidth = PAGE_BTN_WIDTH * 2;
     int pluginTotalWidth = static_cast<int>(m_plugins.size()) * PLUGIN_BTN_WIDTH;
-    totalWidth += MGR_BTN_WIDTH + pluginTotalWidth;
+    totalWidth += pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth;
 
     // Immediately establish button rectangles so geometry checks and mouse hits succeed before WM_PAINT
-    int btnStartX = totalWidth - (MGR_BTN_WIDTH + pluginTotalWidth);
+    int controlsStartX = totalWidth - (pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth);
+    m_rcPrevBtn = { controlsStartX, 1, controlsStartX + PAGE_BTN_WIDTH, totalHeight - 1 };
+    m_rcNextBtn = { controlsStartX + PAGE_BTN_WIDTH, 1, controlsStartX + pagingTotalWidth, totalHeight - 1 };
+
+    int btnStartX = controlsStartX + pagingTotalWidth;
     m_rcMgrBtn = { btnStartX, 1, btnStartX + MGR_BTN_WIDTH, totalHeight - 1 };
     int pX = btnStartX + MGR_BTN_WIDTH;
     for (size_t i = 0; i < m_plugins.size(); ++i) {
@@ -339,6 +345,14 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 return TRUE;
             }
         }
+        if (PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled()) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        if (PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled()) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
         if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
@@ -382,6 +396,17 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             InvalidateRect(hWnd, nullptr, FALSE);
         }
 
+        bool inPrev = PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled();
+        if (inPrev != pThis->m_isHoveringPrevBtn) {
+            pThis->m_isHoveringPrevBtn = inPrev;
+            InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
+        }
+        bool inNext = PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled();
+        if (inNext != pThis->m_isHoveringNextBtn) {
+            pThis->m_isHoveringNextBtn = inNext;
+            InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
+        }
+
         bool inside = PtInRect(&pThis->m_rcMgrBtn, pt);
         if (inside != pThis->m_isHoveringMgrBtn) {
             pThis->m_isHoveringMgrBtn = inside;
@@ -408,6 +433,16 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             pThis->m_hoveredIndex = -1;
             pThis->m_pressedIndex = -1;
             InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        if (pThis->m_isHoveringPrevBtn || pThis->m_isPressedPrevBtn) {
+            pThis->m_isHoveringPrevBtn = false;
+            pThis->m_isPressedPrevBtn = false;
+            InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
+        }
+        if (pThis->m_isHoveringNextBtn || pThis->m_isPressedNextBtn) {
+            pThis->m_isHoveringNextBtn = false;
+            pThis->m_isPressedNextBtn = false;
+            InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
         }
         if (pThis->m_isHoveringMgrBtn || pThis->m_isPressedMgrBtn) {
             pThis->m_isHoveringMgrBtn = false;
@@ -438,6 +473,18 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 InvalidateRect(hWnd, nullptr, FALSE);
                 return 0;
             }
+        }
+        if (PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled()) {
+            pThis->m_isPressedPrevBtn = true;
+            SetCapture(hWnd);
+            InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
+            return 0;
+        }
+        if (PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled()) {
+            pThis->m_isPressedNextBtn = true;
+            SetCapture(hWnd);
+            InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
+            return 0;
         }
         if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
             pThis->m_isPressedMgrBtn = true;
@@ -493,6 +540,32 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 return 0;
             }
             InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        if (pThis->m_isPressedPrevBtn) {
+            pThis->m_isPressedPrevBtn = false;
+            InvalidateRect(hWnd, &pThis->m_rcPrevBtn, FALSE);
+            if (PtInRect(&pThis->m_rcPrevBtn, pt) && pThis->IsPrevButtonEnabled()) {
+                CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+                if (pThis->m_onPageScrollSnapshot) {
+                    pThis->m_onPageScrollSnapshot(snapCopy, false);
+                } else if (pThis->m_onPageScroll) {
+                    pThis->m_onPageScroll(false);
+                }
+                return 0;
+            }
+        }
+        if (pThis->m_isPressedNextBtn) {
+            pThis->m_isPressedNextBtn = false;
+            InvalidateRect(hWnd, &pThis->m_rcNextBtn, FALSE);
+            if (PtInRect(&pThis->m_rcNextBtn, pt) && pThis->IsNextButtonEnabled()) {
+                CandidateDisplaySnapshot snapCopy = pThis->m_snapshot;
+                if (pThis->m_onPageScrollSnapshot) {
+                    pThis->m_onPageScrollSnapshot(snapCopy, true);
+                } else if (pThis->m_onPageScroll) {
+                    pThis->m_onPageScroll(true);
+                }
+                return 0;
+            }
         }
         if (pThis->m_isPressedMgrBtn) {
             pThis->m_isPressedMgrBtn = false;
@@ -633,17 +706,92 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             }
         }
 
-        // --- Manager Button Layout & Rendering ---
+        // --- Paging & Action Button Layout & Rendering ---
+        constexpr int PAGE_BTN_WIDTH = 20;
         constexpr int MGR_BTN_WIDTH = 30;
         constexpr int PLUGIN_BTN_WIDTH = 28;
+        int pagingTotalWidth = PAGE_BTN_WIDTH * 2;
         int pluginTotalWidth = static_cast<int>(pThis->m_plugins.size()) * PLUGIN_BTN_WIDTH;
-        int btnStartX = clientRc.right - (MGR_BTN_WIDTH + pluginTotalWidth);
+        int controlsStartX = clientRc.right - (pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth);
+
+        pThis->m_rcPrevBtn = { controlsStartX, clientRc.top + 1, controlsStartX + PAGE_BTN_WIDTH, clientRc.bottom - 1 };
+        pThis->m_rcNextBtn = { controlsStartX + PAGE_BTN_WIDTH, clientRc.top + 1, controlsStartX + pagingTotalWidth, clientRc.bottom - 1 };
+        int btnStartX = controlsStartX + pagingTotalWidth;
 
         pThis->m_rcMgrBtn = { btnStartX, clientRc.top + 1, btnStartX + MGR_BTN_WIDTH, clientRc.bottom - 1 };
 
-        // Subtle vertical separator line
+        // Subtle vertical separator line before Paging buttons
         HPEN hSepPen = CreatePen(PS_SOLID, 1, RGB(230, 233, 238));
         HPEN hOldPen2 = (HPEN)SelectObject(memDC, hSepPen);
+        MoveToEx(memDC, pThis->m_rcPrevBtn.left, clientRc.top + 7, nullptr);
+        LineTo(memDC, pThis->m_rcPrevBtn.left, clientRc.bottom - 7);
+
+        // --- Render Prev Button (◀) ---
+        bool prevEnabled = pThis->IsPrevButtonEnabled();
+        RECT prevInner = { pThis->m_rcPrevBtn.left + 2, 4, pThis->m_rcPrevBtn.right - 2, clientRc.bottom - 4 };
+        if (prevEnabled) {
+            if (pThis->m_isPressedPrevBtn) {
+                HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
+                HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
+                HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
+                RoundRect(memDC, prevInner.left, prevInner.top, prevInner.right, prevInner.bottom, 4, 4);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hPressPen);
+                DeleteObject(hPressBg);
+            } else if (pThis->m_isHoveringPrevBtn) {
+                HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
+                HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
+                HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
+                RoundRect(memDC, prevInner.left, prevInner.top, prevInner.right, prevInner.bottom, 4, 4);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hHoverPen);
+                DeleteObject(hHoverBg);
+            }
+        }
+        SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
+        COLORREF prevColor = !prevEnabled ? RGB(205, 210, 218)
+                             : (pThis->m_isHoveringPrevBtn ? RGB(0, 102, 204) : RGB(120, 126, 136));
+        SetTextColor(memDC, prevColor);
+        const wchar_t* prevIcon = L"\x25C0";
+        DrawTextW(memDC, prevIcon, 1, &prevInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // --- Render Next Button (▶) ---
+        bool nextEnabled = pThis->IsNextButtonEnabled();
+        RECT nextInner = { pThis->m_rcNextBtn.left + 2, 4, pThis->m_rcNextBtn.right - 2, clientRc.bottom - 4 };
+        if (nextEnabled) {
+            if (pThis->m_isPressedNextBtn) {
+                HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
+                HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
+                HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
+                RoundRect(memDC, nextInner.left, nextInner.top, nextInner.right, nextInner.bottom, 4, 4);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hPressPen);
+                DeleteObject(hPressBg);
+            } else if (pThis->m_isHoveringNextBtn) {
+                HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
+                HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
+                HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
+                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
+                RoundRect(memDC, nextInner.left, nextInner.top, nextInner.right, nextInner.bottom, 4, 4);
+                SelectObject(memDC, hOld);
+                SelectObject(memDC, hOldB);
+                DeleteObject(hHoverPen);
+                DeleteObject(hHoverBg);
+            }
+        }
+        COLORREF nextColor = !nextEnabled ? RGB(205, 210, 218)
+                             : (pThis->m_isHoveringNextBtn ? RGB(0, 102, 204) : RGB(120, 126, 136));
+        SetTextColor(memDC, nextColor);
+        const wchar_t* nextIcon = L"\x25B6";
+        DrawTextW(memDC, nextIcon, 1, &nextInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Subtle vertical separator line before Manager button
         MoveToEx(memDC, pThis->m_rcMgrBtn.left, clientRc.top + 7, nullptr);
         LineTo(memDC, pThis->m_rcMgrBtn.left, clientRc.bottom - 7);
 

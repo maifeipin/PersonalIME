@@ -68,6 +68,16 @@ public:
     RECT GetManagerButtonRect() const { return m_rcMgrBtn; }
     bool IsHoveringManagerButton() const { return m_isHoveringMgrBtn; }
     bool IsPressedManagerButton() const { return m_isPressedMgrBtn; }
+
+    RECT GetPrevButtonRect() const { return m_rcPrevBtn; }
+    RECT GetNextButtonRect() const { return m_rcNextBtn; }
+    bool IsPrevButtonEnabled() const { return m_snapshot.page_index > 0; }
+    bool IsNextButtonEnabled() const { return m_snapshot.page_count > 1 && (m_snapshot.page_index + 1 < m_snapshot.page_count); }
+    bool IsHoveringPrevButton() const { return m_isHoveringPrevBtn; }
+    bool IsHoveringNextButton() const { return m_isHoveringNextBtn; }
+    bool IsPressedPrevButton() const { return m_isPressedPrevBtn; }
+    bool IsPressedNextButton() const { return m_isPressedNextBtn; }
+
     HWND GetHwnd() const { return m_hWnd; }
 
     static LONG GetClassRefCount();
@@ -97,6 +107,13 @@ private:
     RECT m_rcMgrBtn{0, 0, 0, 0};
     bool m_isHoveringMgrBtn = false;
     bool m_isPressedMgrBtn = false;
+
+    RECT m_rcPrevBtn{0, 0, 0, 0};
+    RECT m_rcNextBtn{0, 0, 0, 0};
+    bool m_isHoveringPrevBtn = false;
+    bool m_isHoveringNextBtn = false;
+    bool m_isPressedPrevBtn = false;
+    bool m_isPressedNextBtn = false;
     bool m_trackingMouse = false;
     OnOpenManagerCallback m_onOpenManager;
     OnSelectCandidateCallback m_onSelectCandidate;
