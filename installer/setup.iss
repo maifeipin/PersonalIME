@@ -5,14 +5,14 @@
 ; =====================================================================
 
 #ifndef MyAppVersion
-#define MyAppVersion "1.0.9"
+#define MyAppVersion "1.1.0"
 #endif
 
 ; VersionInfoVersion must be four numeric fields (0-65535 each), so release
 ; strings like "1.0.0-ci.20261107.0fd389b" cannot be used directly. The build
 ; script passes a normalized numeric variant through this define.
 #ifndef MyAppVersionInfoVersion
-#define MyAppVersionInfoVersion "1.0.9.0"
+#define MyAppVersionInfoVersion "1.1.0.0"
 #endif
 
 #define MyAppName "人人"
