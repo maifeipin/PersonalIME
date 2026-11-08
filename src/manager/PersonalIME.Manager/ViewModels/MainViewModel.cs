@@ -118,6 +118,7 @@ public class MainViewModel : ViewModelBase, IDisposable
 
     public AsyncRelayCommand CheckConnectionCommand { get; }
     public ICommand OpenCalendarCommand { get; }
+    private Views.CalendarWindow? _calendarWindow;
 
     public MainViewModel(IAdminClient client)
     {
@@ -139,8 +140,19 @@ public class MainViewModel : ViewModelBase, IDisposable
         CheckConnectionCommand = new AsyncRelayCommand(CheckConnectionAsync);
         OpenCalendarCommand = new RelayCommand(() =>
         {
-            var win = new Views.CalendarWindow();
-            win.Show();
+            if (_calendarWindow != null && _calendarWindow.IsLoaded)
+            {
+                if (_calendarWindow.WindowState == System.Windows.WindowState.Minimized)
+                {
+                    _calendarWindow.WindowState = System.Windows.WindowState.Normal;
+                }
+                _calendarWindow.Activate();
+                return;
+            }
+
+            _calendarWindow = new Views.CalendarWindow();
+            _calendarWindow.Closed += (_, _) => _calendarWindow = null;
+            _calendarWindow.Show();
         });
     }
 

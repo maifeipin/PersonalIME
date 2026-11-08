@@ -37,4 +37,14 @@ public partial class CalendarWindow : Window
             Close();
         }
     }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        base.OnClosed(e);
+        if (DataContext is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+    }
 }
+

@@ -115,9 +115,11 @@
                             </ItemsControl.ItemsPanel>
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                    <Border Margin="2" CornerRadius="6" Cursor="Hand" Background="#FFFFFF" BorderThickness="1">
+                                    <Border Margin="2" CornerRadius="6" Cursor="Hand">
                                         <Border.Style>
                                             <Style TargetType="Border">
+                                                <Setter Property="Background" Value="#FFFFFF"/>
+                                                <Setter Property="BorderThickness" Value="1"/>
                                                 <Setter Property="BorderBrush" Value="#E2E8F0"/>
                                                 <Style.Triggers>
                                                     <DataTrigger Binding="{Binding IsCurrentMonth}" Value="False">

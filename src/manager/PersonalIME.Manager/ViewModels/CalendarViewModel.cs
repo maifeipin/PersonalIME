@@ -9,8 +9,12 @@ using PersonalIME.Manager.Models;
 
 namespace PersonalIME.Manager.ViewModels;
 
-public sealed class CalendarViewModel : ViewModelBase
+public sealed class CalendarViewModel : ViewModelBase, IDisposable
 {
+    private readonly System.Windows.Threading.DispatcherTimer? _timer;
+    private DateTime _lastCheckedDate = DateTime.Today;
+    private int _lastCheckedHour = DateTime.Now.Hour;
+
     private int _currentYear;
     private int _currentMonth;
     private CalendarDayItem? _selectedDay;
@@ -40,9 +44,14 @@ public sealed class CalendarViewModel : ViewModelBase
         get => _selectedDay;
         set
         {
-            if (SetProperty(ref _selectedDay, value) && value != null)
+            if (_selectedDay != null) _selectedDay.IsSelected = false;
+            if (SetProperty(ref _selectedDay, value))
             {
-                UpdateSelectionDetails(value);
+                if (_selectedDay != null)
+                {
+                    _selectedDay.IsSelected = true;
+                    UpdateSelectionDetails(_selectedDay);
+                }
             }
         }
     }
@@ -135,25 +144,37 @@ public sealed class CalendarViewModel : ViewModelBase
         {
             if (param is CalendarDayItem item && item.IsCurrentMonth)
             {
-                foreach (var d in Days) d.IsSelected = false;
-                item.IsSelected = true;
                 SelectedDay = item;
-                RefreshGridSelection();
             }
         });
+
+        if (System.Windows.Application.Current != null)
+        {
+            _timer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(10)
+            };
+            _timer.Tick += OnTimerTick;
+            _timer.Start();
+        }
 
         LoadMonthGrid(_currentYear, _currentMonth, today.Day);
     }
 
     public void ChangeMonth(int delta)
     {
-        int m = _currentMonth + delta;
         int y = _currentYear;
-        if (m > 12) { m = 1; y++; }
-        else if (m < 1) { m = 12; y--; }
+        int m = _currentMonth + delta;
+        while (m > 12) { m -= 12; y++; }
+        while (m < 1) { m += 12; y--; }
 
-        if (y < 1900) y = 1900;
-        if (y > 2100) y = 2100;
+        if (y < 1900) { y = 1900; m = 1; }
+        else if (y > 2100) { y = 2100; m = 12; }
+
+        if (y == _currentYear && m == _currentMonth)
+        {
+            return;
+        }
 
         _currentYear = y;
         _currentMonth = m;
@@ -162,7 +183,8 @@ public sealed class CalendarViewModel : ViewModelBase
         OnPropertyChanged(nameof(YearMonthDisplay));
         OnPropertyChanged(nameof(YearGanZhiDisplay));
 
-        LoadMonthGrid(y, m, 1);
+        int defaultDay = (y == 1900 && m == 1) ? 31 : 1;
+        LoadMonthGrid(y, m, defaultDay);
     }
 
     public void ChangeYear(int delta)
@@ -171,12 +193,15 @@ public sealed class CalendarViewModel : ViewModelBase
         if (y < 1900) y = 1900;
         if (y > 2100) y = 2100;
 
+        if (y == _currentYear) return;
+
         _currentYear = y;
         OnPropertyChanged(nameof(CurrentYear));
         OnPropertyChanged(nameof(YearMonthDisplay));
         OnPropertyChanged(nameof(YearGanZhiDisplay));
 
-        LoadMonthGrid(y, _currentMonth, 1);
+        int defaultDay = (y == 1900 && _currentMonth == 1) ? 31 : 1;
+        LoadMonthGrid(y, _currentMonth, defaultDay);
     }
 
     public void GoToday()
@@ -200,6 +225,11 @@ public sealed class CalendarViewModel : ViewModelBase
         int daysInMonth = DateTime.DaysInMonth(year, month);
         var today = DateTime.Today;
 
+        if (year == 1900 && month == 1 && selectDay < 31)
+        {
+            selectDay = 31;
+        }
+
         CalendarDayItem? targetSelection = null;
 
         for (int i = 0; i < 42; i++)
@@ -210,7 +240,11 @@ public sealed class CalendarViewModel : ViewModelBase
             if (cellDate > 0 && cellDate <= daysInMonth)
             {
                 var dt = new DateTime(year, month, cellDate);
-                var lunar = ChineseCalendarEngine.GetLunarDate(dt);
+                LunarDate? lunar = null;
+                if (dt >= ChineseCalendarEngine.MinSupportedDate && dt <= ChineseCalendarEngine.MaxSupportedDate)
+                {
+                    lunar = ChineseCalendarEngine.GetLunarDate(dt);
+                }
 
                 item.DayNumber = cellDate;
                 item.IsCurrentMonth = true;
@@ -219,30 +253,35 @@ public sealed class CalendarViewModel : ViewModelBase
                 item.IsToday = (dt == today);
                 item.IsWeekend = (i % 7 == 0 || i % 7 == 6);
 
-                // Priority: Solar Term > Festival > Lunar Month Day (初一 shows MonthName) > DayName
-                if (lunar.SolarTerm != null)
+                if (lunar != null)
                 {
-                    item.LunarText = lunar.SolarTerm.Name;
-                    item.IsFestivalOrTerm = true;
-                }
-                else if (!string.IsNullOrEmpty(lunar.Festivals))
-                {
-                    item.LunarText = lunar.Festivals.Split(' ')[0];
-                    item.IsFestivalOrTerm = true;
-                }
-                else if (lunar.Day == 1)
-                {
-                    item.LunarText = lunar.MonthName;
+                    if (lunar.SolarTerm != null)
+                    {
+                        item.LunarText = lunar.SolarTerm.Name;
+                        item.IsFestivalOrTerm = true;
+                    }
+                    else if (!string.IsNullOrEmpty(lunar.Festivals))
+                    {
+                        item.LunarText = lunar.Festivals.Split(' ')[0];
+                        item.IsFestivalOrTerm = true;
+                    }
+                    else if (lunar.Day == 1)
+                    {
+                        item.LunarText = lunar.MonthName;
+                    }
+                    else
+                    {
+                        item.LunarText = lunar.DayName;
+                    }
                 }
                 else
                 {
-                    item.LunarText = lunar.DayName;
+                    item.LunarText = string.Empty;
                 }
 
                 if (cellDate == selectDay)
                 {
                     targetSelection = item;
-                    item.IsSelected = true;
                 }
             }
             else
@@ -253,13 +292,47 @@ public sealed class CalendarViewModel : ViewModelBase
             Days.Add(item);
         }
 
-        if (targetSelection == null && Days.Any(d => d.IsCurrentMonth))
+        if (targetSelection == null && Days.Any(d => d.IsCurrentMonth && d.LunarInfo != null))
+        {
+            targetSelection = Days.First(d => d.IsCurrentMonth && d.LunarInfo != null);
+        }
+        else if (targetSelection == null && Days.Any(d => d.IsCurrentMonth))
         {
             targetSelection = Days.First(d => d.IsCurrentMonth);
-            targetSelection.IsSelected = true;
         }
 
         SelectedDay = targetSelection;
+    }
+
+    private void OnTimerTick(object? sender, EventArgs e)
+    {
+        var now = DateTime.Now;
+        if (now.Date != _lastCheckedDate)
+        {
+            _lastCheckedDate = now.Date;
+            foreach (var d in Days)
+            {
+                d.IsToday = (d.FullDate.Date == now.Date);
+            }
+        }
+
+        if (now.Hour != _lastCheckedHour)
+        {
+            _lastCheckedHour = now.Hour;
+            if (SelectedDay != null && SelectedDay.FullDate.Date == now.Date)
+            {
+                UpdateSelectionDetails(SelectedDay);
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_timer != null)
+        {
+            _timer.Stop();
+            _timer.Tick -= OnTimerTick;
+        }
     }
 
     private void RefreshGridSelection()

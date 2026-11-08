@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using PersonalIME.Manager.Models;
 using PersonalIME.Manager.ViewModels;
 
 namespace PersonalIME.Manager.Tests;
@@ -74,4 +75,54 @@ public class CalendarViewModelTests
         Assert.AreNotEqual("--:--", vm.SunTime.Sunrise);
         Assert.AreNotEqual("--:--", vm.SunTime.Sunset);
     }
+
+    [TestMethod]
+    public void TestDateSelectionNotifiesPropertyChange()
+    {
+        using var vm = new CalendarViewModel();
+        var day1 = vm.Days.First(d => d.IsCurrentMonth && d.DayNumber == 10);
+        var day2 = vm.Days.First(d => d.IsCurrentMonth && d.DayNumber == 20);
+
+        bool day1Notified = false;
+        bool day2Notified = false;
+
+        day1.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(CalendarDayItem.IsSelected)) day1Notified = true;
+        };
+        day2.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(CalendarDayItem.IsSelected)) day2Notified = true;
+        };
+
+        vm.SelectDayCommand.Execute(day1);
+        Assert.IsTrue(day1.IsSelected);
+        Assert.IsTrue(day1Notified);
+
+        day1Notified = false;
+        vm.SelectDayCommand.Execute(day2);
+        Assert.IsFalse(day1.IsSelected);
+        Assert.IsTrue(day2.IsSelected);
+        Assert.IsTrue(day1Notified);
+        Assert.IsTrue(day2Notified);
+    }
+
+    [TestMethod]
+    public void TestBoundaryNavigationNoWrap()
+    {
+        using var vm = new CalendarViewModel();
+        while (vm.CurrentYear > 1900) vm.PrevYearCommand.Execute(null);
+        while (vm.CurrentMonth > 1) vm.PrevMonthCommand.Execute(null);
+
+        Assert.AreEqual(1900, vm.CurrentYear);
+        Assert.AreEqual(1, vm.CurrentMonth);
+        Assert.IsNotNull(vm.SelectedDay);
+        Assert.AreEqual(31, vm.SelectedDay.DayNumber);
+
+        // 向前翻月不能反向跳转到 1900-12
+        vm.PrevMonthCommand.Execute(null);
+        Assert.AreEqual(1900, vm.CurrentYear);
+        Assert.AreEqual(1, vm.CurrentMonth);
+    }
 }
+

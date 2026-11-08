@@ -10,6 +10,7 @@ namespace PersonalIME.Manager;
 public partial class App : Application
 {
     private static Mutex? _singleInstanceMutex;
+    private static bool _ownsMutex;
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -45,6 +46,7 @@ public partial class App : Application
             : @"Local\PersonalIME_Manager_SingleInstance_Mutex";
 
         _singleInstanceMutex = new Mutex(true, mutexName, out bool createdNew);
+        _ownsMutex = createdNew;
         if (!createdNew)
         {
             // Another instance is already running: bring its window forward and terminate
@@ -113,7 +115,17 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
-        _singleInstanceMutex?.ReleaseMutex();
+        if (_ownsMutex && _singleInstanceMutex != null)
+        {
+            try
+            {
+                _singleInstanceMutex.ReleaseMutex();
+            }
+            catch
+            {
+                // ignore if mutex was already abandoned or released
+            }
+        }
         _singleInstanceMutex?.Dispose();
         _singleInstanceMutex = null;
         base.OnExit(e);
