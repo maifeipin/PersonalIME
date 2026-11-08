@@ -288,30 +288,35 @@ jobs:
           codesign --verify --verbose build/PersonalIME.app
           /usr/libexec/PlistBuddy -c "Print :InputMethodConnectionName" build/PersonalIME.app/Contents/Info.plist
 
-      - name: Create DMG
+      - name: Create DMG and PKG
         run: |
           mkdir -p out/release
           DMG="out/release/PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg"
+          PKG="out/release/PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.pkg"
           hdiutil create -volname "PersonalIME" -srcfolder build/PersonalIME.app \
             -ov -format UDZO "${DMG}"
+          pkgbuild --component build/PersonalIME.app --install-location "/Library/Input Methods" "${PKG}"
           echo "DMG_PATH=${DMG}" >> "${GITHUB_ENV}"
-          shasum -a 256 "${DMG}" > out/release/SHA256SUMS-macOS.txt
+          echo "PKG_PATH=${PKG}" >> "${GITHUB_ENV}"
+          shasum -a 256 "${DMG}" "${PKG}" > out/release/SHA256SUMS-macOS.txt
           cat out/release/SHA256SUMS-macOS.txt
 
-      - name: Upload macOS DMG to CI Artifacts
+      - name: Upload macOS Packages to CI Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PersonalIME-macOS-v${{ env.RELEASE_VERSION }}
           path: |
             ${{ env.DMG_PATH }}
+            ${{ env.PKG_PATH }}
             out/release/SHA256SUMS-macOS.txt
           retention-days: 30
 
-      - name: Attach macOS DMG to GitHub Release
+      - name: Attach macOS Packages to GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.RELEASE_VERSION) }}
           files: |
             ${{ env.DMG_PATH }}
+            ${{ env.PKG_PATH }}
             out/release/SHA256SUMS-macOS.txt
