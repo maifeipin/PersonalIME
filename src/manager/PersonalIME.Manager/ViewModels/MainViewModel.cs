@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Windows.Input;
 using PersonalIME.Manager.Ipc;
 using PersonalIME.Manager.Models;
 
@@ -116,6 +117,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     }
 
     public AsyncRelayCommand CheckConnectionCommand { get; }
+    public ICommand OpenCalendarCommand { get; }
 
     public MainViewModel(IAdminClient client)
     {
@@ -135,6 +137,11 @@ public class MainViewModel : ViewModelBase, IDisposable
         Settings.PolicySaved += OnPolicySaved;
 
         CheckConnectionCommand = new AsyncRelayCommand(CheckConnectionAsync);
+        OpenCalendarCommand = new RelayCommand(() =>
+        {
+            var win = new Views.CalendarWindow();
+            win.Show();
+        });
     }
 
     private void OnPolicySaved(InputPolicyConfig policy)

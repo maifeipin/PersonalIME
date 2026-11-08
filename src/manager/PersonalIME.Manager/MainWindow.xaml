@@ -113,17 +113,23 @@
                 </Viewbox>
 
                 <StackPanel Grid.Column="1" VerticalAlignment="Center">
-                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                        <TextBlock Text="人人" FontSize="18" FontWeight="Bold" Foreground="#111827"/>
-                        <Border Margin="8,0,0,0" Background="#EEF2F6" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
-                            <TextBlock Text="智能五笔 / 拼音混输" FontSize="11" Foreground="#4B5563" FontWeight="SemiBold"/>
-                        </Border>
-                    </StackPanel>
-                    <TextBlock Text="现代中文输入法与个性化词库管理" FontSize="11" Foreground="#6B7280" Margin="0,2,0,0"/>
+                    <TextBlock Text="智能五笔 / 拼音混输" FontSize="16" FontWeight="SemiBold" Foreground="#111827"/>
+                    <TextBlock Text="现代中文输入法与个性化词库管理" FontSize="11" Foreground="#6B7280" Margin="0,3,0,0"/>
                 </StackPanel>
 
-                <!-- Right Side: Unified Status Badge -->
-                <Border Grid.Column="2" VerticalAlignment="Center" CornerRadius="14" Padding="12,5" BorderThickness="1">
+                <!-- Right Side: Quick Tool & Unified Status Badge -->
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Content="📅 万年历" Command="{Binding OpenCalendarCommand}" Margin="0,0,10,0"
+                            Padding="10,4" Height="28" Background="#F1F5F9" Foreground="#334155"
+                            BorderBrush="#CBD5E1" BorderThickness="1" FontWeight="SemiBold" FontSize="12" Cursor="Hand">
+                        <Button.Resources>
+                            <Style TargetType="Border">
+                                <Setter Property="CornerRadius" Value="6"/>
+                            </Style>
+                        </Button.Resources>
+                    </Button>
+
+                    <Border VerticalAlignment="Center" CornerRadius="14" Padding="12,5" BorderThickness="1">
                     <Border.Style>
                         <Style TargetType="Border">
                             <Setter Property="Background" Value="#ECFDF5"/>
@@ -166,6 +172,7 @@
                         </TextBlock>
                     </StackPanel>
                 </Border>
+                </StackPanel>
             </Grid>
         </Border>
 

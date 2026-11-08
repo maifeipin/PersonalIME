@@ -15,4 +15,12 @@
     <Resource Include="Assets\app.svg" />
   </ItemGroup>
 
+  <!-- 智能双模引用 maifeipin.ChineseCalendar: 本地存在源码用源码，否则用 NuGet 包 -->
+  <ItemGroup Condition="Exists('..\..\..\maifeipin.ChineseCalendar\src\maifeipin.ChineseCalendar\maifeipin.ChineseCalendar.csproj')">
+    <ProjectReference Include="..\..\..\maifeipin.ChineseCalendar\src\maifeipin.ChineseCalendar\maifeipin.ChineseCalendar.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="!Exists('..\..\..\maifeipin.ChineseCalendar\src\maifeipin.ChineseCalendar\maifeipin.ChineseCalendar.csproj')">
+    <PackageReference Include="maifeipin.ChineseCalendar" Version="1.0.0" />
+  </ItemGroup>
+
 </Project>

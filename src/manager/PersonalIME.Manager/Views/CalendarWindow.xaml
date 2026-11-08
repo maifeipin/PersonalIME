@@ -1,0 +1,299 @@
+<Window x:Class="PersonalIME.Manager.Views.CalendarWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:vm="clr-namespace:PersonalIME.Manager.ViewModels"
+        mc:Ignorable="d"
+        d:DataContext="{d:DesignInstance Type=vm:CalendarViewModel}"
+        Title="中华万年历" Height="580" Width="820"
+        WindowStartupLocation="CenterScreen"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ResizeMode="NoResize"
+        ShowInTaskbar="True"
+        Icon="../Assets/app.ico"
+        KeyDown="Window_KeyDown">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisConverter"/>
+    </Window.Resources>
+
+    <!-- Outer Card with Soft Drop Shadow & Rounded Corners -->
+    <Border Margin="10" Background="#FFFFFF" CornerRadius="12" BorderBrush="#D1D5DB" BorderThickness="1">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="18" ShadowDepth="4" Direction="270" Color="#20000000" Opacity="0.35"/>
+        </Border.Effect>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="46"/> <!-- Custom Header / Draggable Bar -->
+                <RowDefinition Height="*"/>  <!-- Main Content Split -->
+            </Grid.RowDefinitions>
+
+            <!-- Custom Title & Navigation Header Bar -->
+            <Border Grid.Row="0" Background="#F8FAFC" CornerRadius="11,11,0,0" BorderBrush="#E2E8F0" BorderThickness="0,0,0,1" MouseLeftButtonDown="Header_MouseLeftButtonDown">
+                <Grid Margin="16,0,10,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Left: Brand / Title -->
+                    <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                        <TextBlock Text="📅" FontSize="18" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <TextBlock Text="万年历" FontSize="15" FontWeight="Bold" Foreground="#1E293B" VerticalAlignment="Center"/>
+                        <Border Margin="10,0,0,0" Background="#EEF2F6" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
+                            <TextBlock Text="{Binding YearGanZhiDisplay}" FontSize="11" Foreground="#475569" FontWeight="SemiBold"/>
+                        </Border>
+                    </StackPanel>
+
+                    <!-- Center: Month / Year Navigation Controls -->
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                        <Button Content="«" Command="{Binding PrevYearCommand}" ToolTip="上一年" Width="28" Height="26" Cursor="Hand" Background="Transparent" BorderThickness="0" FontWeight="Bold" FontSize="13" Foreground="#475569"/>
+                        <Button Content="‹" Command="{Binding PrevMonthCommand}" ToolTip="上一月" Width="28" Height="26" Cursor="Hand" Background="Transparent" BorderThickness="0" FontWeight="Bold" FontSize="15" Foreground="#475569" Margin="2,0"/>
+
+                        <Border Background="#FFFFFF" BorderBrush="#CBD5E1" BorderThickness="1" CornerRadius="5" Padding="12,3" Margin="4,0">
+                            <TextBlock Text="{Binding YearMonthDisplay}" FontSize="13" FontWeight="Bold" Foreground="#0F172A" VerticalAlignment="Center"/>
+                        </Border>
+
+                        <Button Content="›" Command="{Binding NextMonthCommand}" ToolTip="下一月" Width="28" Height="26" Cursor="Hand" Background="Transparent" BorderThickness="0" FontWeight="Bold" FontSize="15" Foreground="#475569" Margin="2,0"/>
+                        <Button Content="»" Command="{Binding NextYearCommand}" ToolTip="下一年" Width="28" Height="26" Cursor="Hand" Background="Transparent" BorderThickness="0" FontWeight="Bold" FontSize="13" Foreground="#475569"/>
+
+                        <Button Content="今" Command="{Binding GoTodayCommand}" ToolTip="回到今天" Width="32" Height="26" Cursor="Hand" Background="#0066CC" Foreground="#FFFFFF" BorderThickness="0" FontWeight="Bold" FontSize="12" Margin="10,0,0,0">
+                            <Button.Resources>
+                                <Style TargetType="Border">
+                                    <Setter Property="CornerRadius" Value="4"/>
+                                </Style>
+                            </Button.Resources>
+                        </Button>
+                    </StackPanel>
+
+                    <!-- Right: Window Control Buttons -->
+                    <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                        <Button Content="─" Click="MinimizeButton_Click" Width="30" Height="28" Cursor="Hand" Background="Transparent" BorderThickness="0" Foreground="#64748B" FontSize="12"/>
+                        <Button Content="✕" Click="CloseButton_Click" Width="30" Height="28" Cursor="Hand" Background="Transparent" BorderThickness="0" Foreground="#64748B" FontSize="12" Margin="2,0,0,0"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Main Body: Two Columns (Left: 42 Calendar Cells, Right: Astrological & Sun Details) -->
+            <Grid Grid.Row="1" Margin="14,10,14,14">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="460"/> <!-- Month Grid -->
+                    <ColumnDefinition Width="12"/>  <!-- Spacer -->
+                    <ColumnDefinition Width="*"/>   <!-- Detail Card -->
+                </Grid.ColumnDefinitions>
+
+                <!-- Left Column: Calendar Grid -->
+                <Border Grid.Column="0" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Padding="8">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="26"/> <!-- DOW Header (Sun..Sat) -->
+                            <RowDefinition Height="*"/>  <!-- 6 Rows of 7 Cells -->
+                        </Grid.RowDefinitions>
+
+                        <!-- Days of Week Header -->
+                        <UniformGrid Grid.Row="0" Columns="7">
+                            <TextBlock Text="日" Foreground="#EF4444" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="一" Foreground="#475569" FontWeight="SemiBold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="二" Foreground="#475569" FontWeight="SemiBold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="三" Foreground="#475569" FontWeight="SemiBold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="四" Foreground="#475569" FontWeight="SemiBold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="五" Foreground="#475569" FontWeight="SemiBold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                            <TextBlock Text="六" Foreground="#EF4444" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </UniformGrid>
+
+                        <!-- 42 Days Uniform Grid -->
+                        <ItemsControl Grid.Row="1" ItemsSource="{Binding Days}" Margin="0,4,0,0">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <UniformGrid Rows="6" Columns="7"/>
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Margin="2" CornerRadius="6" Cursor="Hand" Background="#FFFFFF" BorderThickness="1">
+                                        <Border.Style>
+                                            <Style TargetType="Border">
+                                                <Setter Property="BorderBrush" Value="#E2E8F0"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsCurrentMonth}" Value="False">
+                                                        <Setter Property="Visibility" Value="Hidden"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding IsSelected}" Value="True">
+                                                        <Setter Property="BorderBrush" Value="#0066CC"/>
+                                                        <Setter Property="BorderThickness" Value="2"/>
+                                                        <Setter Property="Background" Value="#EFF6FF"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding IsToday}" Value="True">
+                                                        <Setter Property="BorderBrush" Value="#3B82F6"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Border.Style>
+                                        <Border.InputBindings>
+                                            <MouseBinding MouseAction="LeftClick" 
+                                                          Command="{Binding DataContext.SelectDayCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                          CommandParameter="{Binding}"/>
+                                        </Border.InputBindings>
+
+                                        <Grid VerticalAlignment="Center" HorizontalAlignment="Center">
+                                            <Grid.RowDefinitions>
+                                                <RowDefinition Height="Auto"/>
+                                                <RowDefinition Height="Auto"/>
+                                            </Grid.RowDefinitions>
+
+                                            <!-- Day Number -->
+                                            <Border Grid.Row="0" Width="26" Height="22" CornerRadius="11" HorizontalAlignment="Center">
+                                                <Border.Style>
+                                                    <Style TargetType="Border">
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsToday}" Value="True">
+                                                                <Setter Property="Background" Value="#0066CC"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </Border.Style>
+                                                <TextBlock Text="{Binding DayString}" FontSize="13" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Foreground" Value="#0F172A"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsWeekend}" Value="True">
+                                                                    <Setter Property="Foreground" Value="#DC2626"/>
+                                                                </DataTrigger>
+                                                                <DataTrigger Binding="{Binding IsToday}" Value="True">
+                                                                    <Setter Property="Foreground" Value="#FFFFFF"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </Border>
+
+                                            <!-- Lunar / Term / Festival Text -->
+                                            <TextBlock Grid.Row="1" Text="{Binding LunarText}" FontSize="10" HorizontalAlignment="Center" Margin="0,1,0,0">
+                                                <TextBlock.Style>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground" Value="#64748B"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsFestivalOrTerm}" Value="True">
+                                                                <Setter Property="Foreground" Value="#EA580C"/>
+                                                                <Setter Property="FontWeight" Value="SemiBold"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </TextBlock.Style>
+                                            </TextBlock>
+                                        </Grid>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Grid>
+                </Border>
+
+                <!-- Right Column: Detail Information Card -->
+                <Border Grid.Column="2" Background="#FFFFFF" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="8" Padding="14,10">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <StackPanel>
+                            <!-- Date Big Heading -->
+                            <TextBlock Text="{Binding SelectedDateDisplay}" FontSize="16" FontWeight="Bold" Foreground="#0F172A"/>
+
+                            <!-- Lunar Date Banner -->
+                            <Border Margin="0,6,0,0" Background="#F1F5F9" CornerRadius="6" Padding="10,6">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding SelectedLunarDisplay}" FontSize="15" FontWeight="Bold" Foreground="#1E293B"/>
+                                    <TextBlock Text="{Binding SelectedGanZhiDisplay}" FontSize="12" Foreground="#475569" Margin="0,3,0,0"/>
+                                    <TextBlock Text="{Binding SelectedZodiacDisplay}" FontSize="11" Foreground="#64748B" Margin="0,2,0,0"/>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Solar Term & Festival Notes -->
+                            <StackPanel Margin="0,8,0,0">
+                                <TextBlock Text="{Binding SelectedTermDisplay}" FontSize="11" Foreground="#D97706" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                                <TextBlock Text="{Binding SelectedFestDisplay}" FontSize="11" Foreground="#DC2626" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                            </StackPanel>
+
+                            <Separator Margin="0,8,0,8" Background="#E2E8F0"/>
+
+                            <!-- Sun Times & True Solar Time (with City Selector) -->
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="☀️ 真太阳时与天象" FontSize="12" FontWeight="Bold" Foreground="#334155" VerticalAlignment="Center"/>
+                                <ComboBox Grid.Column="1" ItemsSource="{Binding Cities}" SelectedItem="{Binding SelectedCity}" DisplayMemberPath="City" Width="90" Height="24" FontSize="11" Cursor="Hand"/>
+                            </Grid>
+
+                            <Border Margin="0,6,0,0" Background="#F8FAFC" BorderBrush="#E2E8F0" BorderThickness="1" CornerRadius="6" Padding="8,6">
+                                <Grid>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+
+                                    <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding SunTime.Sunrise, StringFormat='日出: {0}'}" FontSize="11" Foreground="#475569"/>
+                                    <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding SunTime.Sunset, StringFormat='日落: {0}'}" FontSize="11" Foreground="#475569"/>
+                                    <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding SunTime.Transit, StringFormat='中天: {0}'}" FontSize="11" Foreground="#475569" Margin="0,3,0,0"/>
+                                    <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding SunTime.DayLength, StringFormat='昼长: {0}'}" FontSize="11" Foreground="#475569" Margin="0,3,0,0"/>
+                                </Grid>
+                            </Border>
+
+                            <Separator Margin="0,8,0,8" Background="#E2E8F0"/>
+
+                            <!-- Twelve Hours GanZhi Quick Lookup Table -->
+                            <TextBlock Text="⏱️ 当日十二时辰干支" FontSize="12" FontWeight="Bold" Foreground="#334155" Margin="0,0,0,4"/>
+                            <ItemsControl ItemsSource="{Binding HourItems}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <UniformGrid Columns="2"/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Margin="2,1" Padding="4,2" CornerRadius="4">
+                                            <Border.Style>
+                                                <Style TargetType="Border">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding IsCurrentHour}" Value="True">
+                                                            <Setter Property="Background" Value="#FEF2F2"/>
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </Border.Style>
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="{Binding TimeRange}" FontSize="11" Foreground="#64748B" Width="45"/>
+                                                <TextBlock Text="{Binding GanZhi, StringFormat='{}{0}时'}" FontSize="11" FontWeight="SemiBold" Margin="4,0,0,0">
+                                                    <TextBlock.Style>
+                                                        <Style TargetType="TextBlock">
+                                                            <Setter Property="Foreground" Value="#1E293B"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsCurrentHour}" Value="True">
+                                                                    <Setter Property="Foreground" Value="#DC2626"/>
+                                                                    <Setter Property="FontWeight" Value="Bold"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </TextBlock.Style>
+                                                </TextBlock>
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
