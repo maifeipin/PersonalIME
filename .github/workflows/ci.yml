@@ -245,17 +245,26 @@ jobs:
             2. 在 Windows“设置 -> 时间和语言 -> 语言和区域 -> 键盘”中选用“人人 (RenRen IME)”。
             
             #### macOS 启用说明:
-            1. 打开 `PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg`，双击或拖拽安装（或双击运行 PKG 安装包）。
-            2. 打开 macOS「系统设置」->「键盘」->「文字输入」-> 点击「编辑...」-> 点击「+」，在「简体中文」列表下方选择「人人输入法」并添加。
-            3. 按 `Control + Space` 切换至人人输入法即可开始输入。
+            1. **安装输入法**:
+               - **首选方式 (推荐)**: 下载运行 `PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.pkg` 安装器，按向导一键安装至系统 `/Library/Input Methods` 目录。
+               - **备选方式**: 打开 `PersonalIME-macOS-v${{ env.RELEASE_VERSION }}.dmg`，将 `PersonalIME.app` 复制到 `/Library/Input Methods` 目录。
+            2. **在系统中添加启用**:
+               - 打开 macOS「系统设置」-> 左侧点击「键盘」；
+               - 找到「文字输入」，点击右侧的「编辑...」按钮；
+               - 点击左下角的「+」（添加输入源）；
+               - 在左侧选择「简体中文」（或直接在下方搜索框搜 `PersonalIME`）；
+               - 在右侧选中「人人输入法 (PersonalIME)」，点击右下角「添加」；
+               - ⚠️ **关键一步**：在所有输入法管理窗口中，点击右下角蓝色的「完成 (Done)」按钮保存设置！
+            3. **开始打字**:
+               - 按快捷键 `Control + Space`（或点击右上角菜单栏输入法图标）切换至「人人输入法」，即可开始输入！
             
             ---
             
-            ### 代码签名说明 (Code Signing Status)
+            ### 代码签名与安全说明 (Security & Gatekeeper)
             > [!WARNING]
-            > 本项目为开源构建产物，尚未附加商业数字签名证书。
-            > - Windows SmartScreen 首次运行时若提示“未知发布者”，点击“更多信息” -> “仍要运行”即可。
-            > - macOS 若提示“无法打开，因为无法验证开发者”，在「系统设置」->「隐私与安全性」中点击“仍要打开”即可。
+            > 本项目为开源自动化构建产物，尚未附加商业数字签名证书：
+            > - **Windows**: SmartScreen 首次运行若提示“未知发布者”，点击“更多信息” -> “仍要运行”即可。
+            > - **macOS**: 若打开时提示“无法打开，因为无法验证开发者”，请打开 macOS「系统设置」->「隐私与安全性」，滑到最下方点击“仍要打开”（Open Anyway）即可正常运行。
 
   package-macos:
     name: Package macOS DMG & Publish
