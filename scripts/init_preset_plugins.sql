@@ -103,3 +103,4 @@ VALUES ('custom_preset_addr', '北京市海淀区中关村南大街', 1, strftim
 
 INSERT OR IGNORE INTO entry_codes (entry_id, scheme, code, created_at)
 VALUES ('custom_preset_addr', 3, ';dz', strftime('%s', 'now'));
+
