@@ -1,5 +1,6 @@
 /* Localized versions of Info.plist keys */
 "CFBundleName" = "PersonalIME";
 "CFBundleDisplayName" = "PersonalIME";
-"com.personalime.inputmethod" = "PersonalIME";
-"com.personalime.inputmethod.Hans" = "PersonalIME";
+"com.personalime.inputmethod.PersonalIME" = "PersonalIME";
+"com.personalime.inputmethod.PersonalIME.Hans" = "PersonalIME";
+

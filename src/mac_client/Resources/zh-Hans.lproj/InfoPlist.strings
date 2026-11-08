@@ -1,5 +1,6 @@
 /* Localized versions of Info.plist keys */
 "CFBundleName" = "人人输入法";
 "CFBundleDisplayName" = "人人输入法";
-"com.personalime.inputmethod" = "人人输入法";
-"com.personalime.inputmethod.Hans" = "人人输入法";
+"com.personalime.inputmethod.PersonalIME" = "人人输入法";
+"com.personalime.inputmethod.PersonalIME.Hans" = "人人输入法";
+

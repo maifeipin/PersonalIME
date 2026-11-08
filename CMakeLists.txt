@@ -374,6 +374,9 @@ if (APPLE)
             ${MAC_CLIENT_DIR}/main.mm
             ${MAC_CLIENT_DIR}/Info.plist
             ${MAC_CLIENT_DIR}/PkgInfo
+            ${MAC_CLIENT_DIR}/Resources/icon.tiff
+            ${MAC_CLIENT_DIR}/Resources/zh-Hans.lproj/InfoPlist.strings
+            ${MAC_CLIENT_DIR}/Resources/en.lproj/InfoPlist.strings
         COMMENT "Building universal PersonalIME.app (InputMethodKit shell)"
         VERBATIM
     )

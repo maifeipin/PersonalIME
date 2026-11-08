@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>PersonalIME</string>
     <key>CFBundleIdentifier</key>
-    <string>com.personalime.inputmethod</string>
+    <string>com.personalime.inputmethod.PersonalIME</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -18,6 +18,10 @@
     <string>APPL</string>
     <key>CFBundleSignature</key>
     <string>????</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.tiff</string>
+    <key>tsInputMethodIconFileKey</key>
+    <string>icon.tiff</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
@@ -41,7 +45,7 @@
     <key>TISIntendedLanguage</key>
     <string>zh-Hans</string>
     <key>TISInputSourceID</key>
-    <string>com.personalime.inputmethod</string>
+    <string>com.personalime.inputmethod.PersonalIME</string>
     <key>tsInputMethodCharacterRepertoireKey</key>
     <array>
         <string>Hans</string>
@@ -50,10 +54,10 @@
     <dict>
         <key>tsInputModeListKey</key>
         <dict>
-            <key>com.personalime.inputmethod.Hans</key>
+            <key>com.personalime.inputmethod.PersonalIME.Hans</key>
             <dict>
                 <key>TISInputSourceID</key>
-                <string>com.personalime.inputmethod.Hans</string>
+                <string>com.personalime.inputmethod.PersonalIME.Hans</string>
                 <key>TISIntendedLanguage</key>
                 <string>zh-Hans</string>
                 <key>tsInputModeCharacterRepertoireKey</key>
@@ -68,11 +72,17 @@
                 <true/>
                 <key>tsInputModeScriptKey</key>
                 <string>smUnicodeScript</string>
+                <key>tsInputModeMenuIconFileKey</key>
+                <string>icon.tiff</string>
+                <key>tsInputModePaletteIconFileKey</key>
+                <string>icon.tiff</string>
+                <key>tsInputModeAlternateMenuIconFileKey</key>
+                <string>icon.tiff</string>
             </dict>
         </dict>
         <key>tsVisibleInputModeOrderedArrayKey</key>
         <array>
-            <string>com.personalime.inputmethod.Hans</string>
+            <string>com.personalime.inputmethod.PersonalIME.Hans</string>
         </array>
     </dict>
 </dict>
