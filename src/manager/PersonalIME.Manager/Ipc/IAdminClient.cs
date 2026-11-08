@@ -31,5 +31,6 @@ public interface IAdminClient
     Task ExecutePluginAsync(long id, CancellationToken ct = default);
     Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default);
     Task ClearPluginLogsAsync(long? pluginId = null, CancellationToken ct = default);
+    Task ShutdownAsync(CancellationToken ct = default);
 }
 

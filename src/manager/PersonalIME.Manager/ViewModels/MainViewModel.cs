@@ -124,6 +124,26 @@ public class MainViewModel : ViewModelBase, IDisposable
     public ICommand OpenCalendarCommand { get; }
     private Views.CalendarWindow? _calendarWindow;
 
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
+    private bool _isLifecycleBusy;
+
+    public bool IsLifecycleBusy
+    {
+        get => _isLifecycleBusy;
+        private set
+        {
+            if (SetProperty(ref _isLifecycleBusy, value))
+            {
+                OnPropertyChanged(nameof(CanPerformLifecycleAction));
+                CheckConnectionCommand?.RaiseCanExecuteChanged();
+                RestartServiceCommand?.RaiseCanExecuteChanged();
+                Maintenance?.RestartServiceCommand?.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public bool CanPerformLifecycleAction => !IsLifecycleBusy;
+
     [DllImport("user32.dll", EntryPoint = "FindWindowW", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindWindowW(string? lpClassName, string lpWindowName);
 
@@ -147,13 +167,13 @@ public class MainViewModel : ViewModelBase, IDisposable
         Wordbook = new WordbookViewModel(_client, Banner);
         Sorting = new SortingViewModel(_client, Banner);
         Settings = new SettingsViewModel(_client, Banner);
-        Maintenance = new MaintenanceViewModel(_client, Banner, RestartServiceAsync);
+        Maintenance = new MaintenanceViewModel(_client, Banner, RestartServiceAsync, () => CanPerformLifecycleAction);
         Plugins = new PluginsViewModel(_client, Banner);
 
         Settings.PolicySaved += OnPolicySaved;
 
-        CheckConnectionCommand = new AsyncRelayCommand(CheckConnectionAsync);
-        RestartServiceCommand = new AsyncRelayCommand(RestartServiceAsync);
+        CheckConnectionCommand = new AsyncRelayCommand(CheckConnectionAsync, () => CanPerformLifecycleAction);
+        RestartServiceCommand = new AsyncRelayCommand(RestartServiceAsync, () => CanPerformLifecycleAction);
         OpenCalendarCommand = new RelayCommand(() =>
         {
             if (_calendarWindow != null && _calendarWindow.IsLoaded)
@@ -215,6 +235,24 @@ public class MainViewModel : ViewModelBase, IDisposable
 
     public async Task CheckConnectionAsync()
     {
+        if (!await _lifecycleLock.WaitAsync(0))
+        {
+            return; // Busy with another lifecycle operation
+        }
+        try
+        {
+            IsLifecycleBusy = true;
+            await CheckConnectionInternalAsync();
+        }
+        finally
+        {
+            IsLifecycleBusy = false;
+            _lifecycleLock.Release();
+        }
+    }
+
+    private async Task CheckConnectionInternalAsync()
+    {
         // 1. Try connecting to already running service
         try
         {
@@ -249,11 +287,150 @@ public class MainViewModel : ViewModelBase, IDisposable
 
     public async Task RestartServiceAsync()
     {
+        if (!await _lifecycleLock.WaitAsync(0))
+        {
+            return; // Busy with another lifecycle operation
+        }
+        try
+        {
+            IsLifecycleBusy = true;
+            await RestartServiceInternalAsync();
+        }
+        finally
+        {
+            IsLifecycleBusy = false;
+            _lifecycleLock.Release();
+        }
+    }
+
+    private async Task RestartServiceInternalAsync()
+    {
+        // 1. Custom pipe check: never touch or restart foreign/default services from an isolated client
+        if (_client is AdminIpcClient ipcClient && ipcClient.PipeName != AdminIpcClient.DefaultPipeName)
+        {
+            Banner.ShowWarning($"当前处于自定义管道 ({ipcClient.PipeName})，为避免影响其他实例，已拒绝重启操作。");
+            return;
+        }
+
+        string? servicePath = LocateServiceExecutable();
+        if (string.IsNullOrEmpty(servicePath))
+        {
+            Banner.ShowError("重启失败: 未找到后台服务程序 ime-service.exe");
+            return;
+        }
+
+        bool wasConnected = IsConnected;
+
         Banner.ShowInfo("正在重启输入法服务...");
         ServiceState = ServiceConnectionState.Starting;
-        ConnectionStatusText = "● 正在重启输入法服务...";
+        ConnectionStatusText = "● 正在准备重启服务...";
 
-        await TryAutoLaunchAndConnectAsync(forceKillExisting: true);
+        // 2. Target and terminate ONLY the currently connected instance
+        if (wasConnected)
+        {
+            ServiceStatusInfo? status = null;
+            try
+            {
+                using var ctsStatus = new CancellationTokenSource(1000);
+                status = await _client.GetStatusAsync(ctsStatus.Token);
+            }
+            catch
+            {
+            }
+
+            if (status == null || status.ProcessId == 0)
+            {
+                Banner.ShowError("无法获取当前连接服务的实例身份 (PID)，拒绝重启操作。");
+                ServiceState = ServiceConnectionState.Connected;
+                ConnectionStatusText = "● 输入法已就绪 (无法确认身份已中止重启)";
+                return;
+            }
+
+            Process? targetProc = null;
+            try
+            {
+                targetProc = Process.GetProcessById((int)status.ProcessId);
+            }
+            catch (ArgumentException)
+            {
+                // Process already exited
+            }
+
+            if (targetProc != null)
+            {
+                using (targetProc)
+                {
+                    // Check Session ID
+                    int currentSession = Process.GetCurrentProcess().SessionId;
+                    if (targetProc.SessionId != currentSession)
+                    {
+                        Banner.ShowError($"目标服务进程 (PID: {status.ProcessId}) 位于其他用户会话 (Session {targetProc.SessionId})，已拒绝重启。");
+                        ServiceState = ServiceConnectionState.Connected;
+                        ConnectionStatusText = "● 输入法已就绪 (跨会话拒绝重启)";
+                        return;
+                    }
+
+                    // Check Process Image Path if accessible
+                    string? procPath = null;
+                    try
+                    {
+                        procPath = targetProc.MainModule?.FileName;
+                    }
+                    catch
+                    {
+                    }
+
+                    if (!string.IsNullOrEmpty(procPath) &&
+                        !string.Equals(procPath, servicePath, StringComparison.OrdinalIgnoreCase) &&
+                        !Path.GetFileName(procPath).Equals("ime-service.exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Banner.ShowError($"目标进程 (PID: {status.ProcessId}) 路径不匹配 ({procPath})，已拒绝重启。");
+                        ServiceState = ServiceConnectionState.Connected;
+                        ConnectionStatusText = "● 输入法已就绪 (路径不符拒绝重启)";
+                        return;
+                    }
+
+                    // Request graceful shutdown first
+                    try
+                    {
+                        using var ctsShutdown = new CancellationTokenSource(1000);
+                        await _client.ShutdownAsync(ctsShutdown.Token);
+                    }
+                    catch
+                    {
+                    }
+
+                    // Asynchronously wait for exit without blocking UI thread
+                    bool exited = await WaitForExitAsync(targetProc, 1500);
+                    if (!exited)
+                    {
+                        try
+                        {
+                            if (!targetProc.HasExited)
+                            {
+                                targetProc.Kill();
+                                exited = await WaitForExitAsync(targetProc, 1500);
+                            }
+                        }
+                        catch
+                        {
+                            exited = targetProc.HasExited;
+                        }
+                    }
+
+                    if (!exited && !targetProc.HasExited)
+                    {
+                        Banner.ShowError($"无法终止当前服务进程 (PID: {status.ProcessId})，重启操作已中止。");
+                        ServiceState = ServiceConnectionState.Failed;
+                        ConnectionStatusText = $"○ 重启失败: 进程 PID {status.ProcessId} 无法停止";
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 3. Launch and handshake with new instance
+        await LaunchAndConnectProcessAsync(servicePath);
 
         if (IsConnected)
         {
@@ -266,7 +443,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private async Task TryAutoLaunchAndConnectAsync(bool forceKillExisting = false)
+    private async Task TryAutoLaunchAndConnectAsync()
     {
         string? servicePath = LocateServiceExecutable();
         if (string.IsNullOrEmpty(servicePath))
@@ -278,54 +455,90 @@ public class MainViewModel : ViewModelBase, IDisposable
         }
 
         ServiceState = ServiceConnectionState.Starting;
-        ConnectionStatusText = forceKillExisting ? "● 正在重启输入法服务..." : "● 正在准备输入法引擎...";
+        ConnectionStatusText = "● 正在准备输入法引擎...";
 
-        // Check or kill existing ime-service processes
+        // Only recognize an existing process if it belongs to our session AND same executable path
+        bool isOurInstanceRunning = false;
+        try
+        {
+            int currentSession = Process.GetCurrentProcess().SessionId;
+            var existingProcesses = Process.GetProcessesByName("ime-service");
+            foreach (var p in existingProcesses)
+            {
+                using (p)
+                {
+                    if (p.SessionId == currentSession)
+                    {
+                        string? path = null;
+                        try { path = p.MainModule?.FileName; } catch { }
+                        if (string.IsNullOrEmpty(path) || string.Equals(path, servicePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            isOurInstanceRunning = true;
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        if (isOurInstanceRunning)
+        {
+            await AttemptConnectOnlyAsync();
+            return;
+        }
+
+        await LaunchAndConnectProcessAsync(servicePath);
+    }
+
+    private async Task AttemptConnectOnlyAsync()
+    {
+        const int maxAttempts = 15;
+        const int intervalMs = 200;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            if (_cts.IsCancellationRequested) return;
+
+            try
+            {
+                var status = await _client.GetStatusAsync();
+                ServiceState = ServiceConnectionState.Connected;
+                ConnectionStatusText = $"● 输入法已就绪 (v{status.ServiceVersion})";
+                await RefreshActivePolicyAsync();
+                OnTabChanged(SelectedTabIndex);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                await Task.Delay(intervalMs, _cts.Token);
+            }
+        }
+
+        ServiceState = ServiceConnectionState.Failed;
+        ConnectionStatusText = "○ 连接失败: 现有服务进程未响应握手";
+        ResetActivePolicyOffline();
+    }
+
+    private async Task LaunchAndConnectProcessAsync(string servicePath)
+    {
         Process? startedProcess = null;
         try
         {
-            var existingProcesses = Process.GetProcessesByName("ime-service");
-            bool hasRunning = existingProcesses.Length > 0;
-
-            if (forceKillExisting)
+            var psi = new ProcessStartInfo
             {
-                foreach (var p in existingProcesses)
-                {
-                    try
-                    {
-                        if (!p.HasExited)
-                        {
-                            p.Kill();
-                            p.WaitForExit(2000);
-                        }
-                    }
-                    catch { }
-                    finally
-                    {
-                        p.Dispose();
-                    }
-                }
-            }
-            else
-            {
-                foreach (var p in existingProcesses)
-                {
-                    p.Dispose();
-                }
-            }
-
-            if (forceKillExisting || !hasRunning)
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = servicePath,
-                    WorkingDirectory = Path.GetDirectoryName(servicePath) ?? string.Empty,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                startedProcess = Process.Start(psi);
-            }
+                FileName = servicePath,
+                WorkingDirectory = Path.GetDirectoryName(servicePath) ?? string.Empty,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            startedProcess = Process.Start(psi);
         }
         catch (Exception ex)
         {
@@ -373,6 +586,20 @@ public class MainViewModel : ViewModelBase, IDisposable
         ServiceState = ServiceConnectionState.Failed;
         ConnectionStatusText = "○ 启动失败: 等待后台服务握手超时";
         ResetActivePolicyOffline();
+    }
+
+    private static async Task<bool> WaitForExitAsync(Process process, int timeoutMs)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(timeoutMs);
+            await process.WaitForExitAsync(cts.Token);
+            return true;
+        }
+        catch
+        {
+            return process.HasExited;
+        }
     }
 
     private async Task RefreshActivePolicyAsync()

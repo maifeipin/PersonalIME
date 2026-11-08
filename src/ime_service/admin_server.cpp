@@ -596,6 +596,7 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             nlohmann::json data;
             data["service_version"] = "1.0.0";
             data["protocol_version"] = static_cast<int>(ADMIN_PROTOCOL_VERSION_1);
+            data["process_id"] = static_cast<uint32_t>(GetCurrentProcessId());
             auto p = m_engine.GetPolicy();
             data["active_policy_revision"] = p ? p->revision : 1;
             data["db_path"] = m_engine.GetDb().GetPath();
@@ -1608,6 +1609,21 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             }
             nlohmann::json data;
             data["success"] = true;
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        // 21. Shutdown
+        if (action == "Shutdown" || action == "shutdown" || action == "stop") {
+            std::thread([]() {
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+#ifdef _WIN32
+                ExitProcess(0);
+#else
+                _exit(0);
+#endif
+            }).detach();
+            nlohmann::json data;
+            data["shutting_down"] = true;
             return MakeSuccessResponse(action, requestId, data);
         }
 

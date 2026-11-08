@@ -1,3 +1,4 @@
+using PersonalIME.Manager.Ipc;
 using PersonalIME.Manager.Models;
 using PersonalIME.Manager.ViewModels;
 
@@ -113,5 +114,77 @@ public class MainViewModelTests
         Assert.IsNotNull(vm.RestartServiceCommand);
         await vm.RestartServiceCommand.ExecuteAsync(null);
         Assert.IsTrue(restartCalled);
+    }
+
+    [TestMethod]
+    public async Task TestRestartServiceCustomPipeRejection()
+    {
+        var customClient = new AdminIpcClient("PersonalIME_Custom_Isolated_Pipe_12345");
+        using var vm = new MainViewModel(customClient);
+
+        await vm.RestartServiceAsync();
+
+        Assert.IsTrue(vm.Banner.IsVisible);
+        Assert.AreEqual(BannerType.Warning, vm.Banner.Type);
+        StringAssert.Contains(vm.Banner.Message, "自定义管道");
+        StringAssert.Contains(vm.Banner.Message, "已拒绝重启");
+    }
+
+    [TestMethod]
+    public async Task TestRestartServiceUnverifiedProcessIdRejection()
+    {
+        var mock = new MockAdminClient
+        {
+            OnGetStatus = _ => Task.FromResult(new ServiceStatusInfo
+            {
+                ServiceVersion = "1.0.0",
+                ProcessId = 0 // Unverified PID
+            })
+        };
+        using var vm = new MainViewModel(mock);
+        await vm.CheckConnectionAsync();
+        Assert.IsTrue(vm.IsConnected);
+
+        await vm.RestartServiceAsync();
+
+        Assert.IsTrue(vm.Banner.IsVisible);
+        Assert.AreEqual(BannerType.Error, vm.Banner.Type);
+        StringAssert.Contains(vm.Banner.Message, "无法获取当前连接服务的实例身份 (PID)");
+        Assert.IsTrue(vm.IsConnected, "Must remain connected and safe without blind kill");
+        Assert.IsTrue(vm.IsConnected, "Must remain connected and safe without blind kill");
+    }
+
+    [TestMethod]
+    public async Task TestLifecycleLockPreventsConcurrentReentrancy()
+    {
+        var tcs = new TaskCompletionSource<ServiceStatusInfo>();
+        var mock = new MockAdminClient
+        {
+            OnGetStatus = async ct =>
+            {
+                return await tcs.Task;
+            }
+        };
+        using var vm = new MainViewModel(mock);
+
+        // Start check connection (will hold lock until tcs is set)
+        var checkTask = vm.CheckConnectionAsync();
+
+        Assert.IsTrue(vm.IsLifecycleBusy);
+        Assert.IsFalse(vm.CanPerformLifecycleAction);
+        Assert.IsFalse(vm.CheckConnectionCommand.CanExecute(null));
+        Assert.IsFalse(vm.RestartServiceCommand.CanExecute(null));
+
+        // Attempting to restart while busy should immediately return without doing anything
+        await vm.RestartServiceAsync();
+
+        // Release the pending operation
+        tcs.SetResult(new ServiceStatusInfo { ServiceVersion = "1.0.0" });
+        await checkTask;
+
+        Assert.IsFalse(vm.IsLifecycleBusy);
+        Assert.IsTrue(vm.CanPerformLifecycleAction);
+        Assert.IsTrue(vm.CheckConnectionCommand.CanExecute(null));
+        Assert.IsTrue(vm.RestartServiceCommand.CanExecute(null));
     }
 }

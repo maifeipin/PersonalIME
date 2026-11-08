@@ -68,14 +68,14 @@ public class MaintenanceViewModel : ViewModelBase
     public RelayCommand CancelActionCommand { get; }
     public AsyncRelayCommand? RestartServiceCommand { get; }
 
-    public MaintenanceViewModel(IAdminClient client, NotificationBanner banner, Func<Task>? restartServiceAction = null)
+    public MaintenanceViewModel(IAdminClient client, NotificationBanner banner, Func<Task>? restartServiceAction = null, Func<bool>? canPerformLifecycleAction = null)
     {
         _client = client;
         _banner = banner;
 
         if (restartServiceAction != null)
         {
-            RestartServiceCommand = new AsyncRelayCommand(restartServiceAction);
+            RestartServiceCommand = new AsyncRelayCommand(restartServiceAction, canPerformLifecycleAction);
         }
 
         RefreshStatusCommand = new AsyncRelayCommand(() => RefreshStatusAsync(true));

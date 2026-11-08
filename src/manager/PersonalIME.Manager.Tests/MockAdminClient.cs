@@ -218,5 +218,13 @@ public class MockAdminClient : IAdminClient
         else MockLogs.Clear();
         return Task.CompletedTask;
     }
+
+    public Func<CancellationToken, Task>? OnShutdown { get; set; }
+    public Task ShutdownAsync(CancellationToken ct = default)
+    {
+        if (OnShutdown != null) return OnShutdown(ct);
+        IsConnected = false;
+        return Task.CompletedTask;
+    }
 }
 

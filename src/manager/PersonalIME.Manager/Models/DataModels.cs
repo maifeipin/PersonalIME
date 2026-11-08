@@ -278,6 +278,9 @@ public class ServiceStatusInfo
     [JsonPropertyName("service_version")]
     public string ServiceVersion { get; set; } = "1.0.0";
 
+    [JsonPropertyName("process_id")]
+    public uint ProcessId { get; set; }
+
     [JsonPropertyName("uptime_seconds")]
     public long UptimeSeconds { get; set; }
 

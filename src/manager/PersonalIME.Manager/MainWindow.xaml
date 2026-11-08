@@ -295,6 +295,7 @@
                 <!-- Right Section: Reconnect / Restart Actions -->
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                     <Button Content="🔄 重启服务" Command="{Binding RestartServiceCommand}" Margin="0,0,8,0"
+                            IsEnabled="{Binding CanPerformLifecycleAction}"
                             Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand"
                             ToolTip="重新启动后台输入法服务进程 (ime-service.exe)">
                         <Button.Style>
@@ -325,6 +326,7 @@
                     </Button>
 
                     <Button Content="{Binding ConnectionActionButtonText}" Command="{Binding CheckConnectionCommand}" 
+                            IsEnabled="{Binding CanPerformLifecycleAction}"
                             Padding="12,5" FontSize="12" FontWeight="SemiBold" Cursor="Hand">
                         <Button.Style>
                             <Style TargetType="Button">

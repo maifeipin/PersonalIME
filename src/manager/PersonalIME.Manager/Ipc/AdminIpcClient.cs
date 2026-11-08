@@ -457,4 +457,9 @@ public class AdminIpcClient : IAdminClient
         if (pluginId.HasValue) p["plugin_id"] = pluginId.Value;
         await SendRequestAsync("ClearPluginLogs", p, ct);
     }
+
+    public async Task ShutdownAsync(CancellationToken ct = default)
+    {
+        await SendRequestAsync("Shutdown", null, ct);
+    }
 }
