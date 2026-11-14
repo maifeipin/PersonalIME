@@ -2926,6 +2926,72 @@ int TestStage71cRequestFenceAndWalRecovery() {
 
     cleanupWals();
 
+    // 2d. Per-event WAL barrier isolation: Event B's ACK recovery MUST NOT clear Event A's unresolved V2_RES fault!
+    {
+        CTextInputProcessor tipBarrier;
+        tipBarrier.SetClientIdForTest(1);
+        CHECK_TRUE(tipBarrier.NegotiateStage7ForTest(), L"NegotiateStage7 for tipBarrier2");
+
+        MockContext ctxA;
+        MockContext ctxB;
+        MockContext ctxNew;
+        BOOL eaten = FALSE;
+
+        // 1) Prepare both A and B while WAL is healthy
+        tipBarrier.OnKeyDown(&ctxA, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxA 'A' eaten");
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        tipBarrier.OnKeyDown(&ctxA, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxA commit A queued");
+        auto cbA = tipBarrier.GetRequestControlBlockForTest(2);
+
+        tipBarrier.OnKeyDown(&ctxB, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxB 'A' eaten");
+        ctxB.m_forceSyncBlocked = true;
+        ctxB.m_deferAsyncSession = true;
+        tipBarrier.OnKeyDown(&ctxB, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxB commit B queued");
+        auto cbB = tipBarrier.GetRequestControlBlockForTest(4);
+
+        // 2) Complete A (revoked by switch to ctxB -> E_ABORT / CancelDiscard) with V2_RES failure -> A is #1 in m_pendingV2Receipts
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        CHECK_EQUAL(ctxA.m_pDeferredSession->DoEditSession(1), E_ABORT, L"Event A revoked before write by switch to ctxB");
+        CHECK_TRUE(!cbA->wal_resolved, L"Event A V2_RES failed");
+        ctxA.m_pDeferredSession->Release();
+        ctxA.m_pDeferredSession = nullptr;
+
+        // 3) Complete B with CommitTerminal drop -> B is #2 in m_pendingV2Receipts
+        server.m_dropNextCommitTerminal.store(1);
+        CHECK_EQUAL(ctxB.m_pDeferredSession->DoEditSession(1), S_OK, L"Event B host write");
+        CHECK_TRUE(cbB->wal_resolved && !cbB->wal_acked, L"Event B V2_RES ok, ACK pending");
+        ctxB.m_pDeferredSession->Release();
+        ctxB.m_pDeferredSession = nullptr;
+        CHECK_EQUAL(tipBarrier.GetPendingV2ReceiptCountForTest(), size_t(2), L"A (#1) and B (#2) in retry queue");
+
+        // 4) Drain: A (#1) hits FailCommitInjectCountForTest()=1 so A's V2_RES STILL fails;
+        //    B (#2) succeeds CommitTerminal + V2_ACK!
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        tipBarrier.DrainUnconfirmedCommits(true);
+        CHECK_EQUAL(tipBarrier.GetPendingV2ReceiptCountForTest(), size_t(1), L"B drained after ACK success, A still pending");
+        CHECK_TRUE(tipBarrier.IsWalBarrierFaulted(), L"B's ACK success MUST NOT clear A's unresolved V2_RES fault!");
+
+        // Confirm new commits are still blocked while A's fault remains
+        tipBarrier.OnKeyDown(&ctxNew, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxNew 'A' composing ok");
+        tipBarrier.OnKeyDown(&ctxNew, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"New commit BLOCKED while Event A WAL barrier fault remains!");
+
+        // 5) Drain again with healthy disk -> A's V2_RES + CommitTerminal + V2_ACK succeed and barrier clears
+        tipBarrier.DrainUnconfirmedCommits(true);
+        CHECK_EQUAL(tipBarrier.GetPendingV2ReceiptCountForTest(), size_t(0), L"Event A drained");
+        CHECK_TRUE(!tipBarrier.IsWalBarrierFaulted(), L"WAL barrier fault cleared once ALL faulted events recovered");
+
+        tipBarrier.Deactivate();
+    }
+
+    cleanupWals();
+
     // 3. v2 WAL contradictory terminal frame & corrupt tail resilience
     {
         receipt_journal_v2::Entry e{};

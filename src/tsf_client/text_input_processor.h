@@ -374,8 +374,8 @@ public:
     void CheckObservationTimeouts(std::chrono::milliseconds timeout = std::chrono::milliseconds(1500));
     void RetireContextIfNoPotentialWriter(uint64_t contextId);
     void RecoverReceiptsFromWal();
-    void ClearWalBarrierFaultForTest() { m_walBarrierFaulted = false; }
-    bool IsWalBarrierFaulted() const { return m_walBarrierFaulted; }
+    void ClearWalBarrierFaultForTest() { m_walFaultedEvents.clear(); }
+    bool IsWalBarrierFaulted() const { return !m_walFaultedEvents.empty(); }
     size_t GetPendingV2ReceiptCountForTest() const { return m_pendingV2Receipts.size(); }
     bool HasPendingObservationRequests() const;
     static bool IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId);
@@ -484,9 +484,17 @@ private:
     void EnqueuePendingV2Receipt(const PendingV2Receipt& r);
     void DrainPendingV2Receipts(bool forceNow = false);
 
+    enum class WalFaultStage : uint32_t {
+        UnknownPending = 1u << 0,
+        Resolved       = 1u << 1,
+        ServiceAck     = 1u << 2
+    };
+    std::map<uint64_t, uint32_t> m_walFaultedEvents;
+    void RecordWalFault(uint64_t eventId, WalFaultStage stage);
+    void ClearWalFault(uint64_t eventId, WalFaultStage stage);
+
     std::map<uint64_t, std::shared_ptr<EditRequestControlBlock>> m_activeRequestBlocks;
     uint64_t m_nextEditRequestId = 0;
-    bool m_walBarrierFaulted = false;
 
     struct TextEditSinkBinding {
         Microsoft::WRL::ComPtr<ITfContext> context;

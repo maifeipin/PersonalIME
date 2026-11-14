@@ -622,7 +622,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
         };
 
         if (!receipt_journal_v2::AppendResolved(entry)) {
-            m_walBarrierFaulted = true;
+            RecordWalFault(cb->commit_event_id, WalFaultStage::Resolved);
             SetContextState(contextId, CompositionState::Quarantined);
             EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None));
             return false;
@@ -650,6 +650,8 @@ void CTextInputProcessor::OnEditSessionCompleted(
             entry.disposition = static_cast<uint32_t>(finalDisp);
             if (receipt_journal_v2::AppendServiceAck(entry)) {
                 cb->wal_acked = true;
+            } else {
+                RecordWalFault(cb->commit_event_id, WalFaultStage::ServiceAck);
             }
         }
         if (!cb->wal_acked) {
@@ -896,7 +898,7 @@ bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId) {
         entry.disposition = static_cast<uint32_t>(IpcCommitDisposition::None);
         entry.hr = static_cast<int32_t>(cb->hr);
         if (!receipt_journal_v2::AppendUnknownPending(entry)) {
-            m_walBarrierFaulted = true;
+            RecordWalFault(cb->commit_event_id, WalFaultStage::UnknownPending);
         }
     }
 
@@ -1618,6 +1620,20 @@ bool CTextInputProcessor::EnqueueUnconfirmedCommit(uint64_t contextId, uint64_t 
     StartDrainTimer();
     return true;
 }
+void CTextInputProcessor::RecordWalFault(uint64_t eventId, WalFaultStage stage) {
+    if (eventId == 0) return;
+    m_walFaultedEvents[eventId] |= static_cast<uint32_t>(stage);
+}
+
+void CTextInputProcessor::ClearWalFault(uint64_t eventId, WalFaultStage stage) {
+    auto it = m_walFaultedEvents.find(eventId);
+    if (it == m_walFaultedEvents.end()) return;
+    it->second &= ~static_cast<uint32_t>(stage);
+    if (it->second == 0) {
+        m_walFaultedEvents.erase(it);
+    }
+}
+
 bool CTextInputProcessor::HasPendingObservationRequests() const {
     for (const auto& kv : m_activeRequestBlocks) {
         const auto& cb = kv.second;
@@ -1680,7 +1696,7 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
                 continue;
             }
             it->has_resolved_in_wal = true;
-            m_walBarrierFaulted = false;
+            ClearWalFault(it->commit_event_id, WalFaultStage::Resolved);
             auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
             if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
                 cbIt->second->wal_resolved = true;
@@ -1738,7 +1754,8 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
             ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
             ackEntry.hr = it->hr;
             if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
-                m_walBarrierFaulted = false;
+                ClearWalFault(it->commit_event_id, WalFaultStage::ServiceAck);
+                ClearWalFault(it->commit_event_id, WalFaultStage::UnknownPending);
                 uint64_t ctxId = it->context_id;
                 auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
                 if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
@@ -2045,7 +2062,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             if (resp.has_commit && resp.commit_event_id != 0) {
                 if (m_ipcClient.IsStage7Capable()) {
                     bool prepOk = false;
-                    if (!m_walBarrierFaulted) {
+                    if (!IsWalBarrierFaulted()) {
                         receipt_journal_v2::Entry prepEntry{};
                         prepEntry.owner_id = controlBlock->owner_id;
                         prepEntry.session_id = controlBlock->session_id;
@@ -2061,7 +2078,6 @@ bool CTextInputProcessor::ProcessKeyInternal(
                         prepOk = receipt_journal_v2::AppendPrepared(prepEntry);
                     }
                     if (!prepOk) {
-                        m_walBarrierFaulted = true;
                         IpcKeyResponse restored{};
                         IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
                         bool conflict = false;
