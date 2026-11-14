@@ -58,7 +58,10 @@ public:
                            bool learningEnabled = true,
                            const std::string& layoutId = "",
                            const std::string& matchedCode = "",
-                           const std::string& resolvedCode = "");
+                           const std::string& resolvedCode = "",
+                           uint64_t contextEpoch = 0,
+                           uint64_t inputGeneration = 0,
+                           uint64_t ownerInstanceId = 0);
     bool RemovePendingCommit(const std::string& eventId);
     bool LoadAllPendingCommits(std::vector<EntryRepository::PendingCommitRecord>& outRecords);
     std::vector<EntryRepository::PendingCommitRecord> LoadAllPendingCommits();

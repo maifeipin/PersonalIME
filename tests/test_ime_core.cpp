@@ -1069,6 +1069,77 @@ int TestStage71aSchemaAndTerminalDisposition() {
     TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 1, finalDisp, conflict), "ConfirmedWritten after DispatchedUnverified conflicts");
     TEST_ASSERT(conflict && finalDisp == 4, "Conflict preserves DispatchedUnverified");
 
+    // 6. Unknown event without pending snapshot must be rejected and NOT inserted into commit_events
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-nonexistent", 10, 20, 1, finalDisp, conflict), "Unknown event rejected");
+    TEST_ASSERT(!conflict && finalDisp == 0, "Unknown event does not set conflict or finalDisp");
+    TEST_ASSERT(repo.GetCommitEventRecord("evt-71a-nonexistent").status == 0, "Unknown event must not create commit_events row");
+
+    // 7. LoadAllPendingCommits fidelity + epoch/generation/owner mismatch rejection
+    EntryRepository::PendingCommitRecord pOwn;
+    pOwn.event_id = "evt-71a-own";
+    pOwn.session_id = 10;
+    pOwn.context_id = 22;
+    pOwn.scheme = InputScheme::Wubi86;
+    pOwn.query_code = "cccc";
+    pOwn.entry_id = "e3";
+    pOwn.text = L"以";
+    pOwn.context_epoch = 88;
+    pOwn.input_generation = 15;
+    pOwn.owner_instance_id = 7777;
+    TEST_ASSERT(repo.SavePendingCommit(pOwn), "SavePendingCommit with ownership fields");
+
+    std::vector<EntryRepository::PendingCommitRecord> loaded;
+    TEST_ASSERT(repo.LoadAllPendingCommits(loaded), "LoadAllPendingCommits succeeds");
+    bool foundOwn = false;
+    for (const auto& r : loaded) {
+        if (r.event_id == "evt-71a-own") {
+            foundOwn = true;
+            TEST_ASSERT(r.context_epoch == 88, "LoadAllPendingCommits preserves context_epoch");
+            TEST_ASSERT(r.input_generation == 15, "LoadAllPendingCommits preserves input_generation");
+            TEST_ASSERT(r.owner_instance_id == 7777, "LoadAllPendingCommits preserves owner_instance_id");
+        }
+    }
+    TEST_ASSERT(foundOwn, "Loaded pending commit includes evt-71a-own");
+
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-own", 10, 22, 3, finalDisp, conflict, 99, 15, 7777), "Wrong context_epoch conflicts");
+    TEST_ASSERT(conflict, "Wrong context_epoch sets conflict");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-own", 10, 22, 3, finalDisp, conflict, 88, 16, 7777), "Wrong input_generation conflicts");
+    TEST_ASSERT(conflict, "Wrong input_generation sets conflict");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-own", 10, 22, 3, finalDisp, conflict, 88, 15, 8888), "Wrong owner_instance_id conflicts");
+    TEST_ASSERT(conflict, "Wrong owner_instance_id sets conflict");
+
+    // 8. CancelRestore idempotent retry succeeds
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-own", 10, 22, 2, finalDisp, conflict, 88, 15, 7777), "Finalize CancelRestore succeeds");
+    TEST_ASSERT(!conflict && finalDisp == 2, "CancelRestore recorded");
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-own", 10, 22, 2, finalDisp, conflict, 88, 15, 7777), "Idempotent CancelRestore retry succeeds");
+    TEST_ASSERT(!conflict && finalDisp == 2, "Idempotent CancelRestore retry has no conflict");
+
+    // 9. RunInTransaction + RecordCommit + UpdateCommitEventTerminalMetadata updates learning stats atomically
+    auto learnedEntryId = repo.AddEntry(L"测试词", {{InputScheme::Wubi86, "aaaa"}});
+    TEST_ASSERT(!learnedEntryId.empty(), "Add entry for Stage 7.1a learning check");
+    EntryRepository::PendingCommitRecord pLearn;
+    pLearn.event_id = "evt-71a-learn";
+    pLearn.session_id = 10;
+    pLearn.context_id = 23;
+    pLearn.scheme = InputScheme::Wubi86;
+    pLearn.query_code = "aaaa";
+    pLearn.entry_id = learnedEntryId;
+    pLearn.text = L"测试词";
+    pLearn.context_epoch = 101;
+    pLearn.input_generation = 3;
+    pLearn.owner_instance_id = 10;
+    TEST_ASSERT(repo.SavePendingCommit(pLearn), "SavePendingCommit for atomic learning");
+    bool txOk = repo.RunInTransaction([&]() {
+        if (!repo.RecordCommit("evt-71a-learn", 10, 23, InputScheme::Wubi86, "aaaa", learnedEntryId, true)) return false;
+        return repo.UpdateCommitEventTerminalMetadata("evt-71a-learn", 1, 101, 3, 10);
+    });
+    TEST_ASSERT(txOk, "Atomic ConfirmedWritten + learning transaction succeeds");
+    auto st = repo.GetStat(InputScheme::Wubi86, "aaaa", learnedEntryId);
+    TEST_ASSERT(st.has_value() && st->selected_count == 1, "Learning stat incremented to 1");
+    auto ceLearn = repo.GetCommitEventRecord("evt-71a-learn");
+    TEST_ASSERT(ceLearn.status == 1 && ceLearn.final_disposition == 1 && ceLearn.context_epoch == 101 && ceLearn.input_generation == 3 && ceLearn.owner_instance_id == 10,
+                "commit_events carries full Stage 7.1a metadata");
+
     std::cout << "[PASS] Stage 7.1a Schema v7 Migration & FinalizeTerminalCommitEvent verified!\n";
     return 0;
 }

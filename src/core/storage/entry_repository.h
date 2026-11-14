@@ -7,6 +7,7 @@
 #include <vector>
 #include <optional>
 #include <memory>
+#include <functional>
 
 namespace ime {
 
@@ -71,7 +72,13 @@ public:
     };
     CommitEventRecord GetCommitEventRecord(const std::string& eventId);
     bool FinalizeTerminalCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
-                                     int requestedDisposition, int& outFinalDisposition, bool& outConflict);
+                                     int requestedDisposition, int& outFinalDisposition, bool& outConflict,
+                                     uint64_t expectedContextEpoch = 0, uint64_t expectedInputGeneration = 0,
+                                     uint64_t expectedOwnerInstanceId = 0);
+    bool RunInTransaction(const std::function<bool()>& fn);
+    bool UpdateCommitEventTerminalMetadata(const std::string& eventId, int finalDisposition,
+                                           uint64_t contextEpoch, uint64_t inputGeneration,
+                                           uint64_t ownerInstanceId);
 
     // Sort Preferences (Pin / Rank)
     bool SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank = 1,

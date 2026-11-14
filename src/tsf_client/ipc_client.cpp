@@ -304,7 +304,8 @@ bool IpcClient::NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint6
 bool IpcClient::NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
                                       IpcCommitDisposition requestedDisp, uint32_t contextEpoch,
                                       IpcCommitDisposition& outFinalDisp, bool& outConflict,
-                                      IpcKeyResponse* outResp) {
+                                      IpcKeyResponse* outResp,
+                                      uint32_t expectedGeneration, uint64_t ownerInstanceId) {
     outFinalDisp = IpcCommitDisposition::None;
     outConflict = false;
     if (eventId == 0) return false;
@@ -315,6 +316,9 @@ bool IpcClient::NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uin
     req.event_id = eventId;
     req.mode_arg = static_cast<uint32_t>(requestedDisp);
     req.context_epoch = contextEpoch;
+    req.candidate_version = expectedGeneration;
+    req.vk_code = static_cast<uint32_t>(ownerInstanceId & 0xFFFFFFFFULL);
+    req.scan_code = static_cast<uint32_t>((ownerInstanceId >> 32) & 0xFFFFFFFFULL);
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
     IpcKeyResponse resp{};
     bool ok = SendRequest(req, resp, 80);
@@ -329,7 +333,7 @@ bool IpcClient::NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uin
 }
 
 bool IpcClient::QueryCommitStatus(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
-                                  IpcCommitDisposition& outFinalDisp) {
+                                  IpcCommitDisposition& outFinalDisp, uint32_t contextEpoch) {
     outFinalDisp = IpcCommitDisposition::None;
     if (eventId == 0) return false;
     IpcKeyRequest req{};
@@ -337,6 +341,7 @@ bool IpcClient::QueryCommitStatus(uint64_t sessionId, uint64_t contextId, uint64
     req.session_id = sessionId;
     req.context_id = contextId;
     req.event_id = eventId;
+    req.context_epoch = contextEpoch;
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
     IpcKeyResponse resp{};
     if (!SendRequest(req, resp, 80)) return false;

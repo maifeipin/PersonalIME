@@ -62,11 +62,17 @@ struct ServiceProcess {
     ~ServiceProcess() {
         Stop();
     }
-    bool Start(const std::string& dbPath, const std::string& dictDir) {
+    bool Start(const std::string& dbPath, const std::string& dictDir, const std::string& pipeName = "", const std::string& adminPipeName = "") {
         std::wstring serviceExe = L"build\\Release\\ime-service.exe";
         if (!std::filesystem::exists(serviceExe)) serviceExe = L"ime-service.exe";
 
         std::wstring cmdLine = serviceExe + L" --db " + ime::Utf8ToWide(dbPath) + L" --dict " + ime::Utf8ToWide(dictDir);
+        if (!pipeName.empty()) {
+            cmdLine += L" --pipe " + ime::Utf8ToWide(pipeName);
+        }
+        if (!adminPipeName.empty()) {
+            cmdLine += L" --admin-pipe " + ime::Utf8ToWide(adminPipeName);
+        }
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
@@ -103,6 +109,8 @@ int main(int argc, char* argv[]) {
 
     std::string testDb = "stage3_integration_test.db";
     std::string dictDir = "data/dictionaries";
+    bool stage71aOnly = (argc > 1 && std::string(argv[1]) == "--stage71a-only");
+    if (!stage71aOnly) {
 
     // Clean up previous test database if present
     if (std::filesystem::exists(testDb)) {
@@ -2073,8 +2081,168 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[PASS] Fallback chain & persistence verified (mixed input cascading, scheme isolation, persistence, multi-code)!" << std::endl;
     }
 
+    } // end if (!stage71aOnly)
+
+    // 20. Stage 7.1a End-to-End CommitTerminal, Learning, CancelRestore Idempotency, Unknown Event & Restart Fidelity
+    {
+        std::wcout << L"\n[TEST 20] Stage 7.1a CommitTerminal E2E & Restart Fidelity..." << std::endl;
+        std::string s7Db = "test_stage71a_e2e.db";
+        std::error_code ec;
+        std::filesystem::remove(s7Db, ec);
+
+        {
+            ime::ImeEngine seed;
+            CHECK_TRUE(seed.Initialize(s7Db, dictDir), L"Init Stage 7.1a E2E DB");
+            std::string eid = seed.AddUserEntry(L"终态词", {{ime::InputScheme::Wubi86, "yyyy"}});
+            CHECK_TRUE(!eid.empty(), L"Add user entry for Stage 7.1a E2E");
+        }
+
+        std::wstring s7PipeW = L"\\\\.\\pipe\\PersonalIME_Test_Stage71a_" + std::to_wstring(GetCurrentProcessId());
+        std::string s7Pipe = ime::WideToUtf8(s7PipeW);
+        std::string s7AdminPipe = s7Pipe + "_Admin";
+        IpcClient::SetPipeNameForTest(s7PipeW.c_str());
+
+        ServiceProcess s7Service;
+        CHECK_TRUE(s7Service.Start(s7Db, dictDir, s7Pipe, s7AdminPipe), L"Start service for Stage 7.1a E2E");
+        IpcClient client;
+        uint64_t sid = 7001, cid = 8001;
+        uint32_t ctxEpoch = 101;
+
+        IpcKeyRequest pingReq{};
+        pingReq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        pingReq.session_id = sid;
+        pingReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse pingResp{};
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Stage 7 Ping");
+        CHECK_TRUE((pingResp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0, L"Server advertises Stage 7 capability");
+
+        CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
+        CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
+
+        // 20.1 Type 'yyyy' and select candidate -> ConfirmedWritten -> verify learning
+        IpcKeyRequest keyReq{};
+        keyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        keyReq.session_id = sid;
+        keyReq.context_id = cid;
+        keyReq.context_epoch = ctxEpoch;
+        keyReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse keyResp{};
+        for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'y'");
+        }
+        CHECK_TRUE(keyResp.candidate_count >= 1, L"Candidates present for 'yyyy'");
+        keyReq.vk_code = '1';
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for ConfirmedWritten");
+        CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit == 1");
+        uint64_t learnEvtId = keyResp.commit_event_id;
+        CHECK_TRUE(learnEvtId != 0, L"commit_event_id != 0");
+
+        IpcCommitDisposition outDisp = IpcCommitDisposition::None;
+        bool outConflict = false;
+        // Unknown event rejected
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId + 999999, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict),
+                   L"Unknown event must be rejected");
+        CHECK_TRUE(!outConflict, L"Unknown event must not report conflict");
+
+        // Wrong epoch rejected with conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch + 1, outDisp, outConflict),
+                   L"Wrong context_epoch must conflict");
+        CHECK_TRUE(outConflict, L"Wrong context_epoch sets conflict flag");
+
+        // Wrong ownerInstanceId rejected with conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict, nullptr, 0, sid + 1),
+                   L"Wrong ownerInstanceId must conflict");
+        CHECK_TRUE(outConflict, L"Wrong ownerInstanceId sets conflict flag");
+
+        // Wrong expectedGeneration rejected with conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict, nullptr, 99999, sid),
+                   L"Wrong expectedGeneration must conflict");
+        CHECK_TRUE(outConflict, L"Wrong expectedGeneration sets conflict flag");
+
+        // Correct ConfirmedWritten succeeds
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict),
+                   L"ConfirmedWritten succeeds");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::ConfirmedWritten, L"outDisp == ConfirmedWritten");
+
+        // 20.2 CancelRestore + idempotent retry (ACK loss simulation)
+        for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'y' for CancelRestore");
+        }
+        keyReq.vk_code = '1';
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for CancelRestore");
+        uint64_t cancelEvtId = keyResp.commit_event_id;
+
+        IpcKeyResponse cancelResp{};
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict, &cancelResp),
+                   L"Initial CancelRestore succeeds");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore applied");
+        CHECK_TRUE(wcscmp(cancelResp.composition, L"yyyy") == 0, L"Composition restored to 'yyyy'");
+
+        // Simulate lost ACK and retry CancelRestore
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+                   L"Idempotent CancelRestore retry succeeds");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore retry preserves disposition without conflict");
+
+        // Clear restored composition
+        keyReq.vk_code = VK_ESCAPE;
+        keyReq.candidate_version = 0;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Esc clears restored composition");
+
+        // 20.3 Restart fidelity: create pending commit with context_epoch=555, restart service, verify epoch check + finalization
+        uint32_t restartEpoch = 555;
+        keyReq.context_epoch = restartEpoch;
+        for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'y' before restart");
+        }
+        keyReq.vk_code = '1';
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 before restart");
+        uint64_t restartEvtId = keyResp.commit_event_id;
+
+        client.Disconnect();
+        s7Service.Stop();
+
+        CHECK_TRUE(s7Service.Start(s7Db, dictDir, s7Pipe, s7AdminPipe), L"Restart service for Stage 7.1a fidelity");
+        CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping restarted service");
+
+        // Wrong epoch after restart must conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch + 1, outDisp, outConflict),
+                   L"Wrong epoch after restart conflicts");
+        CHECK_TRUE(outConflict, L"Wrong epoch after restart sets conflict flag");
+
+        // Correct epoch after restart succeeds
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch, outDisp, outConflict),
+                   L"Correct epoch after restart finalizes ConfirmedWritten");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::ConfirmedWritten, L"Post-restart ConfirmedWritten succeeded");
+
+        client.Disconnect();
+        s7Service.Stop();
+
+        // Verify learning count == 2 in DB (one from 20.1, one from 20.3)
+        {
+            ime::ImeEngine verify;
+            CHECK_TRUE(verify.Initialize(s7Db, dictDir), L"Reopen DB to verify Stage 7.1a learning");
+            auto qr = verify.Query(ime::InputScheme::Wubi86, "yyyy");
+            CHECK_TRUE(!qr.candidates.empty(), L"Query 'yyyy' returns learned entry");
+            auto stat = verify.GetRepo()->GetStat(ime::InputScheme::Wubi86, "yyyy", qr.candidates[0].entry_id);
+            CHECK_TRUE(stat.has_value() && stat->selected_count == 2, L"Selected count must be 2 after 2 ConfirmedWritten commits");
+        }
+
+        std::filesystem::remove(s7Db, ec);
+        IpcClient::SetPipeNameForTest(nullptr);
+        std::wcout << L"[PASS] Stage 7.1a CommitTerminal E2E & Restart Fidelity verified!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 & 4C-2 End-to-End Tests PASSED! (19/19)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (20/20)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

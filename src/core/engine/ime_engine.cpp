@@ -230,7 +230,10 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
                                   bool learningEnabled,
                                   const std::string& layoutId,
                                   const std::string& matchedCode,
-                                  const std::string& resolvedCode) {
+                                  const std::string& resolvedCode,
+                                  uint64_t contextEpoch,
+                                  uint64_t inputGeneration,
+                                  uint64_t ownerInstanceId) {
     if (!m_initialized || !m_repo || eventId.empty()) return false;
     EntryRepository::PendingCommitRecord rec;
     rec.event_id = eventId;
@@ -245,6 +248,9 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
     rec.layout_id = layoutId;
     rec.matched_code = matchedCode;
     rec.resolved_code = resolvedCode;
+    rec.context_epoch = contextEpoch;
+    rec.input_generation = inputGeneration;
+    rec.owner_instance_id = ownerInstanceId;
     return m_repo->SavePendingCommit(rec);
 }
 

@@ -660,7 +660,9 @@ EntryRepository::CommitEventRecord EntryRepository::GetCommitEventRecord(const s
 }
 
 bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
-                                                int requestedDisposition, int& outFinalDisposition, bool& outConflict) {
+                                                int requestedDisposition, int& outFinalDisposition, bool& outConflict,
+                                                uint64_t expectedContextEpoch, uint64_t expectedInputGeneration,
+                                                uint64_t expectedOwnerInstanceId) {
     outFinalDisposition = 0;
     outConflict = false;
     if (eventId.empty() || requestedDisposition <= 0) return false;
@@ -669,7 +671,7 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
     if (!tx.IsStarted()) return false;
 
     auto stmtCheck = m_db.Prepare(
-        "SELECT session_id, context_id, status, final_disposition "
+        "SELECT session_id, context_id, status, final_disposition, context_epoch, input_generation, owner_instance_id "
         "FROM commit_events WHERE event_id = ?;"
     );
     if (!stmtCheck) {
@@ -682,8 +684,14 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
         uint64_t existingCid = static_cast<uint64_t>(stmtCheck->ColumnInt64(1));
         int existingStatus = stmtCheck->ColumnInt(2);
         int existingDisp = stmtCheck->ColumnInt(3);
+        uint64_t existingEpoch = static_cast<uint64_t>(stmtCheck->ColumnInt64(4));
+        uint64_t existingGen = static_cast<uint64_t>(stmtCheck->ColumnInt64(5));
+        uint64_t existingOwner = static_cast<uint64_t>(stmtCheck->ColumnInt64(6));
 
-        if (existingSid != sessionId || existingCid != contextId) {
+        if (existingSid != sessionId || existingCid != contextId ||
+            (expectedContextEpoch != 0 && existingEpoch != 0 && expectedContextEpoch != existingEpoch) ||
+            (expectedInputGeneration != 0 && existingGen != 0 && expectedInputGeneration != existingGen) ||
+            (expectedOwnerInstanceId != 0 && existingOwner != 0 && expectedOwnerInstanceId != existingOwner)) {
             outConflict = true;
             outFinalDisposition = existingDisp;
             tx.Rollback();
@@ -720,7 +728,7 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
         return false;
     }
 
-    // Check pending_commits ownership and delete
+    // Check pending_commits ownership and delete; reject unknown events without a pending snapshot
     uint64_t ctxEpoch = 0, inputGen = 0, ownerId = 0;
     auto stmtPend = m_db.Prepare(
         "SELECT session_id, context_id, context_epoch, input_generation, owner_instance_id "
@@ -728,26 +736,30 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
     );
     if (!stmtPend) { tx.Rollback(); return false; }
     stmtPend->BindText(1, eventId);
-    if (stmtPend->Step()) {
-        uint64_t pSid = static_cast<uint64_t>(stmtPend->ColumnInt64(0));
-        uint64_t pCid = static_cast<uint64_t>(stmtPend->ColumnInt64(1));
-        if (pSid != sessionId || pCid != contextId) {
-            outConflict = true;
-            tx.Rollback();
-            return false;
-        }
-        ctxEpoch = static_cast<uint64_t>(stmtPend->ColumnInt64(2));
-        inputGen = static_cast<uint64_t>(stmtPend->ColumnInt64(3));
-        ownerId = static_cast<uint64_t>(stmtPend->ColumnInt64(4));
-
-        auto stmtDel = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
-        if (!stmtDel) { tx.Rollback(); return false; }
-        stmtDel->BindText(1, eventId);
-        if (!stmtDel->Step() && stmtDel->HasError()) { tx.Rollback(); return false; }
-    } else if (stmtPend->HasError()) {
+    if (!stmtPend->Step()) {
         tx.Rollback();
         return false;
     }
+
+    uint64_t pSid = static_cast<uint64_t>(stmtPend->ColumnInt64(0));
+    uint64_t pCid = static_cast<uint64_t>(stmtPend->ColumnInt64(1));
+    ctxEpoch = static_cast<uint64_t>(stmtPend->ColumnInt64(2));
+    inputGen = static_cast<uint64_t>(stmtPend->ColumnInt64(3));
+    ownerId = static_cast<uint64_t>(stmtPend->ColumnInt64(4));
+
+    if (pSid != sessionId || pCid != contextId ||
+        (expectedContextEpoch != 0 && ctxEpoch != 0 && expectedContextEpoch != ctxEpoch) ||
+        (expectedInputGeneration != 0 && inputGen != 0 && expectedInputGeneration != inputGen) ||
+        (expectedOwnerInstanceId != 0 && ownerId != 0 && expectedOwnerInstanceId != ownerId)) {
+        outConflict = true;
+        tx.Rollback();
+        return false;
+    }
+
+    auto stmtDel = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+    if (!stmtDel) { tx.Rollback(); return false; }
+    stmtDel->BindText(1, eventId);
+    if (!stmtDel->Step() && stmtDel->HasError()) { tx.Rollback(); return false; }
 
     int status = (requestedDisposition == 1) ? 1 : 2;
     auto stmtIns = m_db.Prepare(
@@ -762,9 +774,9 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
     stmtIns->BindInt(4, status);
     stmtIns->BindInt64(5, m_clock->Now());
     stmtIns->BindInt(6, requestedDisposition);
-    stmtIns->BindInt64(7, static_cast<int64_t>(ctxEpoch));
-    stmtIns->BindInt64(8, static_cast<int64_t>(inputGen));
-    stmtIns->BindInt64(9, static_cast<int64_t>(ownerId));
+    stmtIns->BindInt64(7, static_cast<int64_t>(ctxEpoch != 0 ? ctxEpoch : expectedContextEpoch));
+    stmtIns->BindInt64(8, static_cast<int64_t>(inputGen != 0 ? inputGen : expectedInputGeneration));
+    stmtIns->BindInt64(9, static_cast<int64_t>(ownerId != 0 ? ownerId : expectedOwnerInstanceId));
     if (!stmtIns->Step() && stmtIns->HasError()) {
         tx.Rollback();
         return false;
@@ -772,6 +784,35 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
 
     outFinalDisposition = requestedDisposition;
     return tx.Commit();
+}
+
+bool EntryRepository::RunInTransaction(const std::function<bool()>& fn) {
+    if (!fn) return false;
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+    if (!fn()) {
+        tx.Rollback();
+        return false;
+    }
+    return tx.Commit();
+}
+
+bool EntryRepository::UpdateCommitEventTerminalMetadata(const std::string& eventId, int finalDisposition,
+                                                      uint64_t contextEpoch, uint64_t inputGeneration,
+                                                      uint64_t ownerInstanceId) {
+    if (eventId.empty() || finalDisposition <= 0) return false;
+    auto stmt = m_db.Prepare(
+        "UPDATE commit_events SET final_disposition = ?, context_epoch = ?, input_generation = ?, owner_instance_id = ? "
+        "WHERE event_id = ?;"
+    );
+    if (!stmt) return false;
+    stmt->BindInt(1, finalDisposition);
+    stmt->BindInt64(2, static_cast<int64_t>(contextEpoch));
+    stmt->BindInt64(3, static_cast<int64_t>(inputGeneration));
+    stmt->BindInt64(4, static_cast<int64_t>(ownerInstanceId));
+    stmt->BindText(5, eventId);
+    if (!stmt->Execute()) return false;
+    return m_db.Changes() > 0;
 }
 
 bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
@@ -945,7 +986,8 @@ bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& ou
     outRecords.clear();
     auto stmt = m_db.Prepare(
         "SELECT event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at, "
-        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch "
+        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch, "
+        "context_epoch, input_generation, owner_instance_id "
         "FROM pending_commits;"
     );
     if (!stmt) return false;
@@ -965,6 +1007,9 @@ bool EntryRepository::LoadAllPendingCommits(std::vector<PendingCommitRecord>& ou
         r.resolved_code = stmt->ColumnText(11);
         r.global_epoch = stmt->ColumnInt64(12);
         r.entry_epoch = stmt->ColumnInt64(13);
+        r.context_epoch = static_cast<uint64_t>(stmt->ColumnInt64(14));
+        r.input_generation = static_cast<uint64_t>(stmt->ColumnInt64(15));
+        r.owner_instance_id = static_cast<uint64_t>(stmt->ColumnInt64(16));
         outRecords.push_back(std::move(r));
     }
     if (stmt->HasError()) {

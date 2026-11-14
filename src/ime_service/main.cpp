@@ -77,6 +77,8 @@ struct ServerPendingCommit {
     uint64_t context_id = 0;
     uint64_t connection_epoch = 0;
     uint64_t generation = 0;
+    uint64_t context_epoch = 0;
+    uint64_t owner_instance_id = 0;
     ime::Candidate candidate;
     ime::InputScheme scheme = ime::InputScheme::Wubi86;
     std::string query_code; // The actual query code typed by user (e.g. "a", "xi'an")
@@ -93,6 +95,9 @@ struct CompletedCommitInfo {
     uint64_t session_id = 0;
     uint64_t context_id = 0;
     CommitState state = CommitState::Recorded;
+    int final_disposition = 0;
+    uint64_t context_epoch = 0;
+    uint64_t owner_instance_id = 0;
 };
 
 static std::atomic<uint64_t> g_nextConnectionEpoch{1};
@@ -623,7 +628,9 @@ void HandleClient(HANDLE hPipe) {
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::QueryCommitStatus)) {
             if (req.event_id != 0 && g_engine.GetRepo()) {
                 auto rec = g_engine.GetRepo()->GetCommitEventRecord(std::to_string(req.event_id));
-                if (rec.status != 0 && rec.session_id == req.session_id && rec.context_id == req.context_id) {
+                bool epochOk = (req.context_epoch == 0 || rec.context_epoch == 0 || rec.context_epoch == req.context_epoch);
+                bool ownerOk = (rec.owner_instance_id == 0 || rec.owner_instance_id == req.session_id);
+                if (rec.status != 0 && rec.session_id == req.session_id && rec.context_id == req.context_id && epochOk && ownerOk) {
                     int disp = rec.final_disposition;
                     if (disp == 0) {
                         disp = (rec.status == 1)
@@ -645,78 +652,197 @@ void HandleClient(HANDLE hPipe) {
             if (req.event_id == 0 || reqDisp < 1 || reqDisp > 5 || !g_engine.GetRepo()) {
                 resp.handled = 0;
             } else {
-                int effectiveDisp = static_cast<int>(reqDisp);
+                uint64_t expectedInputGen = req.candidate_version;
+                uint64_t encodedOwner = (static_cast<uint64_t>(req.scan_code) << 32) | static_cast<uint64_t>(req.vk_code);
+                uint64_t expectedOwnerId = (encodedOwner != 0) ? encodedOwner : req.session_id;
+
                 std::unique_lock<std::mutex> lock(g_pendingMutex);
-                auto it = g_pendingCommits.find(req.event_id);
-                ServerPendingCommit pc;
-                bool hadPending = false;
-                if (it != g_pendingCommits.end()) {
-                    if (it->second.session_id != req.session_id || it->second.context_id != req.context_id) {
-                        resp.handled = 0;
-                        resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
-                        WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
-                        FlushFileBuffers(hPipe);
-                        continue;
+
+                // Step 1: Check already finalized events FIRST (memory cache, then DB) so retries like CancelRestore are idempotent
+                bool hasCompleted = false;
+                CompletedCommitInfo completedInfo{};
+                auto cit = g_completedEvents.find(req.event_id);
+                if (cit != g_completedEvents.end()) {
+                    hasCompleted = true;
+                    completedInfo = cit->second;
+                } else {
+                    lock.unlock();
+                    auto rec = g_engine.GetRepo()->GetCommitEventRecord(std::to_string(req.event_id));
+                    lock.lock();
+                    if (rec.status != 0) {
+                        hasCompleted = true;
+                        completedInfo.session_id = rec.session_id;
+                        completedInfo.context_id = rec.context_id;
+                        completedInfo.state = (rec.status == 1) ? CommitState::Recorded : CommitState::Cancelled;
+                        completedInfo.final_disposition = rec.final_disposition;
+                        if (completedInfo.final_disposition == 0) {
+                            completedInfo.final_disposition = (rec.status == 1)
+                                ? static_cast<int>(IpcCommitDisposition::ConfirmedWritten)
+                                : static_cast<int>(IpcCommitDisposition::CancelDiscard);
+                        }
+                        completedInfo.context_epoch = rec.context_epoch;
+                        completedInfo.owner_instance_id = rec.owner_instance_id;
+                        g_completedEvents[req.event_id] = completedInfo;
+                        if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {
+                            g_completedEvents.erase(g_completedEvents.begin());
+                        }
                     }
-                    pc = it->second;
-                    hadPending = true;
                 }
 
-                // Atomically downgrade CancelRestore -> CancelDiscard when preconditions fail
+                if (hasCompleted) {
+                    bool ownerMatch = (completedInfo.session_id == req.session_id &&
+                                       completedInfo.context_id == req.context_id &&
+                                       (completedInfo.owner_instance_id == 0 || completedInfo.owner_instance_id == expectedOwnerId) &&
+                                       (completedInfo.context_epoch == 0 || req.context_epoch == 0 || completedInfo.context_epoch == req.context_epoch));
+                    int existingDisp = completedInfo.final_disposition;
+                    if (existingDisp == 0) {
+                        existingDisp = (completedInfo.state == CommitState::Recorded)
+                            ? static_cast<int>(IpcCommitDisposition::ConfirmedWritten)
+                            : static_cast<int>(IpcCommitDisposition::CancelDiscard);
+                    }
+                    if (!ownerMatch || existingDisp != static_cast<int>(reqDisp)) {
+                        resp.handled = 0;
+                        resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                        resp.commit_event_id = req.event_id;
+                        resp.commit_length = static_cast<uint32_t>(existingDisp);
+                    } else {
+                        resp.commit_event_id = req.event_id;
+                        resp.commit_length = static_cast<uint32_t>(existingDisp);
+                        resp.handled = 1;
+                    }
+                    WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
+                    FlushFileBuffers(hPipe);
+                    continue;
+                }
+
+                // Step 2: Must have a valid pending snapshot; reject unknown events
+                auto it = g_pendingCommits.find(req.event_id);
+                if (it == g_pendingCommits.end()) {
+                    resp.handled = 0;
+                    WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
+                    FlushFileBuffers(hPipe);
+                    continue;
+                }
+
+                ServerPendingCommit pc = it->second;
+                if (pc.session_id != req.session_id ||
+                    pc.context_id != req.context_id ||
+                    (pc.owner_instance_id != 0 && pc.owner_instance_id != expectedOwnerId) ||
+                    (pc.context_epoch != 0 && req.context_epoch != 0 && pc.context_epoch != req.context_epoch) ||
+                    (expectedInputGen != 0 && pc.generation != 0 && pc.generation != expectedInputGen)) {
+                    resp.handled = 0;
+                    resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                    WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
+                    FlushFileBuffers(hPipe);
+                    continue;
+                }
+
+                if (pc.state == CommitState::Committing || pc.state == CommitState::Recorded) {
+                    resp.handled = 0;
+                    WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
+                    FlushFileBuffers(hPipe);
+                    continue;
+                }
+
+                int effectiveDisp = static_cast<int>(reqDisp);
                 if (reqDisp == static_cast<uint32_t>(IpcCommitDisposition::CancelRestore)) {
-                    if (!hadPending ||
+                    if (pc.connection_epoch == 0 ||
                         state.connection_epoch != pc.connection_epoch ||
                         state.input_generation != pc.generation ||
                         !state.composition.empty()) {
                         effectiveDisp = static_cast<int>(IpcCommitDisposition::CancelDiscard);
                     }
                 }
+
+                it->second.state = CommitState::Committing;
                 lock.unlock();
 
                 int outFinalDisp = 0;
                 bool outConflict = false;
-                bool ok = g_engine.GetRepo()->FinalizeTerminalCommitEvent(
-                    std::to_string(req.event_id),
-                    req.session_id,
-                    req.context_id,
-                    effectiveDisp,
-                    outFinalDisp,
-                    outConflict
-                );
+                bool ok = false;
 
-                lock.lock();
-                if (outConflict) {
-                    resp.handled = 0;
-                    resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
-                    resp.commit_event_id = req.event_id;
-                    resp.commit_length = static_cast<uint32_t>(outFinalDisp);
-                } else if (!ok) {
-                    resp.handled = 0;
-                } else {
-                    g_pendingCommits.erase(req.event_id);
-                    CommitState cState = (outFinalDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten))
-                        ? CommitState::Recorded
-                        : CommitState::Cancelled;
-                    g_completedEvents[req.event_id] = { req.session_id, req.context_id, cState };
-                    if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {
-                        g_completedEvents.erase(g_completedEvents.begin());
-                    }
-
-                    // Only ConfirmedWritten records learning, and only once when transitioning from pending
-                    if (hadPending && outFinalDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten) && g_engine.GetCoordinator()) {
-                        lock.unlock();
-                        bool learnOn = pc.policy_snapshot ? pc.policy_snapshot->learning_enabled : true;
-                        if (learnOn) {
-                            g_engine.GetCoordinator()->CommitCandidate(
+                if (effectiveDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten)) {
+                    ok = g_engine.GetRepo()->RunInTransaction([&]() {
+                        bool commitOk = false;
+                        if (g_engine.GetCoordinator()) {
+                            commitOk = g_engine.GetCoordinator()->CommitCandidate(
                                 pc.candidate,
                                 std::to_string(req.event_id),
                                 req.session_id,
                                 req.context_id,
                                 pc.policy_snapshot
                             );
+                        } else {
+                            commitOk = g_engine.CommitCandidate(
+                                std::to_string(req.event_id),
+                                req.session_id,
+                                req.context_id,
+                                pc.scheme,
+                                pc.query_code,
+                                pc.entry_id
+                            );
                         }
-                        lock.lock();
-                    } else if (outFinalDisp == static_cast<int>(IpcCommitDisposition::CancelRestore) && hadPending) {
+                        if (!commitOk) return false;
+                        return g_engine.GetRepo()->UpdateCommitEventTerminalMetadata(
+                            std::to_string(req.event_id),
+                            static_cast<int>(IpcCommitDisposition::ConfirmedWritten),
+                            pc.context_epoch != 0 ? pc.context_epoch : req.context_epoch,
+                            pc.generation,
+                            pc.owner_instance_id != 0 ? pc.owner_instance_id : expectedOwnerId
+                        );
+                    });
+                    if (ok) {
+                        outFinalDisp = static_cast<int>(IpcCommitDisposition::ConfirmedWritten);
+                    }
+                } else {
+                    ok = g_engine.GetRepo()->FinalizeTerminalCommitEvent(
+                        std::to_string(req.event_id),
+                        req.session_id,
+                        req.context_id,
+                        effectiveDisp,
+                        outFinalDisp,
+                        outConflict,
+                        req.context_epoch,
+                        expectedInputGen,
+                        expectedOwnerId
+                    );
+                }
+
+                lock.lock();
+                auto itAfter = g_pendingCommits.find(req.event_id);
+                if (outConflict) {
+                    if (itAfter != g_pendingCommits.end()) {
+                        itAfter->second.state = CommitState::Pending;
+                    }
+                    resp.handled = 0;
+                    resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                    resp.commit_event_id = req.event_id;
+                    resp.commit_length = static_cast<uint32_t>(outFinalDisp);
+                } else if (!ok) {
+                    if (itAfter != g_pendingCommits.end()) {
+                        itAfter->second.state = CommitState::Pending;
+                    }
+                    resp.handled = 0;
+                } else {
+                    if (itAfter != g_pendingCommits.end()) {
+                        g_pendingCommits.erase(itAfter);
+                    }
+                    CommitState cState = (outFinalDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten))
+                        ? CommitState::Recorded
+                        : CommitState::Cancelled;
+                    g_completedEvents[req.event_id] = {
+                        req.session_id,
+                        req.context_id,
+                        cState,
+                        outFinalDisp,
+                        pc.context_epoch != 0 ? pc.context_epoch : req.context_epoch,
+                        pc.owner_instance_id != 0 ? pc.owner_instance_id : expectedOwnerId
+                    };
+                    if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {
+                        g_completedEvents.erase(g_completedEvents.begin());
+                    }
+
+                    if (outFinalDisp == static_cast<int>(IpcCommitDisposition::CancelRestore)) {
                         state.composition = pc.composition_before_commit;
                         state.current_page = pc.page_before_commit;
                         PopulateCandidates(state, resp);
@@ -1293,6 +1419,7 @@ void HandleClient(HANDLE hPipe) {
                                 uint64_t evId = NextEventId();
 
                                 bool learningOn = state.policy_snapshot ? state.policy_snapshot->learning_enabled : true;
+                                uint64_t nextGen = state.input_generation + 1;
                                 bool saved = g_engine.SavePendingCommit(
                                     std::to_string(evId),
                                     req.session_id,
@@ -1304,7 +1431,10 @@ void HandleClient(HANDLE hPipe) {
                                     learningOn,
                                     cand.layout_id,
                                     cand.matched_code,
-                                    cand.resolved_code
+                                    cand.resolved_code,
+                                    req.context_epoch,
+                                    nextGen,
+                                    req.session_id
                                 );
 
                                 if (!saved) {
@@ -1322,6 +1452,8 @@ void HandleClient(HANDLE hPipe) {
                                     pc.context_id = req.context_id;
                                     pc.connection_epoch = state.connection_epoch;
                                     pc.generation = state.input_generation;
+                                    pc.context_epoch = req.context_epoch;
+                                    pc.owner_instance_id = req.session_id;
                                     pc.candidate = cand;
                                     pc.scheme = cand.scheme;
                                     pc.query_code = state.current_query_code;
@@ -1375,6 +1507,7 @@ void HandleClient(HANDLE hPipe) {
                                     uint64_t evId = NextEventId();
 
                                     bool learningOn = state.policy_snapshot ? state.policy_snapshot->learning_enabled : true;
+                                    uint64_t nextGen = state.input_generation + 1;
                                     bool saved = g_engine.SavePendingCommit(
                                         std::to_string(evId),
                                         req.session_id,
@@ -1386,7 +1519,10 @@ void HandleClient(HANDLE hPipe) {
                                         learningOn,
                                         cand.layout_id,
                                         cand.matched_code,
-                                        cand.resolved_code
+                                        cand.resolved_code,
+                                        req.context_epoch,
+                                        nextGen,
+                                        req.session_id
                                     );
 
                                     if (!saved) {
@@ -1403,6 +1539,8 @@ void HandleClient(HANDLE hPipe) {
                                         pc.context_id = req.context_id;
                                         pc.connection_epoch = state.connection_epoch;
                                         pc.generation = state.input_generation;
+                                        pc.context_epoch = req.context_epoch;
+                                        pc.owner_instance_id = req.session_id;
                                         pc.candidate = cand;
                                         pc.scheme = cand.scheme;
                                         pc.query_code = state.current_query_code;
@@ -1552,7 +1690,18 @@ void HandleClient(HANDLE hPipe) {
             }
         }
 
-        resp.status_flags = ComputeModeFlags(state);
+        uint32_t preservedStageFlags = resp.status_flags & (
+            IPC_STATUS_STAGE7_CAPABLE |
+            IPC_STATUS_CONFLICT_ERROR |
+            IPC_STATUS_HAS_QUERY_CODE |
+            IPC_STATUS_TRUNCATED |
+            IPC_STATUS_ERROR
+        );
+        resp.status_flags = ComputeModeFlags(state) | preservedStageFlags;
+        if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
+            req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
+            resp.status_flags |= IPC_STATUS_STAGE7_CAPABLE;
+        }
         WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
         FlushFileBuffers(hPipe);
     }
@@ -1627,12 +1776,15 @@ int main(int argc, char* argv[]) {
 
     std::string overrideDb;
     std::string overrideDict;
+    std::string overridePipe;
     std::string overrideAdminPipe;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             overrideDb = argv[++i];
         } else if (strcmp(argv[i], "--dict") == 0 && i + 1 < argc) {
             overrideDict = argv[++i];
+        } else if (strcmp(argv[i], "--pipe") == 0 && i + 1 < argc) {
+            overridePipe = argv[++i];
         } else if (strcmp(argv[i], "--admin-pipe") == 0 && i + 1 < argc) {
             overrideAdminPipe = argv[++i];
         }
@@ -1672,7 +1824,9 @@ int main(int argc, char* argv[]) {
             pc.session_id = rec.session_id;
             pc.context_id = rec.context_id;
             pc.connection_epoch = 0; // Restoration connection epoch 0 ensures old cancel doesn't restore stale composition
-            pc.generation = 0;
+            pc.generation = rec.input_generation;
+            pc.context_epoch = rec.context_epoch;
+            pc.owner_instance_id = rec.owner_instance_id;
             pc.scheme = rec.scheme;
             pc.query_code = rec.query_code;
             pc.entry_id = rec.entry_id;
@@ -1700,7 +1854,11 @@ int main(int argc, char* argv[]) {
         }
     }
     std::wcout << L"[ime-service] Restored " << loadedPending.size() << L" uncompleted pending commits from database.\n";
-    std::wcout << L"[ime-service] Pipe Name: " << IME_PIPE_NAME << L"\n";
+    std::wstring pipeName = overridePipe.empty() ? IME_PIPE_NAME : ime::Utf8ToWide(overridePipe);
+    if (!pipeName.starts_with(L"\\\\.\\pipe\\")) {
+        pipeName = L"\\\\.\\pipe\\" + pipeName;
+    }
+    std::wcout << L"[ime-service] Pipe Name: " << pipeName << L"\n";
 
     // Start Stage 4B Admin Named Pipe Server
     std::wstring adminPipeName = overrideAdminPipe.empty() ? IME_ADMIN_PIPE_NAME : ime::Utf8ToWide(overrideAdminPipe);
@@ -1765,7 +1923,7 @@ int main(int argc, char* argv[]) {
 
     while (!g_serviceStopping.load() && WaitForSingleObject(g_hServiceStopEvent, 0) != WAIT_OBJECT_0) {
         HANDLE hPipe = CreateNamedPipeW(
-            IME_PIPE_NAME,
+            pipeName.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
