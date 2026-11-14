@@ -246,6 +246,8 @@ void IpcClient::Disconnect() {
         CloseHandle(m_hPipe);
         m_hPipe = INVALID_HANDLE_VALUE;
     }
+    m_stage7Capable = false;
+    m_stage7Negotiated = false;
 }
 
 void IpcClient::ResetContext(uint64_t sessionId, uint64_t contextId) {
@@ -361,13 +363,21 @@ bool IpcClient::NegotiateStage7Capability(uint64_t sessionId) {
     req.session_id = sessionId;
     req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
     IpcKeyResponse resp{};
-    if (SendRequest(req, resp, 50) && resp.handled == 1 &&
-        (resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
-        m_stage7Capable = true;
-        return true;
+    if (SendRequest(req, resp, 50)) {
+        m_stage7Negotiated = true;
+        if (resp.handled == 1 && (resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
+            m_stage7Capable = true;
+            return true;
+        }
+        m_stage7Capable = false;
+        return false;
     }
     m_stage7Capable = false;
     return false;
+}
+
+uint32_t IpcClient::GetPreferredProtocolVersion(uint64_t /*sessionId*/) {
+    return m_stage7Capable ? IPC_PROTOCOL_VERSION_STAGE7 : IPC_PROTOCOL_VERSION_STAGE3;
 }
 
 bool IpcClient::SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion, uint32_t updateMask) {
@@ -621,6 +631,10 @@ bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWOR
     }
 
     resp = op->recvBuf;
+    if ((resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
+        m_stage7Capable = true;
+        m_stage7Negotiated = true;
+    }
     op->inProgress.store(false);
     op->Release();
     return true;

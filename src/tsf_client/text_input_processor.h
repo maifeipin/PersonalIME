@@ -268,6 +268,13 @@ public:
     bool HasQueuedEditSession(uint64_t contextId) const;
     bool IsEditSessionUiSuppressed(uint64_t contextId, uint64_t generation) const;
     bool ShouldTerminateAfterEdit(uint64_t contextId, uint64_t generation) const;
+    bool IsCompositionlessCommitTargetValid(
+        uint64_t contextId,
+        ITfContext* pContext,
+        uint64_t editGeneration,
+        uint64_t expectedEpoch,
+        uint64_t expectedInputGen,
+        CandidateWindowMode expectedMode) const;
     bool CanShowCandidateWindow(uint64_t contextId, uint64_t generation) const;
     void HideCandidateWindowIfOwnedBy(uint64_t contextId);
     void SuppressQueuedEditSessionsForContext(uint64_t contextId, bool terminateAfter);
@@ -279,6 +286,7 @@ public:
 
     CCandidateWindow& GetCandidateWindowForTest() { return m_candidateWindow; }
     uint64_t GetSessionIdForTest() const { return m_sessionId; }
+    bool NegotiateStage7ForTest() { return m_ipcClient.NegotiateStage7Capability(m_sessionId); }
 
     using PluginQueryOverrideFunc = std::function<bool(std::vector<CandidatePluginItem>& outPlugins, bool* outTruncated, uint32_t* outRevision)>;
     using PluginExecuteOverrideFunc = std::function<bool(uint32_t pluginId, uint32_t* outExecStatus)>;

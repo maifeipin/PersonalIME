@@ -422,11 +422,7 @@ void HandleClient(HANDLE hPipe) {
         resp.session_id = req.session_id;
         resp.context_id = req.context_id;
         resp.protocol_version = req.protocol_version;
-        resp.status_flags = ComputeModeFlags(state);
-        if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
-            req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
-            resp.status_flags |= IPC_STATUS_STAGE7_CAPABLE;
-        }
+        resp.status_flags = ComputeModeFlags(state) | IPC_STATUS_STAGE7_CAPABLE;
 
         // Strict protocol version validation (accept Stage 3, Stage 4, and Stage 7)
         if (req.protocol_version != IPC_PROTOCOL_VERSION_STAGE3 &&

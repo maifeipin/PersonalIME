@@ -229,6 +229,8 @@ public:
 static bool g_failSetText = false;
 static bool g_failEndComposition = false;
 static bool g_failSetSelection = false;
+static bool g_failCollapse = false;
+static HRESULT g_collapseFailHr = E_ABORT;
 static std::wstring g_lastCommittedText = L"";
 
 class MockContext;
@@ -279,7 +281,10 @@ public:
     STDMETHODIMP ShiftStartRegion(TfEditCookie ec, TfShiftDir dir, BOOL *pfNoRegion) override { return E_NOTIMPL; }
     STDMETHODIMP ShiftEndRegion(TfEditCookie ec, TfShiftDir dir, BOOL *pfNoRegion) override { return E_NOTIMPL; }
     STDMETHODIMP IsEmpty(TfEditCookie ec, BOOL *pfEmpty) override { return E_NOTIMPL; }
-    STDMETHODIMP Collapse(TfEditCookie ec, TfAnchor aPos) override { return S_OK; }
+    STDMETHODIMP Collapse(TfEditCookie ec, TfAnchor aPos) override {
+        if (g_failCollapse) return g_collapseFailHr;
+        return S_OK;
+    }
     STDMETHODIMP IsEqualStart(TfEditCookie ec, ITfRange *pWith, TfAnchor aPos, BOOL *pfEqual) override { return E_NOTIMPL; }
     STDMETHODIMP IsEqualEnd(TfEditCookie ec, ITfRange *pWith, TfAnchor aPos, BOOL *pfEqual) override { return E_NOTIMPL; }
     STDMETHODIMP CompareStart(TfEditCookie ec, ITfRange *pWith, TfAnchor aPos, LONG *plResult) override { return E_NOTIMPL; }
@@ -347,8 +352,8 @@ private:
     LONG m_cRef = 1;
 };
 
-// 3. Mock ITfContext and ITfContextComposition
-class MockContext : public ITfContext, public ITfContextComposition {
+// 3. Mock ITfContext, ITfContextComposition, and ITfInsertAtSelection
+class MockContext : public ITfContext, public ITfContextComposition, public ITfInsertAtSelection {
 public:
     MockContext() : m_cRef(1) {}
     virtual ~MockContext() {
@@ -366,6 +371,7 @@ public:
     bool m_failAsyncRequest = false;
     bool m_deferAsyncSession = false;
     bool m_failStartComposition = false;
+    bool m_failGetSelection = false;
     HRESULT m_startCompositionHr = E_FAIL;
     DWORD m_dynamicStatusFlags = 0;
     int m_editSessionRequestCount = 0;
@@ -389,6 +395,10 @@ public:
             return S_OK;
         } else if (IsEqualIID(riid, IID_ITfContextComposition)) {
             *ppvObj = static_cast<ITfContextComposition*>(this);
+            AddRef();
+            return S_OK;
+        } else if (IsEqualIID(riid, IID_ITfInsertAtSelection)) {
+            *ppvObj = static_cast<ITfInsertAtSelection*>(this);
             AddRef();
             return S_OK;
         }
@@ -437,6 +447,10 @@ public:
 
     STDMETHODIMP GetSelection(TfEditCookie ec, ULONG ulIndex, ULONG ulCount, TF_SELECTION* pSelection, ULONG* pcFetched) override {
         if (!pSelection || !pcFetched) return E_POINTER;
+        if (m_failGetSelection) {
+            *pcFetched = 0;
+            return E_FAIL;
+        }
         pSelection[0].range = new MockRange();
         pSelection[0].style.ase = TF_AE_NONE;
         pSelection[0].style.fInterimChar = FALSE;
@@ -482,6 +496,25 @@ public:
     STDMETHODIMP EnumCompositions(IEnumITfCompositionView** ppEnum) override { return E_NOTIMPL; }
     STDMETHODIMP FindComposition(TfEditCookie ecRead, ITfRange *pTestRange, IEnumITfCompositionView **ppEnum) override { return E_NOTIMPL; }
     STDMETHODIMP TakeOwnership(TfEditCookie ecWrite, ITfCompositionView *pComposition, ITfCompositionSink *pSink, ITfComposition** ppComposition) override { return E_NOTIMPL; }
+
+    // ITfInsertAtSelection methods
+    STDMETHODIMP InsertTextAtSelection(TfEditCookie ec, DWORD dwFlags, const WCHAR* pchText, LONG cch, ITfRange** ppRange) override {
+        if (g_failSetText) return E_FAIL;
+        auto* rng = new MockRange();
+        rng->m_text = (pchText && cch > 0) ? std::wstring(pchText, cch) : L"";
+        g_lastCommittedText = rng->m_text;
+        m_activeCompRange = rng->m_text;
+        if (ppRange) {
+            *ppRange = rng;
+        } else {
+            rng->Release();
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP InsertEmbeddedAtSelection(TfEditCookie ec, DWORD dwFlags, IDataObject* pDataObject, ITfRange** ppRange) override {
+        return E_NOTIMPL;
+    }
 
     MockComposition* m_lastCreatedComposition = nullptr;
     LONG m_cRef = 1;
@@ -1320,6 +1353,9 @@ public:
     std::atomic<int> m_resetCount{0};
     std::atomic<uint32_t> m_lastSelectVersion{0};
     std::atomic<uint32_t> m_pluginsRevTag{0}; // If > 0, sets IPC_STATUS_HAS_PLUGINS_REV in status_flags
+    std::atomic<bool> m_advertiseStage7{false};
+    std::atomic<bool> m_rejectStage7KeyDown{false};
+    std::atomic<uint32_t> m_lastKeyDownProtocol{0};
     std::wstring m_lastSelectedText;
 
     SnapshotMockIpcServer(const std::wstring& pipeName) : m_pipeName(pipeName) {
@@ -1450,10 +1486,21 @@ public:
                 if (pRev > 0) {
                     resp.status_flags |= IPC_STATUS_HAS_PLUGINS_REV | ((pRev & 0xFFu) << IPC_PLUGINS_REV_SHIFT);
                 }
+                if (pThis->m_advertiseStage7.load() &&
+                    (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
+                     req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping))) {
+                    resp.status_flags |= IPC_STATUS_STAGE7_CAPABLE;
+                }
 
                 EnterCriticalSection(&pThis->m_cs);
                 auto& st = pThis->m_ctxStates[req.context_id];
                 if (req.msg_type == static_cast<uint32_t>(IpcMsgType::KeyDown)) {
+                    pThis->m_lastKeyDownProtocol.store(req.protocol_version);
+                    if (pThis->m_rejectStage7KeyDown.load() &&
+                        req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
+                        resp.status_flags &= ~IPC_STATUS_STAGE7_CAPABLE;
+                        resp.handled = 0;
+                    } else {
                     uint32_t vk = req.vk_code;
                     if (vk >= 'A' && vk <= 'Z') {
                         st.prev_composition = st.composition;
@@ -1471,6 +1518,11 @@ public:
                             st.candidates = { L"华", L"花", L"化" };
                         }
                         FillCandidates(resp, st);
+                        if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
+                            resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+                            wcsncpy_s(resp.commit_text, L"da'jia", _TRUNCATE);
+                            resp.commit_length = 0;
+                        }
                     } else if (vk == VK_NEXT) {
                         if (req.candidate_version != st.candidate_version) {
                             resp.handled = 0;
@@ -1551,6 +1603,7 @@ public:
                                 resp.handled = 0;
                             }
                         }
+                    }
                     }
                 } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitSuccess)) {
                     auto it = pThis->m_pendingCommits.find(req.event_id);
@@ -2202,6 +2255,124 @@ int TestStage71bCompositionlessAndDisplayAttributes() {
     return 0;
 }
 
+// Test 20: Stage 7.1b Review Fixes:
+// 1. Async compositionless commit -> unfocus/caret change -> deferred DoEditSession -> Unmodified + no write + CommitCancel
+// 2. Stage 7 capability negotiation & segmented query_code delivery + legacy fallback
+// 3. Collapse failure on GetSelection & InsertTextAtSelection -> PartiallyModified with exact HRESULT
+int TestStage71bReviewFixes() {
+    std::wcout << L"[TEST 20] Testing Stage 7.1b Review Fixes (Async Compositionless Unfocus Guard, Stage 7 QueryCode Negotiation, Collapse Failure)..." << std::endl;
+
+    const std::wstring testPipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_T20_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(testPipeName);
+    server.m_advertiseStage7.store(true);
+    CHECK_TRUE(server.Start(3), L"Snapshot mock server must start");
+    IpcClient::SetPipeNameForTest(testPipeName.c_str());
+
+    // 1. Stage 7 capability negotiation -> KeyDown uses IPC_PROTOCOL_VERSION_STAGE7 and delivers query_code "da'jia"
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7ForTest must succeed when server advertises Stage 7");
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_startCompositionHr = E_FAIL;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'A' eaten");
+        CHECK_EQUAL(server.m_lastKeyDownProtocol.load(), IPC_PROTOCOL_VERSION_STAGE7, L"KeyDown negotiated IPC_PROTOCOL_VERSION_STAGE7");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetSnapshot().query_code, std::wstring(L"da'jia"), L"Snapshot carries segmented query_code from Stage 7 server");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"da'jia [工]"), L"Header renders segmented query_code + preview");
+
+        // 2. Async compositionless commit -> OnSetFocus(FALSE) -> deferred DoEditSession executes:
+        //    MUST NOT write into old context's GetSelection, MUST return Unmodified & send CommitCancel!
+        ctx.m_activeCompRange = L"new_caret_untouched";
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+
+        int successBefore = server.m_commitSuccessCount.load();
+        int cancelBefore = server.m_commitCancelCount.load();
+        int learnedBefore = server.m_learnedCount.load();
+
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async compositionless commit queued");
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 1, L"1 queued EditSession");
+
+        // Focus lost before deferred EditSession runs!
+        tip.OnSetFocus(FALSE);
+        CHECK_EQUAL(ctx.m_activeCompRange, std::wstring(L"new_caret_untouched"), L"Host untouched on unfocus");
+
+        // Now deferred EditSession executes on old context
+        ctx.m_forceSyncBlocked = false;
+        ctx.m_deferAsyncSession = false;
+        ctx.ExecuteDeferredSession();
+
+        CHECK_EQUAL(ctx.m_activeCompRange, std::wstring(L"new_caret_untouched"), L"Deferred compositionless commit after unfocus MUST NOT write to host GetSelection!");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"Deferred compositionless commit after unfocus MUST NOT confirm CommitSuccess!");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"Deferred compositionless commit after unfocus MUST NOT learn!");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"Deferred compositionless commit after unfocus MUST send CommitCancel!");
+
+        tip.Deactivate();
+    }
+
+    // 3. Legacy server fallback: if server rejects IPC_PROTOCOL_VERSION_STAGE7 KeyDown, client falls back to STAGE3
+    {
+        server.m_rejectStage7KeyDown.store(true);
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        tip.NegotiateStage7ForTest();
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Legacy fallback KeyDown succeeded and ate key");
+        CHECK_EQUAL(server.m_lastKeyDownProtocol.load(), IPC_PROTOCOL_VERSION_STAGE3, L"Client fell back to IPC_PROTOCOL_VERSION_STAGE3");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetSnapshot().query_code, std::wstring(L""), L"Legacy server returns no query_code");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"a [工]"), L"Header falls back to raw_input 'a [工]'");
+
+        tip.Deactivate();
+        server.m_rejectStage7KeyDown.store(false);
+    }
+
+    // 4. Collapse failure on GetSelection + SetText and ITfInsertAtSelection paths -> PartiallyModified with exact HRESULT
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+
+        g_failCollapse = true;
+        g_collapseFailHr = E_ABORT;
+
+        // 4a. GetSelection + SetText + Collapse failure
+        {
+            CEditSession session(&tip, &ctx, nullptr, false, L"", true, L"大家", {});
+            HRESULT hr = session.DoEditSession(1);
+            CHECK_EQUAL(hr, E_ABORT, L"GetSelection Collapse failure preserves exact HRESULT E_ABORT");
+            CHECK_TRUE(session.GetResult() == EditSessionResult::PartiallyModified, L"GetSelection Collapse failure must return PartiallyModified");
+        }
+
+        // 4b. ITfInsertAtSelection + Collapse failure
+        {
+            ctx.m_failGetSelection = true;
+            CEditSession session(&tip, &ctx, nullptr, false, L"", true, L"测试", {});
+            HRESULT hr = session.DoEditSession(1);
+            ctx.m_failGetSelection = false;
+            CHECK_EQUAL(hr, E_ABORT, L"InsertTextAtSelection Collapse failure preserves exact HRESULT E_ABORT");
+            CHECK_TRUE(session.GetResult() == EditSessionResult::PartiallyModified, L"InsertTextAtSelection Collapse failure must return PartiallyModified");
+        }
+
+        g_failCollapse = false;
+        tip.Deactivate();
+    }
+
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Stage 7.1b Review Fixes verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -2224,6 +2395,7 @@ int main() {
     if (TestSnapshotBoundMouseSelectionAndLatePaging() != 0) return 1;
     if (TestPluginSyncNonBlockingAndDisabledClickRejection() != 0) return 1;
     if (TestStage71bCompositionlessAndDisplayAttributes() != 0) return 1;
+    if (TestStage71bReviewFixes() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

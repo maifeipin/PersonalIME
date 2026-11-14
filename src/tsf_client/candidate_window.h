@@ -52,6 +52,7 @@ struct CandidateDisplaySnapshot {
     std::wstring raw_input;             // Raw keystrokes (e.g. "dajia")
     std::wstring query_code;            // Normalized/segmented code (e.g. "da'jia")
     std::wstring preview_text;          // Currently highlighted candidate preview text (e.g. "大家")
+    std::vector<std::wstring> candidate_core_texts; // Optional explicit core texts without index/hint
 };
 
 class CCandidateWindow {

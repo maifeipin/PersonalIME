@@ -432,6 +432,43 @@ bool CTextInputProcessor::ShouldTerminateAfterEdit(uint64_t contextId, uint64_t 
     return false;
 }
 
+bool CTextInputProcessor::IsCompositionlessCommitTargetValid(
+    uint64_t contextId,
+    ITfContext* pContext,
+    uint64_t editGeneration,
+    uint64_t expectedEpoch,
+    uint64_t expectedInputGen,
+    CandidateWindowMode expectedMode) const {
+    if (contextId == 0 || !pContext || m_isDeactivated || !m_hasFocus) {
+        return false;
+    }
+    if (editGeneration != 0) {
+        if (m_activeContextId != contextId) {
+            return false;
+        }
+        if (ShouldTerminateAfterEdit(contextId, editGeneration)) {
+            return false;
+        }
+    } else if (m_activeContextId != 0 && m_activeContextId != contextId) {
+        return false;
+    }
+    if (expectedEpoch != 0 && GetContextEpoch(contextId) != expectedEpoch) {
+        return false;
+    }
+    if (expectedInputGen != 0 && GetContextInputGeneration(contextId) != expectedInputGen) {
+        return false;
+    }
+    if (expectedMode == CandidateWindowMode::Compositionless) {
+        if (GetContextState(contextId) != CompositionState::CompositionlessComposing) {
+            return false;
+        }
+        if (!HasCompositionlessLease(contextId, pContext)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool CTextInputProcessor::CanShowCandidateWindow(uint64_t contextId, uint64_t generation) const {
     if (m_isDeactivated || !m_hasFocus || m_activeContextId != contextId) {
         return false;
@@ -873,6 +910,8 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
         pLangBarItemMgr->Release();
     }
 
+    m_ipcClient.NegotiateStage7Capability(m_sessionId);
+
     return S_OK;
 }
 
@@ -1071,10 +1110,19 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
     if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
-    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    req.protocol_version = m_ipcClient.GetPreferredProtocolVersion(m_sessionId);
 
     IpcKeyResponse resp{};
-    if (m_ipcClient.SendRequest(req, resp, 50)) {
+    bool sentOk = m_ipcClient.SendRequest(req, resp, 50);
+    if (sentOk && !resp.handled &&
+        req.protocol_version == IPC_PROTOCOL_VERSION_STAGE7 &&
+        (resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) == 0) {
+        m_ipcClient.MarkStage7Capable(false);
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+        resp = {};
+        sentOk = m_ipcClient.SendRequest(req, resp, 50);
+    }
+    if (sentOk) {
         *pfEaten = (resp.handled != 0) ? TRUE : FALSE;
     }
 
@@ -1354,7 +1402,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
     if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
-    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+    req.protocol_version = m_ipcClient.GetPreferredProtocolVersion(m_sessionId);
     if (isExplicitCandidateSelect) {
         req.mode_arg |= IPC_KEYDOWN_EXPLICIT_SELECT;
     }
@@ -1373,7 +1421,16 @@ bool CTextInputProcessor::ProcessKeyInternal(
     req.candidate_version = currentCandVer;
 
     IpcKeyResponse resp{};
-    if (m_ipcClient.SendRequest(req, resp, 80)) {
+    bool sentOk = m_ipcClient.SendRequest(req, resp, 80);
+    if (sentOk && !resp.handled &&
+        req.protocol_version == IPC_PROTOCOL_VERSION_STAGE7 &&
+        (resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) == 0) {
+        m_ipcClient.MarkStage7Capable(false);
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+        resp = {};
+        sentOk = m_ipcClient.SendRequest(req, resp, 80);
+    }
+    if (sentOk) {
         if (!resp.handled) {
             return false;
         }

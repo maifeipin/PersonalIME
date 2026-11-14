@@ -355,6 +355,10 @@ int main() {
         CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"1. 大家 [dw]"), std::wstring(L"大家"), L"ExtractCandidateCoreText strips index and reverse code");
         CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"2. 达伽马"), std::wstring(L"达伽马"), L"ExtractCandidateCoreText strips index without reverse code");
         CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"10. 测试词 [cs]"), std::wstring(L"测试词"), L"ExtractCandidateCoreText strips multi-digit index");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"1. foo[bar]"), std::wstring(L"foo[bar]"), L"ExtractCandidateCoreText preserves legitimate brackets inside candidate text");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"1. foo[bar] [fb]"), std::wstring(L"foo[bar]"), L"ExtractCandidateCoreText strips only trailing reverse code hint");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"2. [表情]"), std::wstring(L"[表情]"), L"ExtractCandidateCoreText preserves bracketed candidate text");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"3. 测试 [中文注释]"), std::wstring(L"测试 [中文注释]"), L"ExtractCandidateCoreText preserves non-ASCII trailing brackets");
 
         CCandidateWindow wnd;
         CHECK_EQ(wnd.GetPreeditDisplayMode() == PreeditDisplayMode::Always, true, L"Default PreeditDisplayMode is Always");

@@ -30,6 +30,8 @@ public:
                            IpcCommitDisposition& outFinalDisp, uint32_t expectedGeneration = 0);
     bool NegotiateStage7Capability(uint64_t sessionId);
     bool IsStage7Capable() const { return m_stage7Capable; }
+    void MarkStage7Capable(bool capable) { m_stage7Capable = capable; m_stage7Negotiated = true; }
+    uint32_t GetPreferredProtocolVersion(uint64_t sessionId);
     bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion = IPC_PROTOCOL_VERSION_STAGE3, uint32_t updateMask = 0);
     bool GetMode(uint64_t sessionId, uint64_t contextId, uint32_t& outModeFlags, ime::InputScheme& outScheme);
     bool SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme);
@@ -91,4 +93,5 @@ private:
 
     HANDLE m_hPipe = INVALID_HANDLE_VALUE;
     bool m_stage7Capable = false;
+    bool m_stage7Negotiated = false;
 };

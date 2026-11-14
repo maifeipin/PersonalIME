@@ -178,10 +178,29 @@ std::wstring CCandidateWindow::ExtractCandidateCoreText(const std::wstring& form
             s = s.substr(dotPos + 2);
         }
     }
-    // Strip trailing "[reverse_code]" auxiliary code hint
-    size_t bracketPos = s.find(L'[');
-    if (bracketPos != std::wstring::npos) {
-        s = s.substr(0, bracketPos);
+    // Strip trailing " [reverse_code]" auxiliary code hint only if it is a well-formed ASCII suffix at the end
+    if (s.size() >= 4 && s.back() == L']') {
+        size_t bracketPos = s.rfind(L" [");
+        if (bracketPos != std::wstring::npos && bracketPos > 0 && bracketPos + 2 < s.size() - 1) {
+            bool isValidHint = true;
+            for (size_t i = bracketPos + 2; i < s.size() - 1; ++i) {
+                wchar_t ch = s[i];
+                bool isAsciiHintChar =
+                    (ch >= L'a' && ch <= L'z') ||
+                    (ch >= L'A' && ch <= L'Z') ||
+                    (ch >= L'0' && ch <= L'9') ||
+                    ch == L'\'' || ch == L'-' || ch == L'/' ||
+                    ch == L',' || ch == L' ' || ch == L'*' ||
+                    ch == L'?' || ch == L'+' || ch == L';' || ch == L'.';
+                if (!isAsciiHintChar) {
+                    isValidHint = false;
+                    break;
+                }
+            }
+            if (isValidHint) {
+                s = s.substr(0, bracketPos);
+            }
+        }
     }
     while (!s.empty() && s.back() == L' ') {
         s.pop_back();
@@ -216,7 +235,12 @@ void CCandidateWindow::SetPreeditDisplayMode(PreeditDisplayMode mode) {
 
 void CCandidateWindow::UpdatePreviewTextFromSelection() {
     if (!m_candidates.empty() && m_selectedIndex >= 0 && m_selectedIndex < static_cast<int>(m_candidates.size())) {
-        m_snapshot.preview_text = ExtractCandidateCoreText(m_candidates[m_selectedIndex]);
+        if (static_cast<size_t>(m_selectedIndex) < m_snapshot.candidate_core_texts.size() &&
+            !m_snapshot.candidate_core_texts[m_selectedIndex].empty()) {
+            m_snapshot.preview_text = m_snapshot.candidate_core_texts[m_selectedIndex];
+        } else {
+            m_snapshot.preview_text = ExtractCandidateCoreText(m_candidates[m_selectedIndex]);
+        }
     } else {
         m_snapshot.preview_text.clear();
     }

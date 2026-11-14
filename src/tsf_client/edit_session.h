@@ -309,16 +309,17 @@ public:
 
                 HRESULT hrEndComp = pComp->EndComposition(ec);
 
-                if (FAILED(hrEndComp) || FAILED(hrSelection)) {
+                HRESULT hrTail = FAILED(hrEndComp) ? hrEndComp : (FAILED(hrCollapse) ? hrCollapse : hrSelection);
+                if (FAILED(hrTail)) {
                     m_result = EditSessionResult::PartiallyModified;
-                    m_finalHr = FAILED(hrEndComp) ? hrEndComp : hrSelection;
+                    m_finalHr = hrTail;
                     if (SUCCEEDED(hrEndComp)) {
                         m_pTip->SetComposition(nullptr, nullptr, CompositionState::None);
                     } else {
                         // Mark as CommitPendingEnd so next keystroke will NOT overwrite committed text!
                         m_pTip->SetCompositionState(CompositionState::CommitPendingEnd);
                     }
-                    return m_finalHr;
+                    return hrTail;
                 }
 
                 m_pTip->SetComposition(nullptr, nullptr, CompositionState::None);
@@ -327,6 +328,18 @@ public:
                 return S_OK;
             } else {
                 // Compositionless commit (or direct punctuation/English commit without active inline composition)
+                if (!m_pTip->IsCompositionlessCommitTargetValid(
+                        m_contextId,
+                        m_pContext,
+                        m_generation,
+                        m_snapshot.context_epoch,
+                        m_snapshot.input_generation,
+                        m_snapshot.mode)) {
+                    m_result = EditSessionResult::Unmodified;
+                    m_finalHr = E_ABORT;
+                    return E_ABORT;
+                }
+
                 if (m_pTip->GetPendingStatus(m_contextId) != CTextInputProcessor::PendingTerminationStatus::Succeeded ||
                     m_pTip->GetCompositionState(m_pContext) == CompositionState::CommitPendingEnd ||
                     m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined) {
@@ -349,12 +362,13 @@ public:
                         sel.range->Release();
                         m_pTip->ExitCompositionlessMode(m_contextId);
 
-                        if (FAILED(hrSelection)) {
-                            // Stage 7.1b: Compositionless commit wrote text, SetSelection failed ->
+                        HRESULT hrTail = FAILED(hrCollapse) ? hrCollapse : hrSelection;
+                        if (FAILED(hrTail)) {
+                            // Stage 7.1b: Compositionless commit wrote text, Collapse/SetSelection failed ->
                             // PartiallyModified, do NOT fabricate composition or set CommitPendingEnd!
                             m_result = EditSessionResult::PartiallyModified;
-                            m_finalHr = hrSelection;
-                            return hrSelection;
+                            m_finalHr = hrTail;
+                            return hrTail;
                         }
 
                         m_result = EditSessionResult::Success;
@@ -371,9 +385,11 @@ public:
                             ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()), &pInsertedRange);
                         pInsertAtSel->Release();
                         if (SUCCEEDED(hrIns)) {
+                            HRESULT hrCollapse = S_OK;
                             HRESULT hrSelection = S_OK;
                             if (pInsertedRange) {
-                                if (SUCCEEDED(pInsertedRange->Collapse(ec, TF_ANCHOR_END))) {
+                                hrCollapse = pInsertedRange->Collapse(ec, TF_ANCHOR_END);
+                                if (SUCCEEDED(hrCollapse)) {
                                     TF_SELECTION insSel{};
                                     insSel.range = pInsertedRange;
                                     insSel.style.ase = TF_AE_NONE;
@@ -383,10 +399,11 @@ public:
                                 pInsertedRange->Release();
                             }
                             m_pTip->ExitCompositionlessMode(m_contextId);
-                            if (FAILED(hrSelection)) {
+                            HRESULT hrTail = FAILED(hrCollapse) ? hrCollapse : hrSelection;
+                            if (FAILED(hrTail)) {
                                 m_result = EditSessionResult::PartiallyModified;
-                                m_finalHr = hrSelection;
-                                return hrSelection;
+                                m_finalHr = hrTail;
+                                return hrTail;
                             }
                             m_result = EditSessionResult::Success;
                             m_finalHr = S_OK;
