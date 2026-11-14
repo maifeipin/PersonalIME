@@ -1610,9 +1610,10 @@ public:
                             st.candidates = { L"版本 [beta]", L"测试 [alpha]" };
                         } else if (vk == 'L') {
                             st.page_count = 1;
-                            std::wstring longCore(64, L'汉');
-                            longCore += L" [beta]";
-                            st.candidates = { longCore, L"短词" };
+                            // 123 UTF-16 units (> 122 limit with "1. " prefix) alongside "版本 [beta]" on the same page
+                            std::wstring longCore(116, L'汉');
+                            longCore += L" [beta]"; // 116 + 7 = 123 UTF-16 units
+                            st.candidates = { longCore, L"版本 [beta]" };
                         } else {
                             st.page_count = 1;
                             st.candidates = { L"华", L"花", L"化" };
@@ -1627,6 +1628,8 @@ public:
                                 if (labelLen + 3 <= 128 && i < st.candidates.size()) {
                                     resp.candidates[i][labelLen + 1] = static_cast<wchar_t>(1 + st.candidates[i].length());
                                     resp.candidates[i][labelLen + 2] = L'\0';
+                                } else if (labelLen + 1 < 128) {
+                                    resp.candidates[i][labelLen + 1] = L'\0';
                                 }
                             }
                         }
@@ -2534,13 +2537,16 @@ int TestStage71bReviewFixes() {
         CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"da'jia [版本 [beta]]"), L"Preedit Header preserves '版本 [beta]' intact without stripping [beta]!");
 
         tip.OnKeyDown(&ctx, 'L', 0, &eaten);
-        CHECK_EQUAL(eaten, TRUE, L"Key 'L' eaten for long candidate");
-        std::wstring expectedLongCore(64, L'汉');
-        expectedLongCore += L" [beta]";
+        CHECK_EQUAL(eaten, TRUE, L"Key 'L' eaten for mixed 123-unit + '版本 [beta]' page");
+        std::wstring expectedLongCore(116, L'汉');
+        expectedLongCore += L" [beta]"; // 123 UTF-16 units
         const auto& snapLong = tip.GetCandidateWindowForTest().GetSnapshot();
-        CHECK_EQUAL(snapLong.candidate_core_texts.size(), size_t(2), L"Long candidate core_texts received");
-        CHECK_EQUAL(snapLong.candidate_core_texts[0], expectedLongCore, L"64-char + ' [beta]' core text preserved without fallback guessing");
-        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), L"da'jia [" + expectedLongCore + L"]", L"Preedit Header preserves long 64-char + ' [beta]' intact");
+        CHECK_EQUAL(snapLong.candidate_core_texts.size(), size_t(2), L"Mixed page core_texts received");
+        CHECK_EQUAL(snapLong.candidate_core_texts[0], expectedLongCore, L"123-unit candidate preserves [beta] without guessing");
+        CHECK_EQUAL(snapLong.candidate_core_texts[1], std::wstring(L"版本 [beta]"), L"Same-page '版本 [beta]' still keeps exact boundary!");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), L"da'jia [" + expectedLongCore + L"]", L"Preedit Header preserves 123-unit candidate");
+        tip.GetCandidateWindowForTest().SetSelectedIndex(1);
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"da'jia [版本 [beta]]"), L"Selecting '版本 [beta]' on same page preserves [beta] intact!");
 
         tip.Deactivate();
     }

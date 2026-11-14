@@ -221,7 +221,6 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
     }
     resp.candidate_count = count;
 
-    bool allCoresEncoded = (count > 0 && resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
     for (uint32_t i = 0; i < count; ++i) {
         const auto& cand = st.cached_coord_query.candidates[startIdx + i];
         std::wstring prefix = std::to_wstring(i + 1) + L". ";
@@ -237,17 +236,14 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
             if (coreFitsInLabel && labelLen + 3 <= kCandCap) {
                 resp.candidates[i][labelLen + 1] = static_cast<wchar_t>(1 + cand.text.length());
                 resp.candidates[i][labelLen + 2] = L'\0';
-            } else {
-                allCoresEncoded = false;
-                if (labelLen + 1 < kCandCap) {
-                    resp.candidates[i][labelLen + 1] = L'\0';
-                }
+            } else if (labelLen + 1 < kCandCap) {
+                resp.candidates[i][labelLen + 1] = L'\0';
             }
         }
     }
 
     if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
-        if (allCoresEncoded) {
+        if (count > 0) {
             resp.status_flags |= IPC_STATUS_HAS_CAND_CORES;
         }
         if (resp.has_commit == 0 && !st.cached_coord_query.candidates.empty()) {

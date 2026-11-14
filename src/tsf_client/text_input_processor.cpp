@@ -1521,26 +1521,31 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 snap.candidate_core_texts.reserve(cands.size());
                 for (uint32_t i = 0; i < resp.candidate_count && i < 9; ++i) {
                     size_t labelLen = wcsnlen(resp.candidates[i], kCandCap);
+                    size_t prefixLen = 0;
+                    size_t dotPos = cands[i].find(L". ");
+                    if (dotPos != std::wstring::npos && dotPos > 0 && dotPos <= 3) {
+                        bool allDigits = true;
+                        for (size_t d = 0; d < dotPos; ++d) {
+                            if (cands[i][d] < L'0' || cands[i][d] > L'9') {
+                                allDigits = false;
+                                break;
+                            }
+                        }
+                        if (allDigits) {
+                            prefixLen = dotPos + 2;
+                        }
+                    }
+
                     std::wstring core;
                     if (labelLen + 2 < kCandCap && resp.candidates[i][labelLen + 1] >= 1) {
                         size_t coreLen = static_cast<size_t>(resp.candidates[i][labelLen + 1] - 1);
-                        size_t prefixLen = 0;
-                        size_t dotPos = cands[i].find(L". ");
-                        if (dotPos != std::wstring::npos && dotPos > 0 && dotPos <= 3) {
-                            bool allDigits = true;
-                            for (size_t d = 0; d < dotPos; ++d) {
-                                if (cands[i][d] < L'0' || cands[i][d] > L'9') {
-                                    allDigits = false;
-                                    break;
-                                }
-                            }
-                            if (allDigits) {
-                                prefixLen = dotPos + 2;
-                            }
-                        }
                         if (prefixLen + coreLen <= cands[i].length()) {
                             core = cands[i].substr(prefixLen, coreLen);
                         }
+                    }
+                    if (core.empty() && prefixLen < cands[i].length()) {
+                        // Boundary metadata omitted due to item length: strip only index prefix, do NOT guess-strip [...]
+                        core = cands[i].substr(prefixLen);
                     }
                     snap.candidate_core_texts.push_back(std::move(core));
                 }
