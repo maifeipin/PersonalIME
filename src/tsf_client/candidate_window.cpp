@@ -230,10 +230,7 @@ void CCandidateWindow::InitDefaultPlugins() {
 void CCandidateWindow::SetPlugins(const std::vector<CandidatePluginItem>& plugins) {
     m_plugins = plugins;
     if ((!m_candidates.empty() || m_isHeaderVisible) && m_hWnd && IsWindow(m_hWnd) && IsWindowVisible(m_hWnd)) {
-        int savedSel = m_selectedIndex;
-        CandidateDisplaySnapshot snap = m_snapshot;
-        snap.initial_selected_index = savedSel;
-        Show(snap, m_lastShowPt);
+        RelayoutCurrent();
     }
 }
 
@@ -418,10 +415,7 @@ void CCandidateWindow::SetPreeditDisplayMode(PreeditDisplayMode mode) {
     if (m_preeditDisplayMode == mode) return;
     m_preeditDisplayMode = mode;
     if (m_hWnd && IsWindow(m_hWnd) && IsWindowVisible(m_hWnd)) {
-        int savedSel = m_selectedIndex;
-        CandidateDisplaySnapshot snap = m_snapshot;
-        snap.initial_selected_index = savedSel;
-        Show(snap, m_lastShowPt);
+        RelayoutCurrent();
     }
 }
 
@@ -510,6 +504,17 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     LayoutAndShow(snapshot, pt, 0, nullptr);
 }
 
+void CCandidateWindow::RelayoutCurrent() {
+    CandidateDisplaySnapshot snap = m_snapshot;
+    snap.initial_selected_index = m_selectedIndex;
+    if (m_hasDpiOverride) {
+        RECT suggested = { m_lastLayoutPos.x, m_lastLayoutPos.y, m_lastLayoutPos.x + 1, m_lastLayoutPos.y + 1 };
+        LayoutAndShow(snap, m_lastLayoutPos, m_dpi, &suggested);
+    } else {
+        Show(snap, m_lastShowPt);
+    }
+}
+
 void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, POINT anchorPt, UINT overrideDpi, const RECT* pSuggestedRect) {
     bool showHeader = ShouldShowPreeditHeader(snapshot, m_preeditDisplayMode);
     if (snapshot.candidates.empty() && !showHeader) {
@@ -528,8 +533,10 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
     m_snapshot = snapshot;
     if (overrideDpi >= 72) {
         m_dpi = overrideDpi;
+        m_hasDpiOverride = true;
     } else {
         m_lastShowPt = anchorPt;
+        m_hasDpiOverride = false;
         m_dpi = QueryDpiForPoint(anchorPt);
     }
     RebuildFontsForDpi(m_dpi);
@@ -770,6 +777,7 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
     if (x + totalWidth > mi.rcWork.right) x = (std::max)(static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.right) - totalWidth);
     if (y + totalHeight > mi.rcWork.bottom) y = (std::max)(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom) - totalHeight);
 
+    m_lastLayoutPos = { x, y };
     ApplyWindowRounding(totalWidth, totalHeight);
 
     SetWindowPos(

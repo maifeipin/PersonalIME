@@ -154,6 +154,7 @@ public:
 private:
     bool EnsureWindow();
     void LayoutAndShow(const CandidateDisplaySnapshot& snapshot, POINT anchorPt, UINT overrideDpi, const RECT* pSuggestedRect);
+    void RelayoutCurrent();
     void InitDefaultPlugins();
     void RebuildFontsForDpi(UINT dpi);
     UINT QueryDpiForPoint(POINT pt) const;
@@ -173,6 +174,8 @@ private:
     bool m_usingNativeRounding = false;
     CandidateDisplaySnapshot m_snapshot;
     POINT m_lastShowPt{0, 0};
+    POINT m_lastLayoutPos{0, 0};
+    bool m_hasDpiOverride = false;
     std::vector<std::wstring> m_candidates;
     std::vector<RECT> m_candidateRects;
     int m_selectedIndex = 0;

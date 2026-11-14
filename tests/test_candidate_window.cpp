@@ -599,10 +599,10 @@ int main() {
         GetWindowRect(hWnd, &beforeDpiRc);
         UINT targetDpi = (initialDpi == 144) ? 192 : 144;
         RECT suggestedRc = {
-            mi.rcWork.left + 80,
-            mi.rcWork.top + 90,
-            mi.rcWork.left + 80 + (beforeDpiRc.right - beforeDpiRc.left) * 2,
-            mi.rcWork.top + 90 + (beforeDpiRc.bottom - beforeDpiRc.top) * 2
+            mi.rcWork.left + 280,
+            mi.rcWork.top + 260,
+            mi.rcWork.left + 280 + (beforeDpiRc.right - beforeDpiRc.left) * 2,
+            mi.rcWork.top + 260 + (beforeDpiRc.bottom - beforeDpiRc.top) * 2
         };
         SendMessageW(hWnd, 0x02E0 /* WM_DPICHANGED */, MAKEWPARAM(targetDpi, targetDpi), reinterpret_cast<LPARAM>(&suggestedRc));
         CHECK_EQ(wnd.GetCurrentDpi(), targetDpi, L"WM_DPICHANGED preserves new DPI instead of overwriting with old anchor DPI");
@@ -612,6 +612,22 @@ int main() {
         if (targetDpi > initialDpi) {
             CHECK_EQ((afterDpiRc.bottom - afterDpiRc.top) > (beforeDpiRc.bottom - beforeDpiRc.top), true, L"Higher DPI increases scaled window height");
         }
+
+        // Subsequent internal relayouts (SetPlugins / SetPreeditDisplayMode) must NOT revert DPI or position to old m_lastShowPt
+        wnd.SetPlugins({ { 1, L"P1", L"*", L"", L"" } });
+        CHECK_EQ(wnd.GetCurrentDpi(), targetDpi, L"SetPlugins after WM_DPICHANGED preserves new DPI");
+        RECT afterPluginsRc{};
+        GetWindowRect(hWnd, &afterPluginsRc);
+        CHECK_EQ(afterPluginsRc.left, afterDpiRc.left, L"SetPlugins preserves DPI-changed X position");
+        CHECK_EQ(afterPluginsRc.top, afterDpiRc.top, L"SetPlugins preserves DPI-changed Y position");
+
+        wnd.SetPreeditDisplayMode(PreeditDisplayMode::Disabled);
+        CHECK_EQ(wnd.GetCurrentDpi(), targetDpi, L"SetPreeditDisplayMode after WM_DPICHANGED preserves new DPI");
+        RECT afterModeRc{};
+        GetWindowRect(hWnd, &afterModeRc);
+        CHECK_EQ(afterModeRc.left, afterDpiRc.left, L"SetPreeditDisplayMode preserves DPI-changed X position");
+        CHECK_EQ(afterModeRc.top, afterDpiRc.top, L"SetPreeditDisplayMode preserves DPI-changed Y position");
+        wnd.SetPreeditDisplayMode(PreeditDisplayMode::Always);
 
         CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(-1);
         wnd.Destroy();
