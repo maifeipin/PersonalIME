@@ -1435,6 +1435,7 @@ public:
         std::wstring comp_before;
         uint32_t page_before = 0;
         std::vector<std::wstring> cands_before;
+        uint32_t generation = 0;
         int state = 0; // 0 = Pending, 1 = Recorded (Success), 2 = Cancelled
     };
 
@@ -1701,6 +1702,7 @@ public:
                                 rec.comp_before = st.composition;
                                 rec.page_before = st.page_index;
                                 rec.cands_before = st.candidates;
+                                rec.generation = st.candidate_version;
                                 rec.state = 0; // Pending
                                 pThis->m_pendingCommits[evId] = rec;
                                 pThis->m_lastSelectedText = rec.text;
@@ -1709,6 +1711,7 @@ public:
                                 wcsncpy_s(resp.commit_text, rec.text.c_str(), _TRUNCATE);
                                 resp.commit_length = static_cast<uint32_t>(rec.text.length());
                                 resp.commit_event_id = evId;
+                                resp.candidate_version = rec.generation;
                                 resp.has_composition = 1;
                                 resp.composition[0] = L'\0';
                                 resp.candidate_count = 0;
@@ -1740,16 +1743,22 @@ public:
                         } else {
                             auto pendIt = pThis->m_pendingCommits.find(req.event_id);
                             if (pendIt != pThis->m_pendingCommits.end()) {
-                                pThis->m_terminalDispositions[req.event_id] = reqDisp;
-                                pendIt->second.state = (reqDisp == IpcCommitDisposition::ConfirmedWritten) ? 1 : 2;
-                                if (reqDisp == IpcCommitDisposition::ConfirmedWritten) {
-                                    pThis->m_commitSuccessCount.fetch_add(1);
-                                    pThis->m_learnedCount.fetch_add(1);
+                                if (pendIt->second.generation != 0 &&
+                                    req.candidate_version != pendIt->second.generation) {
+                                    resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                                    resp.handled = 0;
                                 } else {
-                                    pThis->m_commitCancelCount.fetch_add(1);
+                                    pThis->m_terminalDispositions[req.event_id] = reqDisp;
+                                    pendIt->second.state = (reqDisp == IpcCommitDisposition::ConfirmedWritten) ? 1 : 2;
+                                    if (reqDisp == IpcCommitDisposition::ConfirmedWritten) {
+                                        pThis->m_commitSuccessCount.fetch_add(1);
+                                        pThis->m_learnedCount.fetch_add(1);
+                                    } else {
+                                        pThis->m_commitCancelCount.fetch_add(1);
+                                    }
+                                    resp.commit_length = static_cast<uint32_t>(reqDisp);
+                                    resp.handled = 1;
                                 }
-                                resp.commit_length = static_cast<uint32_t>(reqDisp);
-                                resp.handled = 1;
                             } else {
                                 resp.handled = 0;
                             }
@@ -2831,6 +2840,88 @@ int TestStage71cRequestFenceAndWalRecovery() {
         ctxLive.m_pDeferredSession = nullptr;
         tipOther.Deactivate();
         liveTip1.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 2c. Server commit generation divergence (after AdvanceContextInputGeneration/Reset) +
+    //     initial V2_RES persistence failure recovery + automatic timer-driven timeout without follow-up keys.
+    {
+        CTextInputProcessor tipGen;
+        tipGen.SetClientIdForTest(1);
+        CHECK_TRUE(tipGen.NegotiateStage7ForTest(), L"NegotiateStage7 for tipGen");
+
+        MockContext ctxG;
+        uint64_t ctxGId = reinterpret_cast<uint64_t>(&ctxG);
+        BOOL eaten = FALSE;
+        tipGen.OnKeyDown(&ctxG, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"tipGen 'A' eaten");
+
+        // Advance local input_generation far past server candidate_version (simulating Rollback/Reset divergence)
+        for (int i = 0; i < 10; ++i) {
+            tipGen.AdvanceContextInputGeneration(ctxGId);
+        }
+
+        // Inject V2_RES _commit failure on commit completion, then recover via DrainUnconfirmedCommits
+        ctxG.m_forceSyncBlocked = true;
+        ctxG.m_deferAsyncSession = true;
+        tipGen.OnKeyDown(&ctxG, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"tipGen async commit queued");
+        auto cbG = tipGen.GetRequestControlBlockForTest(2);
+        CHECK_TRUE(cbG != nullptr && cbG->wal_prepared, L"tipGen V2_PREP persisted");
+        CHECK_TRUE(cbG->server_commit_generation != cbG->input_generation,
+                   L"Server commit generation tracked separately from local input_generation");
+
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        HRESULT hrResFail = ctxG.m_pDeferredSession->DoEditSession(1);
+        CHECK_EQUAL(hrResFail, S_OK, L"Host write succeeded before V2_RES failure");
+        CHECK_TRUE(!cbG->wal_resolved, L"V2_RES failed on first _commit");
+        CHECK_TRUE(tipGen.IsWalBarrierFaulted(), L"WAL barrier faulted on V2_RES failure");
+        CHECK_TRUE(tipGen.GetContextState(ctxGId) == CompositionState::Quarantined, L"Context quarantined while V2_RES pending");
+        CHECK_EQUAL(tipGen.GetPendingV2ReceiptCountForTest(), size_t(1), L"Failed V2_RES queued for runtime retry");
+
+        tipGen.DrainUnconfirmedCommits(true);
+        CHECK_EQUAL(tipGen.GetPendingV2ReceiptCountForTest(), size_t(0), L"Runtime retry persisted V2_RES, sent CommitTerminal with server_commit_generation, and persisted V2_ACK");
+        CHECK_TRUE(!tipGen.IsWalBarrierFaulted(), L"WAL barrier fault cleared after recovery");
+        CHECK_TRUE(tipGen.GetContextState(ctxGId) == CompositionState::None, L"Context retired from Quarantined after V2_RES recovery");
+        CHECK_TRUE(server.m_terminalDispositions[cbG->commit_event_id] == IpcCommitDisposition::ConfirmedWritten,
+                   L"CommitTerminal succeeded with server_commit_generation despite local input_generation divergence");
+
+        ctxG.m_pDeferredSession->Release();
+        ctxG.m_pDeferredSession = nullptr;
+
+        // Automatic timer-driven observation timeout with ZERO subsequent keystrokes
+        ctxG.m_forceSyncBlocked = false;
+        ctxG.m_deferAsyncSession = false;
+        tipGen.OnKeyDown(&ctxG, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"tipGen second 'A' eaten");
+        ctxG.m_forceSyncBlocked = true;
+        ctxG.m_deferAsyncSession = true;
+        tipGen.OnKeyDown(&ctxG, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"tipGen second async commit queued");
+        auto cbTimeout = tipGen.GetRequestControlBlockForTest(4);
+        CHECK_TRUE(cbTimeout != nullptr, L"Control block exists for timer timeout test");
+        CHECK_TRUE(tipGen.HasPendingObservationRequests(), L"HasPendingObservationRequests is true while queued");
+
+        // Pump Win32 WM_TIMER messages without any keystrokes until 1500ms timeout fires
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2200);
+        while (!cbTimeout->observation_timed_out && std::chrono::steady_clock::now() < deadline) {
+            MSG msg{};
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(50);
+        }
+        CHECK_TRUE(cbTimeout->observation_timed_out, L"Drain timer automatically triggered observation timeout without follow-up keys");
+        CHECK_TRUE(cbTimeout->revoked, L"Timed-out queued request automatically revoked");
+        CHECK_TRUE(tipGen.GetContextState(ctxGId) == CompositionState::Quarantined, L"Context automatically quarantined by timer");
+
+        HRESULT hrTimedOut = ctxG.m_pDeferredSession->DoEditSession(1);
+        CHECK_EQUAL(hrTimedOut, E_ABORT, L"Timer-revoked session aborted cleanly");
+        ctxG.m_pDeferredSession->Release();
+        ctxG.m_pDeferredSession = nullptr;
+        tipGen.Deactivate();
     }
 
     cleanupWals();

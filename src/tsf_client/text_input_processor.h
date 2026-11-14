@@ -67,7 +67,8 @@ struct EditRequestControlBlock {
     uint64_t session_id = 0;
     uint64_t context_id = 0;
     uint32_t context_epoch = 0;
-    uint32_t input_generation = 0;
+    uint32_t input_generation = 0;         // Local TIP fence generation
+    uint32_t server_commit_generation = 0; // Server pending_commit generation (from resp.candidate_version)
     uint64_t commit_event_id = 0;
     std::wstring commit_text;
     Microsoft::WRL::ComPtr<ITfContext> target_context;
@@ -376,6 +377,7 @@ public:
     void ClearWalBarrierFaultForTest() { m_walBarrierFaulted = false; }
     bool IsWalBarrierFaulted() const { return m_walBarrierFaulted; }
     size_t GetPendingV2ReceiptCountForTest() const { return m_pendingV2Receipts.size(); }
+    bool HasPendingObservationRequests() const;
     static bool IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId);
     std::shared_ptr<EditRequestControlBlock> GetRequestControlBlockForTest(uint64_t editRequestId) const;
 
@@ -473,6 +475,7 @@ private:
         IpcCommitDisposition requested_disp = IpcCommitDisposition::None;
         IpcCommitDisposition acked_disp = IpcCommitDisposition::None;
         int32_t hr = 0;
+        bool has_resolved_in_wal = true;
         bool has_acked_from_server = false;
         int retry_count = 0;
         std::chrono::steady_clock::time_point next_retry{};

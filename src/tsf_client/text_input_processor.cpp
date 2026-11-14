@@ -592,7 +592,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
         entry.session_id = cb->session_id;
         entry.context_id = cb->context_id;
         entry.context_epoch = cb->context_epoch;
-        entry.input_generation = cb->input_generation;
+        entry.input_generation = cb->server_commit_generation;
         entry.edit_request_id = cb->edit_request_id;
         entry.commit_event_id = cb->commit_event_id;
         entry.channel = 0; // 0 = TSF EditSession
@@ -601,9 +601,30 @@ void CTextInputProcessor::OnEditSessionCompleted(
         entry.disposition = static_cast<uint32_t>(disp);
         entry.hr = static_cast<int32_t>(hrFinal);
 
+        auto buildPendingReceipt = [&](bool resolvedInWal, bool ackedFromServer, IpcCommitDisposition ackedDisp) {
+            PendingV2Receipt r{};
+            r.owner_id = cb->owner_id;
+            r.session_id = cb->session_id;
+            r.context_id = cb->context_id;
+            r.context_epoch = cb->context_epoch;
+            r.input_generation = cb->server_commit_generation;
+            r.edit_request_id = cb->edit_request_id;
+            r.commit_event_id = cb->commit_event_id;
+            r.channel = 0;
+            r.text_len = entry.text_len;
+            r.text_digest = entry.text_digest;
+            r.requested_disp = disp;
+            r.acked_disp = ackedDisp;
+            r.hr = entry.hr;
+            r.has_resolved_in_wal = resolvedInWal;
+            r.has_acked_from_server = ackedFromServer;
+            return r;
+        };
+
         if (!receipt_journal_v2::AppendResolved(entry)) {
             m_walBarrierFaulted = true;
             SetContextState(contextId, CompositionState::Quarantined);
+            EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None));
             return false;
         }
         cb->wal_resolved = true;
@@ -616,7 +637,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             cb->commit_event_id,
             disp,
             cb->context_epoch,
-            cb->input_generation,
+            cb->server_commit_generation,
             cb->owner_id,
             finalDisp,
             conflict,
@@ -632,22 +653,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             }
         }
         if (!cb->wal_acked) {
-            PendingV2Receipt r{};
-            r.owner_id = cb->owner_id;
-            r.session_id = cb->session_id;
-            r.context_id = cb->context_id;
-            r.context_epoch = cb->context_epoch;
-            r.input_generation = cb->input_generation;
-            r.edit_request_id = cb->edit_request_id;
-            r.commit_event_id = cb->commit_event_id;
-            r.channel = 0;
-            r.text_len = entry.text_len;
-            r.text_digest = entry.text_digest;
-            r.requested_disp = disp;
-            r.acked_disp = ok ? finalDisp : IpcCommitDisposition::None;
-            r.hr = entry.hr;
-            r.has_acked_from_server = ok;
-            EnqueuePendingV2Receipt(r);
+            EnqueuePendingV2Receipt(buildPendingReceipt(true, ok, ok ? finalDisp : IpcCommitDisposition::None));
         }
         return ok;
     };
@@ -881,7 +887,7 @@ bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId) {
         entry.session_id = cb->session_id;
         entry.context_id = cb->context_id;
         entry.context_epoch = cb->context_epoch;
-        entry.input_generation = cb->input_generation;
+        entry.input_generation = cb->server_commit_generation;
         entry.edit_request_id = cb->edit_request_id;
         entry.commit_event_id = cb->commit_event_id;
         entry.channel = 0; // 0 = TSF EditSession
@@ -1612,6 +1618,17 @@ bool CTextInputProcessor::EnqueueUnconfirmedCommit(uint64_t contextId, uint64_t 
     StartDrainTimer();
     return true;
 }
+bool CTextInputProcessor::HasPendingObservationRequests() const {
+    for (const auto& kv : m_activeRequestBlocks) {
+        const auto& cb = kv.second;
+        if (cb && !cb->observation_timed_out &&
+            (cb->state == RequestLifecycleState::Queued || cb->state == RequestLifecycleState::Executing)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void CTextInputProcessor::EnqueuePendingV2Receipt(const PendingV2Receipt& r) {
     for (const auto& existing : m_pendingV2Receipts) {
         if (existing.commit_event_id == r.commit_event_id) {
@@ -1640,6 +1657,36 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
             continue;
         }
         processed++;
+
+        if (!it->has_resolved_in_wal) {
+            receipt_journal_v2::Entry resEntry{};
+            resEntry.owner_id = it->owner_id;
+            resEntry.session_id = it->session_id;
+            resEntry.context_id = it->context_id;
+            resEntry.context_epoch = it->context_epoch;
+            resEntry.input_generation = it->input_generation;
+            resEntry.edit_request_id = it->edit_request_id;
+            resEntry.commit_event_id = it->commit_event_id;
+            resEntry.channel = it->channel;
+            resEntry.text_len = it->text_len;
+            resEntry.text_digest = it->text_digest;
+            resEntry.disposition = static_cast<uint32_t>(it->requested_disp);
+            resEntry.hr = it->hr;
+            if (!receipt_journal_v2::AppendResolved(resEntry)) {
+                it->retry_count = (std::min)(it->retry_count + 1, 32);
+                int shift = (std::min)(it->retry_count, 5);
+                it->next_retry = now + std::chrono::milliseconds(50 * (1 << shift));
+                ++it;
+                continue;
+            }
+            it->has_resolved_in_wal = true;
+            m_walBarrierFaulted = false;
+            auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
+            if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
+                cbIt->second->wal_resolved = true;
+            }
+            RetireContextIfNoPotentialWriter(it->context_id);
+        }
 
         if (!it->has_acked_from_server) {
             IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
@@ -1691,7 +1738,17 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
             ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
             ackEntry.hr = it->hr;
             if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
+                m_walBarrierFaulted = false;
+                uint64_t ctxId = it->context_id;
+                auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
+                if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
+                    cbIt->second->wal_acked = true;
+                    if (!cbIt->second->unknown_pending) {
+                        m_activeRequestBlocks.erase(cbIt);
+                    }
+                }
                 it = m_pendingV2Receipts.erase(it);
+                RetireContextIfNoPotentialWriter(ctxId);
                 continue;
             }
         }
@@ -1707,9 +1764,9 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
     DrainPendingV2Receipts(forceNow);
     constexpr size_t MAX_QUEUE_SIZE = 512;
     if (m_unconfirmedCommits.empty()) {
-        if (!HasPendingSpilloverRecords() && m_pendingV2Receipts.empty()) {
+        if (!HasPendingSpilloverRecords() && m_pendingV2Receipts.empty() && !HasPendingObservationRequests()) {
             StopDrainTimer();
-        } else if (!m_pendingV2Receipts.empty()) {
+        } else if (!m_pendingV2Receipts.empty() || HasPendingObservationRequests()) {
             StartDrainTimer();
         }
         return;
@@ -1761,7 +1818,8 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
         }
     }
 
-    if (m_unconfirmedCommits.empty() && !HasPendingSpilloverRecords() && m_pendingV2Receipts.empty()) {
+    if (m_unconfirmedCommits.empty() && !HasPendingSpilloverRecords() &&
+        m_pendingV2Receipts.empty() && !HasPendingObservationRequests()) {
         StopDrainTimer();
     } else {
         StartDrainTimer();
@@ -1975,6 +2033,10 @@ bool CTextInputProcessor::ProcessKeyInternal(
             controlBlock->context_id = contextId;
             controlBlock->context_epoch = static_cast<uint32_t>(currentEpoch);
             controlBlock->input_generation = static_cast<uint32_t>(currentInputGen);
+            controlBlock->server_commit_generation =
+                (resp.has_commit && resp.candidate_version != 0)
+                ? resp.candidate_version
+                : static_cast<uint32_t>(currentInputGen);
             controlBlock->commit_event_id = resp.commit_event_id;
             controlBlock->commit_text = resp.commit_text;
             controlBlock->target_context = pic;
@@ -1989,7 +2051,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
                         prepEntry.session_id = controlBlock->session_id;
                         prepEntry.context_id = controlBlock->context_id;
                         prepEntry.context_epoch = controlBlock->context_epoch;
-                        prepEntry.input_generation = controlBlock->input_generation;
+                        prepEntry.input_generation = controlBlock->server_commit_generation;
                         prepEntry.edit_request_id = controlBlock->edit_request_id;
                         prepEntry.commit_event_id = controlBlock->commit_event_id;
                         prepEntry.channel = 0; // 0 = TSF EditSession
@@ -2009,7 +2071,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
                                 resp.commit_event_id,
                                 IpcCommitDisposition::CancelRestore,
                                 controlBlock->context_epoch,
-                                controlBlock->input_generation,
+                                controlBlock->server_commit_generation,
                                 m_ownerInstanceId,
                                 finalDisp,
                                 conflict,
@@ -2195,7 +2257,8 @@ bool CTextInputProcessor::ProcessKeyInternal(
                     return false;
                 }
                 if (!pSession->HasExecuted()) {
-                    // Request is queued in host (TF_S_ASYNC); completion will be handled when DoEditSession runs!
+                    // Request is queued in host (TF_S_ASYNC); start drain/observation timer!
+                    StartDrainTimer();
                     pSession->Release();
                     *pfEaten = TRUE;
                     return true;
