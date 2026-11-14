@@ -241,12 +241,11 @@ public:
             }
         };
 
-        if (m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined &&
-            !(m_controlBlock && m_controlBlock->unknown_pending && !m_controlBlock->revoked)) {
+        if (m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined) {
             hideOwnedWindow();
             m_result = EditSessionResult::Unmodified;
-            m_finalHr = E_FAIL;
-            return E_FAIL;
+            m_finalHr = E_ABORT;
+            return E_ABORT;
         }
 
         // P1-1 RECOVERY: If the previous composition was in CommitPendingEnd,

@@ -1445,6 +1445,7 @@ public:
     std::atomic<int> m_commitSuccessCount{0};
     std::atomic<int> m_commitCancelCount{0};
     std::atomic<int> m_commitTerminalCount{0};
+    std::atomic<int> m_dropNextCommitTerminal{0};
     std::atomic<int> m_queryCommitStatusCount{0};
     std::atomic<int> m_learnedCount{0};
     std::atomic<int> m_resetCount{0};
@@ -1722,31 +1723,36 @@ public:
                     }
                 } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
                     pThis->m_commitTerminalCount.fetch_add(1);
-                    IpcCommitDisposition reqDisp = static_cast<IpcCommitDisposition>(req.mode_arg);
-                    auto termIt = pThis->m_terminalDispositions.find(req.event_id);
-                    if (termIt != pThis->m_terminalDispositions.end()) {
-                        resp.commit_length = static_cast<uint32_t>(termIt->second);
-                        if (termIt->second != reqDisp) {
-                            resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
-                            resp.handled = 0;
-                        } else {
-                            resp.handled = 1;
-                        }
+                    if (pThis->m_dropNextCommitTerminal.load() > 0) {
+                        pThis->m_dropNextCommitTerminal.fetch_sub(1);
+                        resp.handled = 0;
                     } else {
-                        auto pendIt = pThis->m_pendingCommits.find(req.event_id);
-                        if (pendIt != pThis->m_pendingCommits.end()) {
-                            pThis->m_terminalDispositions[req.event_id] = reqDisp;
-                            pendIt->second.state = (reqDisp == IpcCommitDisposition::ConfirmedWritten) ? 1 : 2;
-                            if (reqDisp == IpcCommitDisposition::ConfirmedWritten) {
-                                pThis->m_commitSuccessCount.fetch_add(1);
-                                pThis->m_learnedCount.fetch_add(1);
+                        IpcCommitDisposition reqDisp = static_cast<IpcCommitDisposition>(req.mode_arg);
+                        auto termIt = pThis->m_terminalDispositions.find(req.event_id);
+                        if (termIt != pThis->m_terminalDispositions.end()) {
+                            resp.commit_length = static_cast<uint32_t>(termIt->second);
+                            if (termIt->second != reqDisp) {
+                                resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                                resp.handled = 0;
                             } else {
-                                pThis->m_commitCancelCount.fetch_add(1);
+                                resp.handled = 1;
                             }
-                            resp.commit_length = static_cast<uint32_t>(reqDisp);
-                            resp.handled = 1;
                         } else {
-                            resp.handled = 0;
+                            auto pendIt = pThis->m_pendingCommits.find(req.event_id);
+                            if (pendIt != pThis->m_pendingCommits.end()) {
+                                pThis->m_terminalDispositions[req.event_id] = reqDisp;
+                                pendIt->second.state = (reqDisp == IpcCommitDisposition::ConfirmedWritten) ? 1 : 2;
+                                if (reqDisp == IpcCommitDisposition::ConfirmedWritten) {
+                                    pThis->m_commitSuccessCount.fetch_add(1);
+                                    pThis->m_learnedCount.fetch_add(1);
+                                } else {
+                                    pThis->m_commitCancelCount.fetch_add(1);
+                                }
+                                resp.commit_length = static_cast<uint32_t>(reqDisp);
+                                resp.handled = 1;
+                            } else {
+                                resp.handled = 0;
+                            }
                         }
                     }
                 } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::QueryCommitStatus)) {
@@ -2757,21 +2763,74 @@ int TestStage71cRequestFenceAndWalRecovery() {
         tip.OnKeyDown(&ctx1, 'B', 0, &eaten);
         CHECK_EQUAL(eaten, FALSE, L"Quarantined ctx1 OnKeyDown passes key through");
 
-        // Late callback on ctx1 completes with Success (without revocation) -> resolves V2_RES(ConfirmedWritten),
-        // sends CommitTerminal(ConfirmedWritten), records V2_ACK, and retires Quarantined -> None!
-        // Note: first test late Success before switching to ctx2 (since switching to ctx2 revokes ctx1's queued session).
+        // After timeout + key passthrough, the unstarted queued EditSession MUST be revoked and
+        // aborted with ZERO host writes (cannot overwrite text after keys were passed through!).
+        std::wstring compBeforeLate = ctx1.m_activeCompRange;
         HRESULT hrLate = ctx1.m_pDeferredSession->DoEditSession(1);
-        CHECK_EQUAL(hrLate, S_OK, L"Late callback succeeded on ctx1");
-        CHECK_TRUE(cb->crossed_side_effect, L"crossed_side_effect is true");
-        CHECK_TRUE(cb->wal_resolved && cb->wal_acked, L"Late Success recorded V2_RES and V2_ACK");
-        CHECK_TRUE(server.m_terminalDispositions[cb->commit_event_id] == IpcCommitDisposition::ConfirmedWritten,
-                   L"Server confirmed ConfirmedWritten for late callback");
-        CHECK_TRUE(tip.GetContextState(ctx1Id) == CompositionState::None,
-                   L"ctx1 retired from Quarantined -> None after late callback resolved and no potential writers remain");
+        CHECK_EQUAL(hrLate, E_ABORT, L"Timed-out unstarted EditSession must abort with E_ABORT after keys passed through");
+        CHECK_TRUE(cb->state == RequestLifecycleState::RevokedBeforeWrite, L"Control block is RevokedBeforeWrite");
+        CHECK_TRUE(!cb->crossed_side_effect, L"Timed-out request never crossed side effect");
+        CHECK_EQUAL(ctx1.m_activeCompRange, compBeforeLate, L"Host text untouched by timed-out request");
+        CHECK_TRUE(cb->wal_resolved && cb->wal_acked, L"CancelDiscard persisted V2_RES and V2_ACK");
+        CHECK_TRUE(server.m_terminalDispositions[cb->commit_event_id] == IpcCommitDisposition::CancelDiscard,
+                   L"Server recorded CancelDiscard for timed-out revoked request");
+        CHECK_TRUE(tip.GetContextState(ctx1Id) == CompositionState::CommitPendingEnd,
+                   L"ctx1 retired from Quarantined -> CommitPendingEnd after timed-out request aborted (inline composition still open)");
 
         ctx1.m_pDeferredSession->Release();
         ctx1.m_pDeferredSession = nullptr;
         tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 2b. Live cross-instance recovery MUST NOT falsely close another live TIP's pending event as ClosedUnknown;
+    //     and runtime v2 receipt retry must recover from transient CommitTerminal / _commit failure without rewriting text.
+    {
+        CTextInputProcessor liveTip1;
+        liveTip1.SetClientIdForTest(1);
+        CHECK_TRUE(liveTip1.NegotiateStage7ForTest(), L"NegotiateStage7 for liveTip1");
+
+        MockContext ctxLive;
+        BOOL eaten = FALSE;
+        liveTip1.OnKeyDown(&ctxLive, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"liveTip1 'A' eaten");
+
+        ctxLive.m_forceSyncBlocked = true;
+        ctxLive.m_deferAsyncSession = true;
+        liveTip1.OnKeyDown(&ctxLive, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"liveTip1 async commit queued");
+        auto cbLive = liveTip1.GetRequestControlBlockForTest(2);
+        CHECK_TRUE(cbLive != nullptr && cbLive->wal_prepared, L"liveTip1 V2_PREP persisted");
+
+        // Another live TIP instance runs RecoverReceiptsFromWal while liveTip1 is still alive!
+        CTextInputProcessor tipOther;
+        tipOther.SetClientIdForTest(2);
+        CHECK_TRUE(tipOther.NegotiateStage7ForTest(), L"NegotiateStage7 for tipOther");
+        tipOther.RecoverReceiptsFromWal();
+        CHECK_TRUE(server.m_terminalDispositions.find(cbLive->commit_event_id) == server.m_terminalDispositions.end(),
+                   L"RecoverReceiptsFromWal MUST NOT mark another live TIP instance's event as ClosedUnknown!");
+
+        // Inject transient CommitTerminal failure + _commit failure for V2_ACK, then run liveTip1's deferred EditSession
+        server.m_dropNextCommitTerminal.store(1);
+        HRESULT hrOk = ctxLive.m_pDeferredSession->DoEditSession(1);
+        CHECK_EQUAL(hrOk, S_OK, L"liveTip1 commit succeeded on host");
+        CHECK_TRUE(cbLive->wal_resolved && !cbLive->wal_acked, L"V2_RES persisted, V2_ACK pending due to CommitTerminal failure");
+        CHECK_EQUAL(liveTip1.GetPendingV2ReceiptCountForTest(), size_t(1), L"Failed V2 receipt queued for runtime retry");
+
+        // Inject 1 _commit failure on V2_ACK retry, then succeed on second DrainUnconfirmedCommits
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        liveTip1.DrainUnconfirmedCommits(true);
+        CHECK_EQUAL(liveTip1.GetPendingV2ReceiptCountForTest(), size_t(1), L"V2_ACK _commit failure retains item in retry queue");
+        liveTip1.DrainUnconfirmedCommits(true);
+        CHECK_EQUAL(liveTip1.GetPendingV2ReceiptCountForTest(), size_t(0), L"Runtime retry persisted V2_ACK and drained queue");
+        CHECK_TRUE(server.m_terminalDispositions[cbLive->commit_event_id] == IpcCommitDisposition::ConfirmedWritten,
+                   L"liveTip1 settled ConfirmedWritten without conflict");
+
+        ctxLive.m_pDeferredSession->Release();
+        ctxLive.m_pDeferredSession = nullptr;
+        tipOther.Deactivate();
+        liveTip1.Deactivate();
     }
 
     cleanupWals();
@@ -2807,6 +2866,42 @@ int TestStage71cRequestFenceAndWalRecovery() {
         CHECK_TRUE(it != snap.events.end(), L"Event 7777 loaded");
         CHECK_EQUAL(it->second.resolved_disposition, static_cast<uint32_t>(IpcCommitDisposition::ConfirmedWritten),
                     L"First terminal disposition preserved immutably");
+
+        // _commit failure on AppendResolved followed by retry must execute SyncWalFileLocked and succeed
+        receipt_journal_v2::Entry eRetry{};
+        eRetry.owner_id = 0x1111;
+        eRetry.session_id = 0x2222;
+        eRetry.context_id = 0x3333;
+        eRetry.commit_event_id = 7778;
+        eRetry.disposition = static_cast<uint32_t>(IpcCommitDisposition::ConfirmedWritten);
+        CHECK_TRUE(receipt_journal_v2::AppendPrepared(eRetry), L"AppendPrepared 7778");
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        CHECK_TRUE(!receipt_journal_v2::AppendResolved(eRetry), L"AppendResolved 7778 fails when _commit fails");
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        CHECK_TRUE(!receipt_journal_v2::AppendResolved(eRetry), L"Idempotent retry still executes _commit and fails if _commit fails");
+        CHECK_TRUE(receipt_journal_v2::AppendResolved(eRetry), L"Retry succeeds once _commit succeeds");
+
+        // Legitimate CancelRestore -> CancelDiscard downgrade must NOT be marked conflicted on WAL reload
+        receipt_journal_v2::Entry eDown{};
+        eDown.owner_id = 0x1111;
+        eDown.session_id = 0x2222;
+        eDown.context_id = 0x3333;
+        eDown.commit_event_id = 7779;
+        CHECK_TRUE(receipt_journal_v2::AppendPrepared(eDown), L"AppendPrepared 7779");
+        eDown.disposition = static_cast<uint32_t>(IpcCommitDisposition::CancelRestore);
+        CHECK_TRUE(receipt_journal_v2::AppendResolved(eDown), L"AppendResolved(CancelRestore) 7779");
+        eDown.disposition = static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard);
+        CHECK_TRUE(receipt_journal_v2::AppendServiceAck(eDown), L"AppendServiceAck(CancelDiscard) 7779");
+
+        receipt_journal_v2::Snapshot snapDown;
+        CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snapDown, false), L"Reload WAL after CancelRestore->CancelDiscard");
+        auto itDown = snapDown.events.find(7779);
+        CHECK_TRUE(itDown != snapDown.events.end(), L"Event 7779 loaded");
+        CHECK_TRUE(!itDown->second.conflicted, L"Legitimate CancelRestore->CancelDiscard downgrade is NOT conflicted");
+        CHECK_EQUAL(itDown->second.resolved_disposition, static_cast<uint32_t>(IpcCommitDisposition::CancelRestore),
+                    L"Resolved keeps CancelRestore");
+        CHECK_EQUAL(itDown->second.acked_disposition, static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard),
+                    L"Acked keeps CancelDiscard");
     }
 
     cleanupWals();
@@ -2822,16 +2917,17 @@ int TestStage71cRequestFenceAndWalRecovery() {
         uint64_t evLegacyP1 = 8003;
         uint64_t evLegacyR1 = 8004;
 
+        uint64_t deadSession = (static_cast<uint64_t>(GetCurrentProcessId()) << 32) | 0xBEEFull;
         EnterCriticalSection(&server.m_cs);
-        server.m_pendingCommits[evDeadPrep] = { 0xBEEF, 0xCAFE1, L"工", L"a", 0, {L"工"}, 0 };
-        server.m_pendingCommits[evUnackedRes] = { 0xBEEF, 0xCAFE2, L"戈", L"b", 0, {L"戈"}, 0 };
-        server.m_pendingCommits[evLegacyP1] = { 0xBEEF, 0xCAFE3, L"阿", L"c", 0, {L"阿"}, 0 };
-        server.m_pendingCommits[evLegacyR1] = { 0xBEEF, 0xCAFE4, L"啊", L"d", 0, {L"啊"}, 0 };
+        server.m_pendingCommits[evDeadPrep] = { deadSession, 0xCAFE1, L"工", L"a", 0, {L"工"}, 0 };
+        server.m_pendingCommits[evUnackedRes] = { deadSession, 0xCAFE2, L"戈", L"b", 0, {L"戈"}, 0 };
+        server.m_pendingCommits[evLegacyP1] = { deadSession, 0xCAFE3, L"阿", L"c", 0, {L"阿"}, 0 };
+        server.m_pendingCommits[evLegacyR1] = { deadSession, 0xCAFE4, L"啊", L"d", 0, {L"啊"}, 0 };
         LeaveCriticalSection(&server.m_cs);
 
         receipt_journal_v2::Entry e1{};
         e1.owner_id = 0xDEAD1234;
-        e1.session_id = 0xBEEF;
+        e1.session_id = deadSession;
         e1.context_id = 0xCAFE1;
         e1.context_epoch = 1;
         e1.input_generation = 1;
@@ -2841,7 +2937,7 @@ int TestStage71cRequestFenceAndWalRecovery() {
 
         receipt_journal_v2::Entry e2{};
         e2.owner_id = 0xDEAD1234;
-        e2.session_id = 0xBEEF;
+        e2.session_id = deadSession;
         e2.context_id = 0xCAFE2;
         e2.context_epoch = 1;
         e2.input_generation = 2;
@@ -2852,8 +2948,8 @@ int TestStage71cRequestFenceAndWalRecovery() {
         CHECK_TRUE(receipt_journal_v2::AppendResolved(e2), L"Write V2_RES(ConfirmedWritten) without V2_ACK");
 
         // Legacy v1 P1 + R1
-        CHECK_TRUE(receipt_journal::Prepare({ 0xBEEF, 0xCAFE3, evLegacyP1, 0, 0 }), L"Write v1 P1");
-        CHECK_TRUE(receipt_journal::Append({ { 0xBEEF, 0xCAFE4, evLegacyR1, 0, 0 } }), L"Write v1 R1");
+        CHECK_TRUE(receipt_journal::Prepare({ deadSession, 0xCAFE3, evLegacyP1, 0, 0 }), L"Write v1 P1");
+        CHECK_TRUE(receipt_journal::Append({ { deadSession, 0xCAFE4, evLegacyR1, 0, 0 } }), L"Write v1 R1");
 
         CTextInputProcessor tip2;
         tip2.SetClientIdForTest(1);

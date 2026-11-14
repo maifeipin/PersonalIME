@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
+#include <mutex>
 #include <memory>
 #include <atomic>
 #include <chrono>
@@ -368,10 +370,13 @@ public:
     bool HasPotentialWriterForContext(uint64_t contextId) const;
     bool MarkContextUnknownPending(uint64_t editRequestId);
     bool MarkObservationTimeout(uint64_t editRequestId);
+    void CheckObservationTimeouts(std::chrono::milliseconds timeout = std::chrono::milliseconds(1500));
     void RetireContextIfNoPotentialWriter(uint64_t contextId);
     void RecoverReceiptsFromWal();
     void ClearWalBarrierFaultForTest() { m_walBarrierFaulted = false; }
     bool IsWalBarrierFaulted() const { return m_walBarrierFaulted; }
+    size_t GetPendingV2ReceiptCountForTest() const { return m_pendingV2Receipts.size(); }
+    static bool IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId);
     std::shared_ptr<EditRequestControlBlock> GetRequestControlBlockForTest(uint64_t editRequestId) const;
 
     // Retained unconfirmed commits for bounded recovery
@@ -454,6 +459,28 @@ private:
     std::map<uint64_t, CompositionState> m_contextStates;
     std::map<uint64_t, CandidateWindowMode> m_contextModes;
     std::map<uint64_t, Microsoft::WRL::ComPtr<ITfContext>> m_compositionlessContextLeases;
+    struct PendingV2Receipt {
+        uint64_t owner_id = 0;
+        uint64_t session_id = 0;
+        uint64_t context_id = 0;
+        uint32_t context_epoch = 0;
+        uint32_t input_generation = 0;
+        uint64_t edit_request_id = 0;
+        uint64_t commit_event_id = 0;
+        uint32_t channel = 0;
+        uint32_t text_len = 0;
+        uint64_t text_digest = 0;
+        IpcCommitDisposition requested_disp = IpcCommitDisposition::None;
+        IpcCommitDisposition acked_disp = IpcCommitDisposition::None;
+        int32_t hr = 0;
+        bool has_acked_from_server = false;
+        int retry_count = 0;
+        std::chrono::steady_clock::time_point next_retry{};
+    };
+    std::vector<PendingV2Receipt> m_pendingV2Receipts;
+    void EnqueuePendingV2Receipt(const PendingV2Receipt& r);
+    void DrainPendingV2Receipts(bool forceNow = false);
+
     std::map<uint64_t, std::shared_ptr<EditRequestControlBlock>> m_activeRequestBlocks;
     uint64_t m_nextEditRequestId = 0;
     bool m_walBarrierFaulted = false;

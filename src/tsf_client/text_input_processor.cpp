@@ -14,6 +14,8 @@
 #include "receipt_retry.h"
 
 static LONG64 s_sessionCounter = 0;
+static std::mutex s_liveOwnersMutex;
+static std::set<uint64_t> s_liveOwnerInstances;
 
 CTextInputProcessor::CTextInputProcessor() {
     m_cRef = 1;
@@ -23,6 +25,10 @@ CTextInputProcessor::CTextInputProcessor() {
     m_ownerInstanceId = m_sessionId ^ (GetTickCount64() * 11400714819323198485ull);
     if (m_ownerInstanceId == 0 || m_ownerInstanceId == m_sessionId) {
         m_ownerInstanceId = m_sessionId ^ 0x9E3779B97F4A7C15ULL;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_liveOwnersMutex);
+        s_liveOwnerInstances.insert(m_ownerInstanceId);
     }
     DllAddRef();
 
@@ -123,6 +129,10 @@ void CTextInputProcessor::OpenManagerFromTray() {
 }
 
 CTextInputProcessor::~CTextInputProcessor() {
+    {
+        std::lock_guard<std::mutex> lock(s_liveOwnersMutex);
+        s_liveOwnerInstances.erase(m_ownerInstanceId);
+    }
     m_candidateWindow.SetOnOpenManager(nullptr);
     m_candidateWindow.SetOnExecutePlugin(nullptr);
     m_candidateWindow.SetOnSelectCandidate(nullptr);
@@ -621,6 +631,24 @@ void CTextInputProcessor::OnEditSessionCompleted(
                 cb->wal_acked = true;
             }
         }
+        if (!cb->wal_acked) {
+            PendingV2Receipt r{};
+            r.owner_id = cb->owner_id;
+            r.session_id = cb->session_id;
+            r.context_id = cb->context_id;
+            r.context_epoch = cb->context_epoch;
+            r.input_generation = cb->input_generation;
+            r.edit_request_id = cb->edit_request_id;
+            r.commit_event_id = cb->commit_event_id;
+            r.channel = 0;
+            r.text_len = entry.text_len;
+            r.text_digest = entry.text_digest;
+            r.requested_disp = disp;
+            r.acked_disp = ok ? finalDisp : IpcCommitDisposition::None;
+            r.hr = entry.hr;
+            r.has_acked_from_server = ok;
+            EnqueuePendingV2Receipt(r);
+        }
         return ok;
     };
 
@@ -877,8 +905,52 @@ bool CTextInputProcessor::MarkObservationTimeout(uint64_t editRequestId) {
         return false;
     }
     it->second->observation_timed_out = true;
+    // Revoke any queued request that has not crossed a host side effect so it cannot write
+    // after subsequent keys have been passed through during Quarantine.
+    if (it->second->state == RequestLifecycleState::Queued && !it->second->crossed_side_effect) {
+        it->second->revoked = true;
+    }
     // Timeout alone NEVER forces ClosedUnknown; mark UnknownPending and quarantine only this context.
     return MarkContextUnknownPending(editRequestId);
+}
+
+void CTextInputProcessor::CheckObservationTimeouts(std::chrono::milliseconds timeout) {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<uint64_t> timedOutIds;
+    for (const auto& kv : m_activeRequestBlocks) {
+        const auto& cb = kv.second;
+        if (cb && !cb->observation_timed_out &&
+            (cb->state == RequestLifecycleState::Queued || cb->state == RequestLifecycleState::Executing) &&
+            (now - cb->created_at >= timeout)) {
+            timedOutIds.push_back(kv.first);
+        }
+    }
+    for (uint64_t id : timedOutIds) {
+        MarkObservationTimeout(id);
+    }
+}
+
+bool CTextInputProcessor::IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId) {
+    if (ownerId != 0) {
+        std::lock_guard<std::mutex> lock(s_liveOwnersMutex);
+        if (s_liveOwnerInstances.find(ownerId) != s_liveOwnerInstances.end()) {
+            return true;
+        }
+    }
+    DWORD ownerPid = static_cast<DWORD>(sessionId >> 32);
+    if (ownerPid == 0) {
+        return true; // Unknown PID: be conservative and do not declare dead.
+    }
+    if (ownerPid == GetCurrentProcessId()) {
+        return false; // Same process, but ownerId is no longer in s_liveOwnerInstances.
+    }
+    HANDLE hProc = OpenProcess(SYNCHRONIZE, FALSE, ownerPid);
+    if (hProc != nullptr) {
+        DWORD w = WaitForSingleObject(hProc, 0);
+        CloseHandle(hProc);
+        return (w == WAIT_TIMEOUT);
+    }
+    return (GetLastError() == ERROR_ACCESS_DENIED);
 }
 
 void CTextInputProcessor::RetireContextIfNoPotentialWriter(uint64_t contextId) {
@@ -991,8 +1063,13 @@ void CTextInputProcessor::RecoverReceiptsFromWal() {
                 continue;
             }
 
-            // Server still has pending commit. Only settle ClosedUnknown if original owner/writer is dead.
-            bool ownerDead = (ev.owner_id != m_ownerInstanceId) || !HasPotentialWriterForContext(ev.context_id);
+            // Server still has pending commit. Only settle ClosedUnknown if the original owner/writer is verified dead.
+            bool ownerDead = false;
+            if (ev.owner_id == m_ownerInstanceId) {
+                ownerDead = !HasPotentialWriterForContext(ev.context_id);
+            } else {
+                ownerDead = !IsOwnerInstanceAlive(ev.owner_id, ev.session_id);
+            }
             if (ownerDead) {
                 base.disposition = static_cast<uint32_t>(IpcCommitDisposition::ClosedUnknown);
                 if (!receipt_journal_v2::AppendResolved(base)) {
@@ -1422,6 +1499,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     }
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    CheckObservationTimeouts();
     if (HasQueuedEditSession(contextId) || IsContextQuarantined(contextId)) {
         return S_OK;
     }
@@ -1500,6 +1578,7 @@ static VOID CALLBACK DrainTimerCallback(HWND, UINT, UINT_PTR idEvent, DWORD) {
         if (it->second->m_unconfirmedCommits.size() < 512 && it->second->HasPendingSpilloverRecords()) {
             it->second->LoadSpilloverCommitsFromFile();
         }
+        it->second->CheckObservationTimeouts();
         it->second->DrainUnconfirmedCommits(false);
     }
 }
@@ -1533,11 +1612,105 @@ bool CTextInputProcessor::EnqueueUnconfirmedCommit(uint64_t contextId, uint64_t 
     StartDrainTimer();
     return true;
 }
+void CTextInputProcessor::EnqueuePendingV2Receipt(const PendingV2Receipt& r) {
+    for (const auto& existing : m_pendingV2Receipts) {
+        if (existing.commit_event_id == r.commit_event_id) {
+            return;
+        }
+    }
+    if (m_pendingV2Receipts.size() < 512) {
+        PendingV2Receipt copy = r;
+        copy.next_retry = std::chrono::steady_clock::now();
+        m_pendingV2Receipts.push_back(copy);
+    }
+    StartDrainTimer();
+}
+
+void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
+    if (m_pendingV2Receipts.empty()) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    size_t processed = 0;
+    constexpr size_t MAX_DRAIN_PER_INVOCATION = 8;
+
+    for (auto it = m_pendingV2Receipts.begin(); it != m_pendingV2Receipts.end() && processed < MAX_DRAIN_PER_INVOCATION; ) {
+        if (!forceNow && now < it->next_retry) {
+            ++it;
+            continue;
+        }
+        processed++;
+
+        if (!it->has_acked_from_server) {
+            IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+            bool conflict = false;
+            IpcKeyResponse termResp{};
+            bool ok = m_ipcClient.NotifyCommitTerminal(
+                it->session_id,
+                it->context_id,
+                it->commit_event_id,
+                it->requested_disp,
+                it->context_epoch,
+                it->input_generation,
+                it->owner_id,
+                finalDisp,
+                conflict,
+                &termResp);
+            if (conflict) {
+                SetContextState(it->context_id, CompositionState::Quarantined);
+                it = m_pendingV2Receipts.erase(it);
+                continue;
+            }
+            if (ok) {
+                it->has_acked_from_server = true;
+                it->acked_disp = finalDisp;
+                if (it->requested_disp == IpcCommitDisposition::CancelRestore &&
+                    finalDisp == IpcCommitDisposition::CancelRestore &&
+                    (termResp.candidate_count > 0 ||
+                     (termResp.has_composition && termResp.composition[0] != L'\0'))) {
+                    m_contextCandidateVersions[it->context_id] = termResp.candidate_version;
+                    m_latestServerCandidateVersions[it->context_id] = termResp.candidate_version;
+                    m_contextPageIndices[it->context_id] = termResp.page_index;
+                    m_contextPageCounts[it->context_id] = termResp.page_count;
+                }
+            }
+        }
+
+        if (it->has_acked_from_server) {
+            receipt_journal_v2::Entry ackEntry{};
+            ackEntry.owner_id = it->owner_id;
+            ackEntry.session_id = it->session_id;
+            ackEntry.context_id = it->context_id;
+            ackEntry.context_epoch = it->context_epoch;
+            ackEntry.input_generation = it->input_generation;
+            ackEntry.edit_request_id = it->edit_request_id;
+            ackEntry.commit_event_id = it->commit_event_id;
+            ackEntry.channel = it->channel;
+            ackEntry.text_len = it->text_len;
+            ackEntry.text_digest = it->text_digest;
+            ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
+            ackEntry.hr = it->hr;
+            if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
+                it = m_pendingV2Receipts.erase(it);
+                continue;
+            }
+        }
+
+        it->retry_count = (std::min)(it->retry_count + 1, 32);
+        int shift = (std::min)(it->retry_count, 5);
+        it->next_retry = now + std::chrono::milliseconds(50 * (1 << shift));
+        ++it;
+    }
+}
+
 void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
+    DrainPendingV2Receipts(forceNow);
     constexpr size_t MAX_QUEUE_SIZE = 512;
     if (m_unconfirmedCommits.empty()) {
-        if (!HasPendingSpilloverRecords()) {
+        if (!HasPendingSpilloverRecords() && m_pendingV2Receipts.empty()) {
             StopDrainTimer();
+        } else if (!m_pendingV2Receipts.empty()) {
+            StartDrainTimer();
         }
         return;
     }
@@ -1588,7 +1761,7 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
         }
     }
 
-    if (m_unconfirmedCommits.empty() && !HasPendingSpilloverRecords()) {
+    if (m_unconfirmedCommits.empty() && !HasPendingSpilloverRecords() && m_pendingV2Receipts.empty()) {
         StopDrainTimer();
     } else {
         StartDrainTimer();
@@ -1621,6 +1794,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     }
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    CheckObservationTimeouts();
 
     // Do not overlap new keystrokes while an asynchronous edit session is queued on this context
     if (HasQueuedEditSession(contextId)) {

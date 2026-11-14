@@ -246,6 +246,12 @@ inline bool ReadV2FileLocked(Snapshot& snap) {
                 st.resolved_disposition = e.disposition;
             }
         } else if (kind == RecordKind::ServiceAck) {
+            auto isCompatibleAck = [](uint32_t resolvedDisp, uint32_t ackedDisp) -> bool {
+                if (resolvedDisp == ackedDisp) return true;
+                // Server may legitimately downgrade CancelRestore -> CancelDiscard.
+                return resolvedDisp == static_cast<uint32_t>(IpcCommitDisposition::CancelRestore) &&
+                       ackedDisp == static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard);
+            };
             if (st.has_service_ack && st.acked_disposition != e.disposition) {
                 st.conflicted = true;
             } else {
@@ -254,7 +260,7 @@ inline bool ReadV2FileLocked(Snapshot& snap) {
                 if (!st.has_resolved) {
                     st.has_resolved = true;
                     st.resolved_disposition = e.disposition;
-                } else if (st.resolved_disposition != e.disposition) {
+                } else if (!isCompatibleAck(st.resolved_disposition, e.disposition)) {
                     st.conflicted = true;
                 }
             }
@@ -266,6 +272,30 @@ inline bool ReadV2FileLocked(Snapshot& snap) {
     return ok;
 }
 
+inline int& FailCommitInjectCountForTest() {
+    static int s_failCount = 0;
+    return s_failCount;
+}
+
+inline bool SyncWalFileLocked() {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, Path().c_str(), L"a+b") != 0 || !f) {
+        return false;
+    }
+    bool ok = true;
+    int& injectFail = FailCommitInjectCountForTest();
+    if (injectFail > 0) {
+        --injectFail;
+        ok = false;
+    } else if (fflush(f) != 0 || ferror(f) || _commit(_fileno(f)) != 0) {
+        ok = false;
+    }
+    if (fclose(f) != 0) {
+        ok = false;
+    }
+    return ok;
+}
+
 inline bool AppendFrameLocked(const std::string& body) {
     FILE* f = nullptr;
     if (_wfopen_s(&f, Path().c_str(), L"a+b") != 0 || !f) {
@@ -273,7 +303,11 @@ inline bool AppendFrameLocked(const std::string& body) {
     }
     std::string frame = "\n" + body + " " + std::to_string(receipt_journal::Checksum(body)) + "\n";
     bool ok = (fwrite(frame.data(), 1, frame.size(), f) == frame.size());
-    if (fflush(f) != 0 || ferror(f) || _commit(_fileno(f)) != 0) {
+    int& injectFail = FailCommitInjectCountForTest();
+    if (injectFail > 0) {
+        --injectFail;
+        ok = false;
+    } else if (fflush(f) != 0 || ferror(f) || _commit(_fileno(f)) != 0) {
         ok = false;
     }
     if (fclose(f) != 0) {
@@ -320,11 +354,19 @@ inline bool AppendEntry(RecordKind kind, Entry entry, uint64_t* outSeq = nullptr
             if (it->second.resolved_disposition != entry.disposition) {
                 return false; // Immutable terminal disposition conflict
             }
+            // Previous _commit may have failed even though the frame is readable:
+            // re-sync to disk before reporting durable persistence.
+            if (!SyncWalFileLocked()) {
+                return false;
+            }
             if (outSeq) *outSeq = snap.max_seq;
-            return true; // Idempotent
+            return true; // Idempotent & durably synced
         }
         if (kind == RecordKind::ServiceAck && it->second.has_service_ack) {
             if (it->second.acked_disposition != entry.disposition) {
+                return false;
+            }
+            if (!SyncWalFileLocked()) {
                 return false;
             }
             if (outSeq) *outSeq = snap.max_seq;
