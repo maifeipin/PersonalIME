@@ -125,6 +125,26 @@ public:
     bool IsHoveringManagerButton() const { return m_isHoveringMgrBtn; }
     bool IsPressedManagerButton() const { return m_isPressedMgrBtn; }
 
+    // Stage 7.3: Overflow "⋮" drawer & non-activating popup menu
+    RECT GetMoreButtonRect() const { return m_rcMoreBtn; }
+    bool IsHoveringMoreButton() const { return m_isHoveringMoreBtn; }
+    bool IsPressedMoreButton() const { return m_isPressedMoreBtn; }
+    bool IsMenuOpen() const { return m_isMenuOpen; }
+    void OpenMoreMenu();
+    void CloseMoreMenu();
+    void ToggleMoreMenu();
+    HWND GetMenuHwnd() const { return m_hMenuWnd; }
+    uint32_t GetMenuGeneration() const { return m_menuGeneration; }
+    RECT GetMenuManagerItemRect() const { return m_rcMenuMgrItem; }
+    RECT GetMenuPluginItemRect(size_t index) const {
+        return index < m_menuPluginRects.size() ? m_menuPluginRects[index] : RECT{0, 0, 0, 0};
+    }
+    DWORD GetLastHookInstallError() const { return m_lastHookInstallError; }
+    bool IsHookFallbackManagerVisible() const { return m_showFallbackMgrBtn; }
+    static bool IsHookObserverActive();
+    static void SetHookInstallFailureOverrideForTest(bool fail);
+    void SimulateExternalClickForTest(POINT screenPt, uint32_t generationOverride = 0);
+
     RECT GetPrevButtonRect() const { return m_rcPrevBtn; }
     RECT GetNextButtonRect() const { return m_rcNextBtn; }
     bool IsPrevButtonEnabled() const { return m_snapshot.page_index > 0; }
@@ -159,7 +179,12 @@ private:
     void RebuildFontsForDpi(UINT dpi);
     UINT QueryDpiForPoint(POINT pt) const;
     void ApplyWindowRounding(int width, int height);
+    void ApplyWindowRoundingTo(HWND hWnd, int width, int height, bool* pUsedNative = nullptr);
+    bool EnsureMenuWindow();
+    void RefreshMenuTheme();
+    void HandleExternalClick(POINT screenPt, uint32_t generation);
     static LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
     HWND m_hWnd = nullptr;
     UINT m_dpi = 96;
@@ -198,6 +223,23 @@ private:
     RECT m_rcMgrBtn{0, 0, 0, 0};
     bool m_isHoveringMgrBtn = false;
     bool m_isPressedMgrBtn = false;
+
+    RECT m_rcMoreBtn{0, 0, 0, 0};
+    bool m_isHoveringMoreBtn = false;
+    bool m_isPressedMoreBtn = false;
+    bool m_showFallbackMgrBtn = false;
+    DWORD m_lastHookInstallError = 0;
+
+    HWND m_hMenuWnd = nullptr;
+    bool m_hasRegisteredMenuClassRef = false;
+    bool m_isMenuOpen = false;
+    uint32_t m_menuGeneration = 0;
+    int m_menuHoveredIdx = -1; // 0 = manager, 1..N = plugin index + 1
+    int m_menuPressedIdx = -1;
+    uint32_t m_menuPressedGen = 0;
+    bool m_menuTrackingMouse = false;
+    RECT m_rcMenuMgrItem{0, 0, 0, 0};
+    std::vector<RECT> m_menuPluginRects;
 
     RECT m_rcPrevBtn{0, 0, 0, 0};
     RECT m_rcNextBtn{0, 0, 0, 0};

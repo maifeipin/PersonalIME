@@ -2,10 +2,261 @@
 #include "globals.h"
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 static const wchar_t* CANDIDATE_WND_CLASS = L"PersonalIME_CandidateWnd";
+static const wchar_t* MORE_MENU_WND_CLASS = L"PersonalIME_MoreMenuWnd";
 static LONG s_cClassRef = 0;
+static LONG s_cMenuClassRef = 0;
 static std::atomic<int> s_appsUseLightThemeOverride{-1};
+static std::atomic<bool> s_forceHookInstallFailForTest{false};
+static constexpr UINT WM_APP_EXTERNAL_CLICK = WM_APP + 0x73;
+
+namespace {
+
+struct MenuObserverEntry {
+    uint32_t generation = 0;
+    HWND uiHwnd = nullptr;
+    HWND menuHwnd = nullptr;
+};
+
+struct HookObserverState {
+    std::mutex mutex;
+    std::vector<MenuObserverEntry> entries;
+    HANDLE hThread = nullptr;
+    DWORD threadId = 0;
+    HHOOK hHook = nullptr;
+    DWORD lastError = 0;
+    HANDLE hReadyEvent = nullptr;
+    bool hookInstalled = false;
+};
+
+HookObserverState& GetHookObserverState() {
+    static HookObserverState s_state;
+    return s_state;
+}
+
+LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && lParam != 0) {
+        bool isMouseDown =
+            wParam == WM_LBUTTONDOWN ||
+            wParam == WM_RBUTTONDOWN ||
+            wParam == WM_MBUTTONDOWN ||
+            wParam == WM_NCLBUTTONDOWN ||
+            wParam == WM_NCRBUTTONDOWN ||
+            wParam == WM_NCMBUTTONDOWN;
+        if (isMouseDown) {
+            POINT screenPt = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam)->pt;
+            std::vector<MenuObserverEntry> snapshot;
+            {
+                auto& state = GetHookObserverState();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                snapshot = state.entries;
+            }
+            LPARAM packedPt = MAKELPARAM(static_cast<short>(screenPt.x), static_cast<short>(screenPt.y));
+            for (const auto& entry : snapshot) {
+                if (entry.uiHwnd && entry.generation != 0) {
+                    PostMessageW(entry.uiHwnd, WM_APP_EXTERNAL_CLICK, static_cast<WPARAM>(entry.generation), packedPt);
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+DWORD WINAPI HookObserverThreadProc(LPVOID) {
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(&LowLevelMouseProc),
+        &hMod);
+
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+
+    HHOOK hHook = nullptr;
+    DWORD err = 0;
+    if (s_forceHookInstallFailForTest.load(std::memory_order_acquire)) {
+        err = ERROR_ACCESS_DENIED;
+    } else {
+        hHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hMod, 0);
+        if (!hHook) {
+            err = GetLastError();
+            if (err == 0) err = ERROR_HOOK_NOT_INSTALLED;
+        }
+    }
+
+    HANDLE hReadyToSignal = nullptr;
+    {
+        auto& state = GetHookObserverState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.hHook = hHook;
+        state.lastError = err;
+        state.hookInstalled = (hHook != nullptr);
+        hReadyToSignal = state.hReadyEvent;
+    }
+    if (hReadyToSignal) {
+        SetEvent(hReadyToSignal);
+    }
+
+    if (!hHook) {
+        if (hMod) {
+            FreeLibraryAndExitThread(hMod, 1);
+        }
+        return 1;
+    }
+
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    UnhookWindowsHookEx(hHook);
+    {
+        auto& state = GetHookObserverState();
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.hHook = nullptr;
+        state.hookInstalled = false;
+    }
+
+    if (hMod) {
+        FreeLibraryAndExitThread(hMod, 0);
+    }
+    return 0;
+}
+
+bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD* pOutError) {
+    if (pOutError) *pOutError = 0;
+    if (generation == 0 || !uiHwnd || !menuHwnd) return false;
+
+    auto& state = GetHookObserverState();
+    HANDLE hWaitThread = nullptr;
+    HANDLE hReadyEvent = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.entries.push_back({ generation, uiHwnd, menuHwnd });
+        if (state.hThread != nullptr && state.hookInstalled) {
+            return true;
+        }
+        if (state.hThread == nullptr) {
+            state.lastError = 0;
+            state.hookInstalled = false;
+            state.hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            hReadyEvent = state.hReadyEvent;
+            DWORD tid = 0;
+            state.hThread = CreateThread(nullptr, 0, HookObserverThreadProc, nullptr, 0, &tid);
+            state.threadId = tid;
+            if (!state.hThread) {
+                DWORD err = GetLastError();
+                if (err == 0) err = ERROR_NOT_ENOUGH_MEMORY;
+                state.entries.pop_back();
+                if (state.hReadyEvent) {
+                    CloseHandle(state.hReadyEvent);
+                    state.hReadyEvent = nullptr;
+                }
+                if (pOutError) *pOutError = err;
+                return false;
+            }
+            hWaitThread = state.hThread;
+        } else {
+            hReadyEvent = state.hReadyEvent;
+            hWaitThread = state.hThread;
+        }
+    }
+
+    if (hReadyEvent) {
+        WaitForSingleObject(hReadyEvent, 2000);
+    }
+
+    bool ok = false;
+    DWORD err = 0;
+    HANDLE hFailedThread = nullptr;
+    HANDLE hEventToClose = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        ok = state.hookInstalled;
+        err = state.lastError;
+        if (state.hReadyEvent) {
+            hEventToClose = state.hReadyEvent;
+            state.hReadyEvent = nullptr;
+        }
+        if (!ok) {
+            state.entries.erase(
+                std::remove_if(state.entries.begin(), state.entries.end(),
+                    [generation](const MenuObserverEntry& e) { return e.generation == generation; }),
+                state.entries.end());
+            if (state.entries.empty() && state.hThread == hWaitThread) {
+                hFailedThread = state.hThread;
+                state.hThread = nullptr;
+                state.threadId = 0;
+            }
+        }
+    }
+    if (hEventToClose) {
+        CloseHandle(hEventToClose);
+    }
+    if (hFailedThread) {
+        WaitForSingleObject(hFailedThread, 2000);
+        CloseHandle(hFailedThread);
+    }
+    if (!ok && pOutError) {
+        *pOutError = err ? err : ERROR_HOOK_NOT_INSTALLED;
+    }
+    return ok;
+}
+
+void UnregisterMenuObserverForWindow(HWND uiHwnd) {
+    if (!uiHwnd) return;
+    auto& state = GetHookObserverState();
+    HANDLE hThreadToJoin = nullptr;
+    DWORD tidToQuit = 0;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.entries.erase(
+            std::remove_if(state.entries.begin(), state.entries.end(),
+                [uiHwnd](const MenuObserverEntry& e) { return e.uiHwnd == uiHwnd; }),
+            state.entries.end());
+        if (state.entries.empty() && state.hThread != nullptr) {
+            hThreadToJoin = state.hThread;
+            tidToQuit = state.threadId;
+            state.hThread = nullptr;
+            state.threadId = 0;
+        }
+    }
+    if (hThreadToJoin) {
+        if (tidToQuit != 0) {
+            PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
+        }
+        if (GetCurrentThreadId() != tidToQuit) {
+            WaitForSingleObject(hThreadToJoin, 2000);
+        }
+        CloseHandle(hThreadToJoin);
+    }
+}
+
+bool IsMenuObserverEntryAlive(uint32_t generation, HWND uiHwnd, HWND menuHwnd) {
+    if (generation == 0 || !uiHwnd || !menuHwnd) return false;
+    auto& state = GetHookObserverState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (const auto& e : state.entries) {
+        if (e.generation == generation && e.uiHwnd == uiHwnd && e.menuHwnd == menuHwnd) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+bool CCandidateWindow::IsHookObserverActive() {
+    auto& state = GetHookObserverState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.hookInstalled && !state.entries.empty();
+}
+
+void CCandidateWindow::SetHookInstallFailureOverrideForTest(bool fail) {
+    s_forceHookInstallFailForTest.store(fail, std::memory_order_release);
+}
 
 LONG CCandidateWindow::GetClassRefCount() {
     return InterlockedCompareExchange(&s_cClassRef, 0, 0);
@@ -110,6 +361,27 @@ void CCandidateWindow::RefreshTheme(bool invalidate) {
             InvalidateRect(m_hWnd, nullptr, TRUE);
         }
     }
+    RefreshMenuTheme();
+}
+
+void CCandidateWindow::RefreshMenuTheme() {
+    if (m_hMenuWnd && IsWindow(m_hMenuWnd)) {
+        HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+        if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
+        if (hDwm) {
+            using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+            auto pDwmSet = reinterpret_cast<DwmSetWindowAttributeFn>(
+                GetProcAddress(hDwm, "DwmSetWindowAttribute"));
+            if (pDwmSet) {
+                constexpr DWORD kDwmwaUseImmersiveDarkMode = 20;
+                BOOL darkMode = (m_effectiveTheme == ThemeMode::Dark) ? TRUE : FALSE;
+                pDwmSet(m_hMenuWnd, kDwmwaUseImmersiveDarkMode, &darkMode, sizeof(darkMode));
+            }
+        }
+        if (IsWindowVisible(m_hMenuWnd)) {
+            InvalidateRect(m_hMenuWnd, nullptr, TRUE);
+        }
+    }
 }
 
 UINT CCandidateWindow::QueryDpiForPoint(POINT pt) const {
@@ -183,14 +455,13 @@ void CCandidateWindow::RebuildFontsForDpi(UINT dpi) {
     m_fontDpi = dpi;
 }
 
-void CCandidateWindow::ApplyWindowRounding(int width, int height) {
-    if (!m_hWnd || !IsWindow(m_hWnd)) {
-        m_usingNativeRounding = false;
+void CCandidateWindow::ApplyWindowRoundingTo(HWND hWnd, int width, int height, bool* pUsedNative) {
+    if (pUsedNative) *pUsedNative = false;
+    if (!hWnd || !IsWindow(hWnd)) {
         return;
     }
     // Remove any previous custom region before attempting native Win11 DWM rounded corners
-    SetWindowRgn(m_hWnd, nullptr, FALSE);
-    m_usingNativeRounding = false;
+    SetWindowRgn(hWnd, nullptr, FALSE);
 
     HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
     if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
@@ -202,8 +473,8 @@ void CCandidateWindow::ApplyWindowRounding(int width, int height) {
             constexpr DWORD kDwmwaWindowCornerPreference = 33;
             constexpr DWORD kDwmwcpRound = 2;
             DWORD pref = kDwmwcpRound;
-            if (SUCCEEDED(pDwmSet(m_hWnd, kDwmwaWindowCornerPreference, &pref, sizeof(pref)))) {
-                m_usingNativeRounding = true;
+            if (SUCCEEDED(pDwmSet(hWnd, kDwmwaWindowCornerPreference, &pref, sizeof(pref)))) {
+                if (pUsedNative) *pUsedNative = true;
                 return;
             }
         }
@@ -211,7 +482,11 @@ void CCandidateWindow::ApplyWindowRounding(int width, int height) {
 
     int radius = ScaleDip(8);
     HRGN hRgn = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
-    SetWindowRgn(m_hWnd, hRgn, TRUE);
+    SetWindowRgn(hWnd, hRgn, TRUE);
+}
+
+void CCandidateWindow::ApplyWindowRounding(int width, int height) {
+    ApplyWindowRoundingTo(m_hWnd, width, height, &m_usingNativeRounding);
 }
 
 CCandidateWindow::CCandidateWindow() {
@@ -229,6 +504,9 @@ void CCandidateWindow::InitDefaultPlugins() {
 
 void CCandidateWindow::SetPlugins(const std::vector<CandidatePluginItem>& plugins) {
     m_plugins = plugins;
+    if (m_isMenuOpen) {
+        CloseMoreMenu();
+    }
     if ((!m_candidates.empty() || m_isHeaderVisible) && m_hWnd && IsWindow(m_hWnd) && IsWindowVisible(m_hWnd)) {
         RelayoutCurrent();
     }
@@ -305,6 +583,17 @@ bool CCandidateWindow::EnsureWindow() {
 }
 
 void CCandidateWindow::Destroy() {
+    CloseMoreMenu();
+    if (m_hMenuWnd && IsWindow(m_hMenuWnd)) {
+        DestroyWindow(m_hMenuWnd);
+        m_hMenuWnd = nullptr;
+    }
+    if (m_hasRegisteredMenuClassRef) {
+        m_hasRegisteredMenuClassRef = false;
+        if (InterlockedDecrement(&s_cMenuClassRef) == 0) {
+            UnregisterClassW(MORE_MENU_WND_CLASS, g_hInst);
+        }
+    }
     if (m_hWnd && IsWindow(m_hWnd)) {
         DestroyWindow(m_hWnd);
         m_hWnd = nullptr;
@@ -345,6 +634,7 @@ void CCandidateWindow::ResetAllPressedStates() {
     m_pressedArrowSnapshot = {};
 
     m_isPressedMgrBtn = false;
+    m_isPressedMoreBtn = false;
     for (auto& p : m_plugins) {
         p.isPressed = false;
     }
@@ -442,12 +732,14 @@ std::wstring CCandidateWindow::GetDisplayedPreeditText() const {
 }
 
 void CCandidateWindow::Hide() {
+    CloseMoreMenu();
     if (m_hWnd && IsWindow(m_hWnd)) {
         if (GetCapture() == m_hWnd) {
             ReleaseCapture();
         }
         ShowWindow(m_hWnd, SW_HIDE);
     }
+    m_hasDpiOverride = false;
     m_snapshot = {};
     m_candidates.clear();
     m_candidateRects.clear();
@@ -457,6 +749,7 @@ void CCandidateWindow::Hide() {
     m_selectedIndex = 0;
     m_hoveredIndex = -1;
     m_isHoveringMgrBtn = false;
+    m_isHoveringMoreBtn = false;
     m_isHoveringPrevBtn = false;
     m_isHoveringNextBtn = false;
     for (auto& p : m_plugins) {
@@ -529,6 +822,9 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
     if (m_hWnd && IsWindow(m_hWnd) && GetCapture() == m_hWnd) {
         ReleaseCapture();
     }
+    if (m_isMenuOpen && overrideDpi == 0) {
+        CloseMoreMenu();
+    }
 
     m_snapshot = snapshot;
     if (overrideDpi >= 72) {
@@ -555,6 +851,7 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
     m_isHoveringPrevBtn = false;
     m_isHoveringNextBtn = false;
     m_isHoveringMgrBtn = false;
+    m_isHoveringMoreBtn = false;
     for (auto& p : m_plugins) {
         p.isHovered = false;
     }
@@ -631,11 +928,11 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
         totalHeight = rowTop + candRowHeight;
 
         const int pageBtnW = ScaleDip(20);
-        const int mgrBtnW = ScaleDip(30);
-        const int pluginBtnW = ScaleDip(28);
+        const int mgrBtnW = ScaleDip(28);
+        const int moreBtnW = ScaleDip(24);
         int pagingTotalWidth = pageBtnW * 2;
-        int pluginTotalWidth = static_cast<int>(m_plugins.size()) * pluginBtnW;
-        int controlsTotalWidth = pagingTotalWidth + mgrBtnW + pluginTotalWidth;
+        int fallbackMgrW = m_showFallbackMgrBtn ? mgrBtnW : 0;
+        int controlsTotalWidth = pagingTotalWidth + fallbackMgrW + moreBtnW;
 
         int padLeft = ScaleDip(8);
         int candGap = ScaleDip(16);
@@ -736,11 +1033,15 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
         m_rcNextBtn = { controlsStartX + pageBtnW, rowTop + 1, controlsStartX + pagingTotalWidth, totalHeight - 1 };
 
         int btnStartX = controlsStartX + pagingTotalWidth;
-        m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, totalHeight - 1 };
-        int pX = btnStartX + mgrBtnW;
-        for (size_t i = 0; i < m_plugins.size(); ++i) {
-            m_plugins[i].rcBtn = { pX, rowTop + 1, pX + pluginBtnW, totalHeight - 1 };
-            pX += pluginBtnW;
+        if (m_showFallbackMgrBtn) {
+            m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, totalHeight - 1 };
+            btnStartX += mgrBtnW;
+        } else {
+            m_rcMgrBtn = { 0, 0, 0, 0 };
+        }
+        m_rcMoreBtn = { btnStartX, rowTop + 1, btnStartX + moreBtnW, totalHeight - 1 };
+        for (auto& p : m_plugins) {
+            p.rcBtn = { 0, 0, 0, 0 };
         }
     } else {
         // Header-only mode when raw_input is non-empty but no candidates match
@@ -752,6 +1053,7 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
         m_rcPrevBtn = { 0, 0, 0, 0 };
         m_rcNextBtn = { 0, 0, 0, 0 };
         m_rcMgrBtn = { 0, 0, 0, 0 };
+        m_rcMoreBtn = { 0, 0, 0, 0 };
         for (auto& p : m_plugins) {
             p.rcBtn = { 0, 0, 0, 0 };
         }
@@ -804,6 +1106,12 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         return MA_NOACTIVATE;
     }
 
+    if (uMsg == WM_APP_EXTERNAL_CLICK && pThis) {
+        POINT screenPt = { static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
+        pThis->HandleExternalClick(screenPt, static_cast<uint32_t>(wParam));
+        return 0;
+    }
+
     if ((uMsg == WM_SETTINGCHANGE || uMsg == WM_THEMECHANGED) && pThis) {
         if (uMsg == WM_THEMECHANGED || lParam == 0 ||
             wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0) {
@@ -851,6 +1159,10 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             return TRUE;
         }
         if (PtInRect(&pThis->m_rcMgrBtn, pt)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        if (PtInRect(&pThis->m_rcMoreBtn, pt)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -910,6 +1222,11 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             pThis->m_isHoveringMgrBtn = inside;
             InvalidateRect(hWnd, &pThis->m_rcMgrBtn, FALSE);
         }
+        bool insideMore = PtInRect(&pThis->m_rcMoreBtn, pt);
+        if (insideMore != pThis->m_isHoveringMoreBtn) {
+            pThis->m_isHoveringMoreBtn = insideMore;
+            InvalidateRect(hWnd, &pThis->m_rcMoreBtn, FALSE);
+        }
         for (auto& p : pThis->m_plugins) {
             bool inP = PtInRect(&p.rcBtn, pt);
             if (inP != p.isHovered) {
@@ -946,6 +1263,11 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             pThis->m_isHoveringMgrBtn = false;
             pThis->m_isPressedMgrBtn = false;
             InvalidateRect(hWnd, &pThis->m_rcMgrBtn, FALSE);
+        }
+        if (pThis->m_isHoveringMoreBtn || pThis->m_isPressedMoreBtn) {
+            pThis->m_isHoveringMoreBtn = false;
+            pThis->m_isPressedMoreBtn = false;
+            InvalidateRect(hWnd, &pThis->m_rcMoreBtn, FALSE);
         }
         for (auto& p : pThis->m_plugins) {
             if (p.isHovered || p.isPressed) {
@@ -994,6 +1316,12 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             pThis->m_isPressedMgrBtn = true;
             SetCapture(hWnd);
             InvalidateRect(hWnd, &pThis->m_rcMgrBtn, FALSE);
+            return 0;
+        }
+        if (PtInRect(&pThis->m_rcMoreBtn, pt)) {
+            pThis->m_isPressedMoreBtn = true;
+            SetCapture(hWnd);
+            InvalidateRect(hWnd, &pThis->m_rcMoreBtn, FALSE);
             return 0;
         }
         for (auto& p : pThis->m_plugins) {
@@ -1121,6 +1449,17 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 return 0;
             }
             InvalidateRect(hWnd, &pThis->m_rcMgrBtn, FALSE);
+        }
+        if (pThis->m_isPressedMoreBtn) {
+            pThis->m_isPressedMoreBtn = false;
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
+            InvalidateRect(hWnd, &pThis->m_rcMoreBtn, FALSE);
+            if (PtInRect(&pThis->m_rcMoreBtn, pt)) {
+                pThis->ToggleMoreMenu();
+                return 0;
+            }
         }
         for (auto& p : pThis->m_plugins) {
             if (p.isPressed) {
@@ -1310,17 +1649,23 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
         if (!pThis->m_candidates.empty()) {
             const int pageBtnW = pThis->ScaleDip(20);
-            const int mgrBtnW = pThis->ScaleDip(30);
-            const int pluginBtnW = pThis->ScaleDip(28);
+            const int mgrBtnW = pThis->ScaleDip(28);
+            const int moreBtnW = pThis->ScaleDip(24);
             int pagingTotalWidth = pageBtnW * 2;
-            int pluginTotalWidth = static_cast<int>(pThis->m_plugins.size()) * pluginBtnW;
-            int controlsStartX = clientRc.right - (pagingTotalWidth + mgrBtnW + pluginTotalWidth);
+            int fallbackMgrW = pThis->m_showFallbackMgrBtn ? mgrBtnW : 0;
+            int controlsStartX = clientRc.right - (pagingTotalWidth + fallbackMgrW + moreBtnW);
 
             pThis->m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + pageBtnW, clientRc.bottom - 1 };
             pThis->m_rcNextBtn = { controlsStartX + pageBtnW, rowTop + 1, controlsStartX + pagingTotalWidth, clientRc.bottom - 1 };
             int btnStartX = controlsStartX + pagingTotalWidth;
 
-            pThis->m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, clientRc.bottom - 1 };
+            if (pThis->m_showFallbackMgrBtn) {
+                pThis->m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, clientRc.bottom - 1 };
+                btnStartX += mgrBtnW;
+            } else {
+                pThis->m_rcMgrBtn = { 0, 0, 0, 0 };
+            }
+            pThis->m_rcMoreBtn = { btnStartX, rowTop + 1, btnStartX + moreBtnW, clientRc.bottom - 1 };
 
             HPEN hSepPen = CreatePen(PS_SOLID, 1, pal.dividerColor);
             HPEN hOldPen2 = (HPEN)SelectObject(memDC, hSepPen);
@@ -1364,32 +1709,29 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             const wchar_t* nextIcon = L"\x25B6";
             DrawTextW(memDC, nextIcon, 1, &nextInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            MoveToEx(memDC, pThis->m_rcMgrBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
-            LineTo(memDC, pThis->m_rcMgrBtn.left, clientRc.bottom - pThis->ScaleDip(7));
+            if (pThis->m_showFallbackMgrBtn) {
+                MoveToEx(memDC, pThis->m_rcMgrBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
+                LineTo(memDC, pThis->m_rcMgrBtn.left, clientRc.bottom - pThis->ScaleDip(7));
 
-            RECT btnInner = { pThis->m_rcMgrBtn.left + 2, rowTop + 4, pThis->m_rcMgrBtn.right - 2, clientRc.bottom - 4 };
-            drawBtnBg(btnInner, pThis->m_isPressedMgrBtn, pThis->m_isHoveringMgrBtn, pillRadius);
+                RECT btnInner = { pThis->m_rcMgrBtn.left + 2, rowTop + 4, pThis->m_rcMgrBtn.right - 2, clientRc.bottom - 4 };
+                drawBtnBg(btnInner, pThis->m_isPressedMgrBtn, pThis->m_isHoveringMgrBtn, pillRadius);
+
+                SelectObject(memDC, pThis->m_hFont);
+                SetTextColor(memDC, pThis->m_isHoveringMgrBtn ? pal.btnHoverColor : pal.arrowBtnEnabled);
+                const wchar_t* btnIcon = L"\x2699";
+                DrawTextW(memDC, btnIcon, 1, &btnInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            MoveToEx(memDC, pThis->m_rcMoreBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
+            LineTo(memDC, pThis->m_rcMoreBtn.left, clientRc.bottom - pThis->ScaleDip(7));
+
+            RECT moreInner = { pThis->m_rcMoreBtn.left + 2, rowTop + 4, pThis->m_rcMoreBtn.right - 2, clientRc.bottom - 4 };
+            drawBtnBg(moreInner, pThis->m_isPressedMoreBtn || pThis->m_isMenuOpen, pThis->m_isHoveringMoreBtn, pillRadius);
 
             SelectObject(memDC, pThis->m_hFont);
-            SetTextColor(memDC, pThis->m_isHoveringMgrBtn ? pal.btnHoverColor : pal.arrowBtnEnabled);
-            const wchar_t* btnIcon = L"\x2699";
-            DrawTextW(memDC, btnIcon, 1, &btnInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            int pLeft = btnStartX + mgrBtnW;
-            for (size_t i = 0; i < pThis->m_plugins.size(); ++i) {
-                auto& p = pThis->m_plugins[i];
-                p.rcBtn = { pLeft, rowTop + 1, pLeft + pluginBtnW, clientRc.bottom - 1 };
-
-                MoveToEx(memDC, p.rcBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
-                LineTo(memDC, p.rcBtn.left, clientRc.bottom - pThis->ScaleDip(7));
-
-                RECT pInner = { p.rcBtn.left + 2, rowTop + 4, p.rcBtn.right - 2, clientRc.bottom - 4 };
-                drawBtnBg(pInner, p.isPressed, p.isHovered, pillRadius);
-
-                SetTextColor(memDC, p.isHovered ? pal.btnHoverColor : pal.arrowBtnEnabled);
-                DrawTextW(memDC, p.icon.c_str(), static_cast<int>(p.icon.length()), &pInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                pLeft += pluginBtnW;
-            }
+            SetTextColor(memDC, (pThis->m_isHoveringMoreBtn || pThis->m_isMenuOpen) ? pal.btnHoverColor : pal.arrowBtnEnabled);
+            const wchar_t* moreIcon = L"\x22EE";
+            DrawTextW(memDC, moreIcon, 1, &moreInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
             SelectObject(memDC, hOldPen2);
             DeleteObject(hSepPen);
@@ -1398,6 +1740,422 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         // Copy memory DC to screen
         BitBlt(hdc, 0, 0, clientRc.right, clientRc.bottom, memDC, 0, 0, SRCCOPY);
 
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+bool CCandidateWindow::EnsureMenuWindow() {
+    if (m_hMenuWnd && IsWindow(m_hMenuWnd)) {
+        return true;
+    }
+    if (!EnsureWindow()) {
+        return false;
+    }
+    if (!m_hasRegisteredMenuClassRef) {
+        if (InterlockedIncrement(&s_cMenuClassRef) == 1) {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.style = CS_HREDRAW | CS_VREDRAW;
+            wc.lpfnWndProc = MenuWndProc;
+            wc.hInstance = g_hInst;
+            wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+            wc.lpszClassName = MORE_MENU_WND_CLASS;
+            if (!RegisterClassExW(&wc)) {
+                DWORD err = GetLastError();
+                if (err != ERROR_CLASS_ALREADY_EXISTS) {
+                    InterlockedDecrement(&s_cMenuClassRef);
+                    return false;
+                }
+            }
+        }
+        m_hasRegisteredMenuClassRef = true;
+    }
+
+    m_hMenuWnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        MORE_MENU_WND_CLASS,
+        L"",
+        WS_POPUP,
+        0, 0, 120, 40,
+        m_hWnd,
+        nullptr,
+        g_hInst,
+        this
+    );
+
+    if (!m_hMenuWnd) {
+        if (m_hasRegisteredMenuClassRef) {
+            m_hasRegisteredMenuClassRef = false;
+            if (InterlockedDecrement(&s_cMenuClassRef) == 0) {
+                UnregisterClassW(MORE_MENU_WND_CLASS, g_hInst);
+            }
+        }
+        return false;
+    }
+    RefreshMenuTheme();
+    return true;
+}
+
+void CCandidateWindow::OpenMoreMenu() {
+    if (m_isMenuOpen) return;
+    if (!m_hWnd || !IsWindow(m_hWnd) || !IsWindowVisible(m_hWnd)) {
+        return;
+    }
+    if (!EnsureMenuWindow()) {
+        return;
+    }
+
+    RECT candWndRc{};
+    GetWindowRect(m_hWnd, &candWndRc);
+
+    POINT moreRightBottom = { m_rcMoreBtn.right, m_rcMoreBtn.bottom };
+    ClientToScreen(m_hWnd, &moreRightBottom);
+
+    HMONITOR hMon = MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(hMon, &mi);
+    int workWidth = static_cast<int>(mi.rcWork.right - mi.rcWork.left);
+    int maxMenuWidth = (std::max)(ScaleDip(120), (std::min)(workWidth - ScaleDip(8), ScaleDip(260)));
+
+    HDC hdc = GetDC(m_hMenuWnd);
+    HFONT hMenuFont = m_hFont;
+    HFONT hOldFont = (HFONT)SelectObject(hdc, hMenuFont);
+
+    auto measureItem = [&](const std::wstring& text) -> int {
+        RECT rc = { 0, 0, 0, 0 };
+        DrawTextW(hdc, text.c_str(), static_cast<int>(text.length()), &rc, DT_CALCRECT | DT_SINGLELINE);
+        return static_cast<int>(rc.right - rc.left);
+    };
+
+    const std::wstring mgrLabel = L"\x2699  设置与词库管理";
+    int maxTextW = measureItem(mgrLabel);
+    for (const auto& p : m_plugins) {
+        std::wstring label = p.icon + L"  " + p.name;
+        maxTextW = (std::max)(maxTextW, measureItem(label));
+    }
+
+    SelectObject(hdc, hOldFont);
+    ReleaseDC(m_hMenuWnd, hdc);
+
+    int padX = ScaleDip(14);
+    int padY = ScaleDip(6);
+    int itemH = ScaleDip(28);
+    int menuW = (std::min)(maxMenuWidth, (std::max)(ScaleDip(156), maxTextW + padX * 2));
+    int itemCount = 1 + static_cast<int>(m_plugins.size());
+    int menuH = padY * 2 + itemCount * itemH;
+
+    int curY = padY;
+    m_rcMenuMgrItem = { ScaleDip(4), curY, menuW - ScaleDip(4), curY + itemH };
+    curY += itemH;
+    m_menuPluginRects.resize(m_plugins.size());
+    for (size_t i = 0; i < m_plugins.size(); ++i) {
+        m_menuPluginRects[i] = { ScaleDip(4), curY, menuW - ScaleDip(4), curY + itemH };
+        curY += itemH;
+    }
+
+    int x = moreRightBottom.x - menuW;
+    int y = candWndRc.bottom + ScaleDip(4);
+    if (y + menuH > mi.rcWork.bottom) {
+        y = candWndRc.top - menuH - ScaleDip(4);
+    }
+    if (x + menuW > mi.rcWork.right) x = mi.rcWork.right - menuW;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+    if (y + menuH > mi.rcWork.bottom) y = (std::max)(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom) - menuH);
+
+    if (++m_menuGeneration == 0) ++m_menuGeneration;
+    DWORD hookErr = 0;
+    if (!RegisterMenuObserver(m_menuGeneration, m_hWnd, m_hMenuWnd, &hookErr)) {
+        if (++m_menuGeneration == 0) ++m_menuGeneration;
+        m_isMenuOpen = false;
+        m_lastHookInstallError = hookErr;
+        m_showFallbackMgrBtn = true;
+        RelayoutCurrent();
+        return;
+    }
+
+    m_lastHookInstallError = 0;
+    m_isMenuOpen = true;
+    m_menuHoveredIdx = -1;
+    m_menuPressedIdx = -1;
+    m_menuPressedGen = 0;
+    m_menuTrackingMouse = false;
+
+    ApplyWindowRoundingTo(m_hMenuWnd, menuW, menuH, nullptr);
+    RefreshMenuTheme();
+
+    SetWindowPos(
+        m_hMenuWnd,
+        HWND_TOPMOST,
+        x, y, menuW, menuH,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW
+    );
+    InvalidateRect(m_hMenuWnd, nullptr, TRUE);
+    if (m_hWnd && IsWindow(m_hWnd)) {
+        InvalidateRect(m_hWnd, &m_rcMoreBtn, FALSE);
+    }
+}
+
+void CCandidateWindow::CloseMoreMenu() {
+    if (++m_menuGeneration == 0) ++m_menuGeneration;
+    if (m_hWnd) {
+        UnregisterMenuObserverForWindow(m_hWnd);
+    }
+    bool wasOpen = m_isMenuOpen;
+    m_isMenuOpen = false;
+    m_menuHoveredIdx = -1;
+    m_menuPressedIdx = -1;
+    m_menuPressedGen = 0;
+    m_menuTrackingMouse = false;
+    if (m_hMenuWnd && IsWindow(m_hMenuWnd)) {
+        if (GetCapture() == m_hMenuWnd) {
+            ReleaseCapture();
+        }
+        ShowWindow(m_hMenuWnd, SW_HIDE);
+    }
+    if (wasOpen && m_hWnd && IsWindow(m_hWnd)) {
+        InvalidateRect(m_hWnd, &m_rcMoreBtn, FALSE);
+    }
+}
+
+void CCandidateWindow::ToggleMoreMenu() {
+    if (m_isMenuOpen) {
+        CloseMoreMenu();
+    } else {
+        OpenMoreMenu();
+    }
+}
+
+void CCandidateWindow::HandleExternalClick(POINT screenPt, uint32_t generation) {
+    if (!m_isMenuOpen || generation == 0 || generation != m_menuGeneration) {
+        return;
+    }
+    if (!m_hWnd || !IsWindow(m_hWnd) || !m_hMenuWnd || !IsWindow(m_hMenuWnd) || !IsWindowVisible(m_hMenuWnd)) {
+        return;
+    }
+    if (!IsMenuObserverEntryAlive(generation, m_hWnd, m_hMenuWnd)) {
+        return;
+    }
+
+    RECT menuScreenRc{};
+    GetWindowRect(m_hMenuWnd, &menuScreenRc);
+    if (PtInRect(&menuScreenRc, screenPt)) {
+        return;
+    }
+
+    RECT moreBtnScreenRc = m_rcMoreBtn;
+    MapWindowPoints(m_hWnd, nullptr, reinterpret_cast<LPPOINT>(&moreBtnScreenRc), 2);
+    if (PtInRect(&moreBtnScreenRc, screenPt)) {
+        return;
+    }
+
+    CloseMoreMenu();
+}
+
+void CCandidateWindow::SimulateExternalClickForTest(POINT screenPt, uint32_t generationOverride) {
+    if (!m_hWnd || !IsWindow(m_hWnd)) return;
+    uint32_t gen = (generationOverride != 0) ? generationOverride : m_menuGeneration;
+    PostMessageW(
+        m_hWnd,
+        WM_APP_EXTERNAL_CLICK,
+        static_cast<WPARAM>(gen),
+        MAKELPARAM(static_cast<short>(screenPt.x), static_cast<short>(screenPt.y)));
+}
+
+LRESULT CALLBACK CCandidateWindow::MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    CCandidateWindow* pThis = nullptr;
+    if (uMsg == WM_CREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
+        pThis = static_cast<CCandidateWindow*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pThis));
+    } else {
+        pThis = reinterpret_cast<CCandidateWindow*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    }
+
+    if (uMsg == WM_MOUSEACTIVATE) {
+        return MA_NOACTIVATE;
+    }
+
+    if (uMsg == WM_SETCURSOR && pThis) {
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(hWnd, &pt);
+        if (PtInRect(&pThis->m_rcMenuMgrItem, pt)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        for (const auto& rcP : pThis->m_menuPluginRects) {
+            if (PtInRect(&rcP, pt)) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+        }
+    }
+
+    if (uMsg == WM_MOUSEMOVE && pThis) {
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        int newHovered = -1;
+        if (PtInRect(&pThis->m_rcMenuMgrItem, pt)) {
+            newHovered = 0;
+        } else {
+            for (size_t i = 0; i < pThis->m_menuPluginRects.size(); ++i) {
+                if (PtInRect(&pThis->m_menuPluginRects[i], pt)) {
+                    newHovered = static_cast<int>(i) + 1;
+                    break;
+                }
+            }
+        }
+        if (newHovered != pThis->m_menuHoveredIdx) {
+            pThis->m_menuHoveredIdx = newHovered;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        if (!pThis->m_menuTrackingMouse) {
+            TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, hWnd, 0 };
+            TrackMouseEvent(&tme);
+            pThis->m_menuTrackingMouse = true;
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_MOUSELEAVE && pThis) {
+        pThis->m_menuTrackingMouse = false;
+        if (pThis->m_menuHoveredIdx != -1) {
+            pThis->m_menuHoveredIdx = -1;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_LBUTTONDOWN && pThis) {
+        POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+        int hit = -1;
+        if (PtInRect(&pThis->m_rcMenuMgrItem, pt)) {
+            hit = 0;
+        } else {
+            for (size_t i = 0; i < pThis->m_menuPluginRects.size(); ++i) {
+                if (PtInRect(&pThis->m_menuPluginRects[i], pt)) {
+                    hit = static_cast<int>(i) + 1;
+                    break;
+                }
+            }
+        }
+        if (hit >= 0) {
+            pThis->m_menuPressedIdx = hit;
+            pThis->m_menuPressedGen = pThis->m_menuGeneration;
+            SetCapture(hWnd);
+            InvalidateRect(hWnd, nullptr, FALSE);
+            return 0;
+        }
+    }
+
+    if (uMsg == WM_LBUTTONUP && pThis) {
+        if (pThis->m_menuPressedIdx >= 0) {
+            int pressed = pThis->m_menuPressedIdx;
+            uint32_t pressedGen = pThis->m_menuPressedGen;
+            pThis->m_menuPressedIdx = -1;
+            pThis->m_menuPressedGen = 0;
+            if (GetCapture() == hWnd) {
+                ReleaseCapture();
+            }
+
+            POINT pt = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+            bool sameGen = (pressedGen != 0 && pressedGen == pThis->m_menuGeneration && pThis->m_isMenuOpen);
+            if (sameGen) {
+                if (pressed == 0 && PtInRect(&pThis->m_rcMenuMgrItem, pt)) {
+                    pThis->CloseMoreMenu();
+                    pThis->TriggerManagerButton();
+                    return 0;
+                }
+                int pluginIdx = pressed - 1;
+                if (pluginIdx >= 0 &&
+                    static_cast<size_t>(pluginIdx) < pThis->m_menuPluginRects.size() &&
+                    static_cast<size_t>(pluginIdx) < pThis->m_plugins.size() &&
+                    PtInRect(&pThis->m_menuPluginRects[pluginIdx], pt)) {
+                    uint32_t pid = pThis->m_plugins[pluginIdx].id;
+                    pThis->CloseMoreMenu();
+                    pThis->TriggerPluginButton(pid);
+                    return 0;
+                }
+            }
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_CAPTURECHANGED && pThis) {
+        if (reinterpret_cast<HWND>(lParam) != hWnd) {
+            pThis->m_menuPressedIdx = -1;
+            pThis->m_menuPressedGen = 0;
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    if (uMsg == WM_PAINT && pThis) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT clientRc;
+        GetClientRect(hWnd, &clientRc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, clientRc.right, clientRc.bottom);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
+        const CandidateThemePalette& pal = pThis->m_palette;
+        HBRUSH hBg = CreateSolidBrush(pal.bgColor);
+        FillRect(memDC, &clientRc, hBg);
+        DeleteObject(hBg);
+
+        HPEN hBorderPen = CreatePen(PS_SOLID, 1, pal.borderColor);
+        HPEN hOldPen = (HPEN)SelectObject(memDC, hBorderPen);
+        SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        Rectangle(memDC, clientRc.left, clientRc.top, clientRc.right, clientRc.bottom);
+        SelectObject(memDC, hOldPen);
+        DeleteObject(hBorderPen);
+
+        SetBkMode(memDC, TRANSPARENT);
+        SelectObject(memDC, pThis->m_hFont);
+
+        int rad = pThis->ScaleDip(6);
+        int textPadX = pThis->ScaleDip(10);
+
+        auto drawMenuItem = [&](const RECT& rc, int idx, const std::wstring& label) {
+            bool isHovered = (pThis->m_menuHoveredIdx == idx);
+            bool isPressed = (pThis->m_menuPressedIdx == idx);
+            if (isHovered || isPressed) {
+                COLORREF bg = isPressed ? pal.pressedPillBg : pal.hoverPillBg;
+                HBRUSH hB = CreateSolidBrush(bg);
+                HPEN hP = CreatePen(PS_SOLID, 1, bg);
+                HPEN hOP = (HPEN)SelectObject(memDC, hP);
+                HBRUSH hOB = (HBRUSH)SelectObject(memDC, hB);
+                RoundRect(memDC, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
+                SelectObject(memDC, hOP);
+                SelectObject(memDC, hOB);
+                DeleteObject(hP);
+                DeleteObject(hB);
+            }
+            SetTextColor(memDC, (isHovered || isPressed) ? pal.btnHoverColor : pal.candidateTextColor);
+            RECT rcText = { rc.left + textPadX, rc.top, rc.right - textPadX, rc.bottom };
+            DrawTextW(memDC, label.c_str(), static_cast<int>(label.length()), &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        };
+
+        drawMenuItem(pThis->m_rcMenuMgrItem, 0, L"\x2699  设置与词库管理");
+        for (size_t i = 0; i < pThis->m_plugins.size() && i < pThis->m_menuPluginRects.size(); ++i) {
+            const auto& p = pThis->m_plugins[i];
+            drawMenuItem(pThis->m_menuPluginRects[i], static_cast<int>(i) + 1, p.icon + L"  " + p.name);
+        }
+
+        BitBlt(hdc, 0, 0, clientRc.right, clientRc.bottom, memDC, 0, 0, SRCCOPY);
         SelectObject(memDC, oldBmp);
         DeleteObject(memBmp);
         DeleteDC(memDC);

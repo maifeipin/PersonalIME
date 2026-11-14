@@ -85,11 +85,11 @@ int main() {
         // Force paint message to establish layout
         SendMessageW(win.GetHwnd(), WM_PAINT, 0, 0);
 
-        RECT rcBtn = win.GetManagerButtonRect();
+        RECT rcBtn = win.GetMoreButtonRect();
         int btnWidth = rcBtn.right - rcBtn.left;
         int btnHeight = rcBtn.bottom - rcBtn.top;
-        CHECK_EQ(btnWidth > 20, true, L"Manager button width must be > 20px");
-        CHECK_EQ(btnHeight > 0, true, L"Manager button height must be > 0");
+        CHECK_EQ(btnWidth > 18, true, L"More button width must be > 18px");
+        CHECK_EQ(btnHeight > 0, true, L"More button height must be > 0");
 
         // Focus preservation check: must return MA_NOACTIVATE
         LRESULT actRes = SendMessageW(win.GetHwnd(), WM_MOUSEACTIVATE, (WPARAM)win.GetHwnd(), MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN));
@@ -98,29 +98,36 @@ int main() {
         // Hover test
         POINT insidePt = { (rcBtn.left + rcBtn.right) / 2, (rcBtn.top + rcBtn.bottom) / 2 };
         SendMessageW(win.GetHwnd(), WM_MOUSEMOVE, 0, MAKELPARAM(insidePt.x, insidePt.y));
-        CHECK_EQ(win.IsHoveringManagerButton(), true, L"Mouse move over manager button must set hover");
+        CHECK_EQ(win.IsHoveringMoreButton(), true, L"Mouse move over more button must set hover");
 
         SendMessageW(win.GetHwnd(), WM_MOUSELEAVE, 0, 0);
-        CHECK_EQ(win.IsHoveringManagerButton(), false, L"Mouse leave must clear hover");
+        CHECK_EQ(win.IsHoveringMoreButton(), false, L"Mouse leave must clear hover");
 
-        // Click callback test
+        // Click more button -> opens non-activating menu, then click Manager item inside menu
         bool mgrClicked = false;
         win.SetOnOpenManager([&]() { mgrClicked = true; });
 
         SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(insidePt.x, insidePt.y));
-        CHECK_EQ(win.IsPressedManagerButton(), true, L"LButtonDown inside button must set pressed");
+        CHECK_EQ(win.IsPressedMoreButton(), true, L"LButtonDown inside more button must set pressed");
 
         SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(insidePt.x, insidePt.y));
-        CHECK_EQ(win.IsPressedManagerButton(), false, L"LButtonUp must clear pressed");
-        CHECK_EQ(mgrClicked, true, L"LButtonUp inside manager button must invoke OnOpenManager");
+        CHECK_EQ(win.IsPressedMoreButton(), false, L"LButtonUp must clear pressed");
+        CHECK_EQ(win.IsMenuOpen(), true, L"Clicking more button opens overflow menu");
+
+        RECT rcMgrItem = win.GetMenuManagerItemRect();
+        POINT ptMgrItem = { (rcMgrItem.left + rcMgrItem.right) / 2, (rcMgrItem.top + rcMgrItem.bottom) / 2 };
+        SendMessageW(win.GetMenuHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptMgrItem.x, ptMgrItem.y));
+        SendMessageW(win.GetMenuHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptMgrItem.x, ptMgrItem.y));
+        CHECK_EQ(mgrClicked, true, L"Clicking manager item in menu must invoke OnOpenManager");
+        CHECK_EQ(win.IsMenuOpen(), false, L"Menu must close after triggering manager item");
         CHECK_EQ(IsWindowVisible(win.GetHwnd()), FALSE, L"Window must be hidden after triggering manager button");
 
         win.Destroy();
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
     }
-    std::wcout << L"[PASS] Verified: Manager button on candidate window preserves host focus (MA_NOACTIVATE) and handles click." << std::endl;
+    std::wcout << L"[PASS] Verified: Overflow button & menu preserve host focus (MA_NOACTIVATE) and handle manager click." << std::endl;
 
-    // 6. Plugin buttons rendering, count, and execution callback test
+    // 6. Plugin items inside overflow menu rendering, count, and execution callback test
     {
         CCandidateWindow win;
         CHECK_EQ(win.GetPlugins().size(), 3, L"Default plugins count must be 3 (calc, paint, edge)");
@@ -139,17 +146,24 @@ int main() {
         CHECK_EQ(plugins[1].name, L"画图", L"Plugin 1 must be 画图");
         CHECK_EQ(plugins[2].name, L"Edge浏览器", L"Plugin 2 must be Edge浏览器");
 
-        // Click plugin 1 (calc)
-        RECT rcP0 = plugins[0].rcBtn;
+        // Open more menu and click plugin 0 (calc)
+        RECT rcMore = win.GetMoreButtonRect();
+        POINT ptMore = { (rcMore.left + rcMore.right) / 2, (rcMore.top + rcMore.bottom) / 2 };
+        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptMore.x, ptMore.y));
+        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptMore.x, ptMore.y));
+        CHECK_EQ(win.IsMenuOpen(), true, L"More menu opens for plugin execution");
+
+        RECT rcP0 = win.GetMenuPluginItemRect(0);
         POINT ptP0 = { (rcP0.left + rcP0.right) / 2, (rcP0.top + rcP0.bottom) / 2 };
-        SendMessageW(win.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptP0.x, ptP0.y));
-        SendMessageW(win.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptP0.x, ptP0.y));
-        CHECK_EQ(executedId, 1, L"Clicking plugin 0 must trigger OnExecutePlugin with id=1");
+        SendMessageW(win.GetMenuHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptP0.x, ptP0.y));
+        SendMessageW(win.GetMenuHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptP0.x, ptP0.y));
+        CHECK_EQ(executedId, 1, L"Clicking plugin 0 in menu must trigger OnExecutePlugin with id=1");
+        CHECK_EQ(win.IsMenuOpen(), false, L"Menu closes after executing plugin");
 
         win.Destroy();
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
     }
-    std::wcout << L"[PASS] Verified: Plugin list loaded on candidate bar, aligned with settings button, and executes cleanly." << std::endl;
+    std::wcout << L"[PASS] Verified: Plugin list loaded in overflow drawer and executes cleanly." << std::endl;
 
     // 7. Candidate selection (keyboard SetSelectedIndex, mouse hover selection, click commit & wheel scroll)
     {
@@ -539,7 +553,7 @@ int main() {
         RECT clientRc{};
         GetClientRect(hWnd, &clientRc);
         CHECK_EQ(wnd.GetNextButtonRect().right <= clientRc.right, true, L"Paging buttons stay inside clamped window");
-        CHECK_EQ(wnd.GetManagerButtonRect().right <= clientRc.right, true, L"Manager button stays inside clamped window");
+        CHECK_EQ(wnd.GetMoreButtonRect().right <= clientRc.right, true, L"More button stays inside clamped window");
 
         // 7b. Long first candidate must NOT starve subsequent candidates or overlap paging controls
         CandidateDisplaySnapshot mixedLongSnap{};
@@ -569,13 +583,13 @@ int main() {
         CHECK_EQ(candRects.size(), static_cast<size_t>(3), L"All 3 candidate rects exist");
         RECT rcPrev = wnd.GetPrevButtonRect();
         RECT rcNext = wnd.GetNextButtonRect();
-        RECT rcMgr = wnd.GetManagerButtonRect();
+        RECT rcMore = wnd.GetMoreButtonRect();
         for (size_t i = 0; i < candRects.size(); ++i) {
             CHECK_EQ(!IsRectEmpty(&candRects[i]), true, L"Subsequent candidate after long first item has non-empty rect");
             RECT dummy{};
             CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcPrev) == 0, true, L"Candidate rect disjoint from Prev button");
             CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcNext) == 0, true, L"Candidate rect disjoint from Next button");
-            CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcMgr) == 0, true, L"Candidate rect disjoint from Manager button");
+            CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcMore) == 0, true, L"Candidate rect disjoint from More button");
         }
 
         // Clicking candidate 2 (after long candidate 0) selects index 2
@@ -634,6 +648,123 @@ int main() {
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
     }
     std::wcout << L"[PASS] Verified: Stage 7.2 Light/Dark auto theming, WM_SETTINGCHANGE refresh, DPI layout & WorkArea clamping." << std::endl;
+
+    // 8. Stage 7.3: Non-activating "⋮" overflow menu, on-demand WH_MOUSE_LL observer, external click & hook-failure fallback
+    {
+        CCandidateWindow wnd;
+        CandidateDisplaySnapshot snap{};
+        snap.candidate_version = 1;
+        snap.context_id = 1;
+        snap.context_epoch = 1;
+        snap.input_generation = 1;
+        snap.page_index = 0;
+        snap.page_count = 2;
+        snap.query_code = L"ceshi";
+        snap.candidates = { L"1. 测试", L"2. 菜单" };
+
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Hook observer must be inactive before menu opens");
+        wnd.Show(snap, { 150, 150 });
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Hook observer remains inactive while menu is closed");
+
+        RECT rcMore = wnd.GetMoreButtonRect();
+        POINT ptMoreClient = { (rcMore.left + rcMore.right) / 2, (rcMore.top + rcMore.bottom) / 2 };
+
+        // Click ⋮ -> opens menu & starts WH_MOUSE_LL observer
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptMoreClient.x, ptMoreClient.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptMoreClient.x, ptMoreClient.y));
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"Clicking ⋮ opens overflow menu");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), true, L"WH_MOUSE_LL observer activates when menu opens");
+
+        HWND hMenu = wnd.GetMenuHwnd();
+        CHECK_EQ(hMenu != nullptr && IsWindowVisible(hMenu) != FALSE, true, L"Menu window is visible");
+        LRESULT menuAct = SendMessageW(hMenu, WM_MOUSEACTIVATE, reinterpret_cast<WPARAM>(hMenu), MAKELPARAM(HTCLIENT, WM_LBUTTONDOWN));
+        CHECK_EQ(menuAct, MA_NOACTIVATE, L"Menu WM_MOUSEACTIVATE returns MA_NOACTIVATE");
+        SendMessageW(hMenu, WM_PAINT, 0, 0);
+
+        // External click inside menu -> keeps menu open
+        RECT menuScreenRc{};
+        GetWindowRect(hMenu, &menuScreenRc);
+        POINT insideMenuScreen = { (menuScreenRc.left + menuScreenRc.right) / 2, (menuScreenRc.top + menuScreenRc.bottom) / 2 };
+        wnd.SimulateExternalClickForTest(insideMenuScreen);
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"External click inside menu does not close menu");
+
+        // External click inside ⋮ button -> must NOT double-toggle
+        POINT moreScreen = ptMoreClient;
+        ClientToScreen(wnd.GetHwnd(), &moreScreen);
+        wnd.SimulateExternalClickForTest(moreScreen);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"External click notification on ⋮ does not double-toggle menu");
+
+        // Second click on ⋮ toggles menu closed & stops observer
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptMoreClient.x, ptMoreClient.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptMoreClient.x, ptMoreClient.y));
+        CHECK_EQ(wnd.IsMenuOpen(), false, L"Second click on ⋮ closes menu");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"WH_MOUSE_LL observer stops after menu closes");
+
+        // Re-open menu, test stale generation notification is ignored, and real external click outside closes menu
+        wnd.OpenMoreMenu();
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"Menu re-opens cleanly");
+        uint32_t staleGen = wnd.GetMenuGeneration() - 1;
+        if (staleGen == 0) staleGen = 9999;
+        POINT outsidePt = { menuScreenRc.right + 120, menuScreenRc.bottom + 120 };
+        wnd.SimulateExternalClickForTest(outsidePt, staleGen);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"Stale menu_generation notification must be ignored");
+
+        // Real-generation external click outside -> closes menu
+        wnd.SimulateExternalClickForTest(outsidePt);
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        CHECK_EQ(wnd.IsMenuOpen(), false, L"External click outside menu and ⋮ closes menu");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer stops after external click closes menu");
+
+        // Theme switch while menu is open refreshes both windows without closing
+        wnd.OpenMoreMenu();
+        CHECK_EQ(wnd.IsMenuOpen(), true, L"Menu open for theme sync test");
+        wnd.SetThemeMode(ThemeMode::Dark);
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Dark, true, L"Theme switches to Dark while menu is open");
+        SendMessageW(hMenu, WM_PAINT, 0, 0);
+        wnd.Hide();
+        CHECK_EQ(wnd.IsMenuOpen(), false, L"Hide() closes open menu");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Hide() unregisters hook observer");
+
+        // Hook installation failure fallback -> menu does NOT open, error recorded, fallback manager button shown & clickable
+        CCandidateWindow::SetHookInstallFailureOverrideForTest(true);
+        wnd.Show(snap, { 150, 150 });
+        wnd.OpenMoreMenu();
+        CHECK_EQ(wnd.IsMenuOpen(), false, L"Menu does not open when WH_MOUSE_LL installation fails");
+        CHECK_EQ(wnd.GetLastHookInstallError() != 0, true, L"Hook installation failure records non-zero error");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer remains inactive on hook failure");
+        CHECK_EQ(wnd.IsHookFallbackManagerVisible(), true, L"Fallback manager shortcut is exposed on hook failure");
+
+        bool fallbackMgrTriggered = false;
+        wnd.SetOnOpenManager([&]() { fallbackMgrTriggered = true; });
+        RECT rcFallbackMgr = wnd.GetManagerButtonRect();
+        CHECK_EQ(!IsRectEmpty(&rcFallbackMgr), true, L"Fallback manager button rect is non-empty");
+        POINT ptFallbackMgr = { (rcFallbackMgr.left + rcFallbackMgr.right) / 2, (rcFallbackMgr.top + rcFallbackMgr.bottom) / 2 };
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptFallbackMgr.x, ptFallbackMgr.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptFallbackMgr.x, ptFallbackMgr.y));
+        CHECK_EQ(fallbackMgrTriggered, true, L"Fallback manager shortcut still opens manager");
+
+        CCandidateWindow::SetHookInstallFailureOverrideForTest(false);
+        wnd.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after Destroy");
+    }
+    std::wcout << L"[PASS] Verified: Stage 7.3 non-activating overflow menu, on-demand WH_MOUSE_LL observer & hook failure fallback." << std::endl;
 
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
