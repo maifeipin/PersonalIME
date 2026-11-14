@@ -153,6 +153,7 @@ public:
 
 private:
     bool EnsureWindow();
+    void LayoutAndShow(const CandidateDisplaySnapshot& snapshot, POINT anchorPt, UINT overrideDpi, const RECT* pSuggestedRect);
     void InitDefaultPlugins();
     void RebuildFontsForDpi(UINT dpi);
     UINT QueryDpiForPoint(POINT pt) const;

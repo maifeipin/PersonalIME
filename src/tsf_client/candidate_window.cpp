@@ -507,6 +507,10 @@ void CCandidateWindow::Show(const std::vector<std::wstring>& candidates, POINT p
 }
 
 void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) {
+    LayoutAndShow(snapshot, pt, 0, nullptr);
+}
+
+void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, POINT anchorPt, UINT overrideDpi, const RECT* pSuggestedRect) {
     bool showHeader = ShouldShowPreeditHeader(snapshot, m_preeditDisplayMode);
     if (snapshot.candidates.empty() && !showHeader) {
         Hide();
@@ -522,8 +526,12 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     }
 
     m_snapshot = snapshot;
-    m_lastShowPt = pt;
-    m_dpi = QueryDpiForPoint(pt);
+    if (overrideDpi >= 72) {
+        m_dpi = overrideDpi;
+    } else {
+        m_lastShowPt = anchorPt;
+        m_dpi = QueryDpiForPoint(anchorPt);
+    }
     RebuildFontsForDpi(m_dpi);
     RefreshTheme(false);
 
@@ -546,7 +554,9 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     m_candidateRects.clear();
     ResetAllPressedStates();
 
-    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    HMONITOR hMon = pSuggestedRect
+        ? MonitorFromRect(pSuggestedRect, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromPoint(anchorPt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(hMon, &mi);
@@ -636,29 +646,85 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
             totalWidth = minRequiredWidth;
         }
 
-        // Fit candidate pills cleanly within available width before controls
-        int availCandRight = totalWidth - controlsTotalWidth - ScaleDip(4);
+        // Fit all candidate pills strictly within [availCandLeft, availCandRight)
+        // using water-filling allocation so a single long candidate never starves
+        // subsequent items on the same page and never overlaps control buttons.
+        int controlsStartX = totalWidth - controlsTotalWidth;
+        int availCandLeft = ScaleDip(4);
+        int availCandRight = (std::max)(availCandLeft, controlsStartX - ScaleDip(4));
+        int availTotalWidth = availCandRight - availCandLeft;
+
         int pillPadL = ScaleDip(4);
         int pillPadR = ScaleDip(6);
         int pillPadV = ScaleDip(4);
-        curX = padLeft;
-        m_candidateRects.resize(m_candidates.size());
-        for (size_t i = 0; i < m_candidates.size(); ++i) {
-            int pillLeft = curX - pillPadL;
-            int pillRight = curX + candWidths[i] + pillPadR;
-            if (pillRight > availCandRight) {
-                pillRight = (std::max)(pillLeft + ScaleDip(20), availCandRight);
+        int interPillGap = ScaleDip(6);
+        size_t n = m_candidates.size();
+
+        m_candidateRects.assign(n, { 0, 0, 0, 0 });
+        if (availTotalWidth > 0 && n > 0) {
+            int gapCount = (n > 1) ? static_cast<int>(n - 1) : 0;
+            if (gapCount > 0 && availTotalWidth < static_cast<int>(n) * ScaleDip(16) + gapCount * interPillGap) {
+                int maxGapBudget = (std::max)(0, availTotalWidth - static_cast<int>(n) * ScaleDip(12));
+                interPillGap = (std::min)(interPillGap, maxGapBudget / gapCount);
             }
-            if (pillLeft >= availCandRight) {
-                m_candidateRects[i] = { 0, 0, 0, 0 }; // Clamped out of view
-            } else {
-                m_candidateRects[i] = { pillLeft, rowTop + pillPadV, pillRight, totalHeight - pillPadV };
+            int pillBudget = availTotalWidth - gapCount * interPillGap;
+
+            if (pillBudget > 0) {
+                std::vector<int> natPillW(n, 0);
+                int sumNat = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    natPillW[i] = pillPadL + candWidths[i] + pillPadR;
+                    sumNat += natPillW[i];
+                }
+
+                std::vector<int> allocW(n, 0);
+                if (sumNat <= pillBudget) {
+                    allocW = natPillW;
+                } else {
+                    std::vector<bool> settled(n, false);
+                    int remainingBudget = pillBudget;
+                    int remainingCount = static_cast<int>(n);
+                    bool changed = true;
+                    while (changed && remainingCount > 0) {
+                        changed = false;
+                        int share = remainingBudget / remainingCount;
+                        for (size_t i = 0; i < n; ++i) {
+                            if (!settled[i] && natPillW[i] <= share) {
+                                allocW[i] = natPillW[i];
+                                remainingBudget -= natPillW[i];
+                                remainingCount--;
+                                settled[i] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (remainingCount > 0) {
+                        int share = remainingBudget / remainingCount;
+                        int rem = remainingBudget % remainingCount;
+                        for (size_t i = 0; i < n; ++i) {
+                            if (!settled[i]) {
+                                allocW[i] = share + (rem > 0 ? 1 : 0);
+                                if (rem > 0) --rem;
+                            }
+                        }
+                    }
+                }
+
+                int pillX = availCandLeft;
+                for (size_t i = 0; i < n; ++i) {
+                    int w = allocW[i];
+                    if (w > 0 && pillX < availCandRight) {
+                        int pillRight = (std::min)(pillX + w, availCandRight);
+                        if (pillRight > pillX) {
+                            m_candidateRects[i] = { pillX, rowTop + pillPadV, pillRight, totalHeight - pillPadV };
+                        }
+                    }
+                    pillX += w + interPillGap;
+                }
             }
-            curX += candWidths[i] + candGap;
         }
 
         // Immediately establish button rectangles so geometry checks and mouse hits succeed before WM_PAINT
-        int controlsStartX = totalWidth - controlsTotalWidth;
         m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + pageBtnW, totalHeight - 1 };
         m_rcNextBtn = { controlsStartX + pageBtnW, rowTop + 1, controlsStartX + pagingTotalWidth, totalHeight - 1 };
 
@@ -690,14 +756,14 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
         m_rcHeader = { 0, 0, 0, 0 };
     }
 
-    int x = pt.x;
-    int y = pt.y;
+    int x = pSuggestedRect ? pSuggestedRect->left : anchorPt.x;
+    int y = pSuggestedRect ? pSuggestedRect->top : anchorPt.y;
 
     if (x + totalWidth > mi.rcWork.right) {
         x = mi.rcWork.right - totalWidth;
     }
     if (y + totalHeight > mi.rcWork.bottom) {
-        y = pt.y - totalHeight - ScaleDip(20);
+        y = (pSuggestedRect ? pSuggestedRect->top : anchorPt.y) - totalHeight - ScaleDip(20);
     }
     if (x < mi.rcWork.left) x = mi.rcWork.left;
     if (y < mi.rcWork.top) y = mi.rcWork.top;
@@ -740,13 +806,19 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
     if (uMsg == 0x02E0 /* WM_DPICHANGED */ && pThis) {
         UINT newDpi = HIWORD(wParam);
+        const RECT* pSuggested = reinterpret_cast<const RECT*>(lParam);
         if (newDpi >= 72) {
             pThis->m_dpi = newDpi;
             pThis->RebuildFontsForDpi(newDpi);
             if ((!pThis->m_candidates.empty() || pThis->m_isHeaderVisible) && IsWindowVisible(hWnd)) {
                 CandidateDisplaySnapshot snap = pThis->m_snapshot;
                 snap.initial_selected_index = pThis->m_selectedIndex;
-                pThis->Show(snap, pThis->m_lastShowPt);
+                POINT anchor = pThis->m_lastShowPt;
+                if (pSuggested) {
+                    anchor.x = pSuggested->left;
+                    anchor.y = pSuggested->top;
+                }
+                pThis->LayoutAndShow(snap, anchor, newDpi, pSuggested);
             }
         }
         return 0;
@@ -1198,30 +1270,33 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                 DeleteObject(hHoverBrush);
             }
 
-            size_t bracketPos = cand.find(L'[');
-            if (bracketPos != std::wstring::npos) {
-                std::wstring mainPart = cand.substr(0, bracketPos);
-                std::wstring hintPart = cand.substr(bracketPos);
+            int textRight = rcPill.right - pThis->ScaleDip(2);
+            if (curX < textRight) {
+                size_t bracketPos = cand.find(L'[');
+                if (bracketPos != std::wstring::npos) {
+                    std::wstring mainPart = cand.substr(0, bracketPos);
+                    std::wstring hintPart = cand.substr(bracketPos);
 
-                RECT rcMain = { curX, textY, rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
-                SetTextColor(memDC, pal.candidateTextColor);
-                DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_SINGLELINE | DT_END_ELLIPSIS);
+                    RECT rcMain = { curX, textY, textRight, clientRc.bottom };
+                    SetTextColor(memDC, pal.candidateTextColor);
+                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_SINGLELINE | DT_END_ELLIPSIS);
 
-                RECT rcMainCalc = { 0, 0, 0, 0 };
-                DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMainCalc, DT_CALCRECT | DT_SINGLELINE);
+                    RECT rcMainCalc = { 0, 0, 0, 0 };
+                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMainCalc, DT_CALCRECT | DT_SINGLELINE);
 
-                int hintX = curX + (rcMainCalc.right - rcMainCalc.left) + pThis->ScaleDip(2);
-                if (hintX < rcPill.right - pThis->ScaleDip(2)) {
-                    SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
-                    RECT rcHint = { hintX, textY + pThis->ScaleDip(2), rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
-                    SetTextColor(memDC, pal.reverseLookupColor);
-                    DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE | DT_END_ELLIPSIS);
-                    SelectObject(memDC, hItemFont);
+                    int hintX = curX + (rcMainCalc.right - rcMainCalc.left) + pThis->ScaleDip(2);
+                    if (hintX < textRight) {
+                        SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
+                        RECT rcHint = { hintX, textY + pThis->ScaleDip(2), textRight, clientRc.bottom };
+                        SetTextColor(memDC, pal.reverseLookupColor);
+                        DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SelectObject(memDC, hItemFont);
+                    }
+                } else {
+                    SetTextColor(memDC, pal.candidateTextColor);
+                    RECT rcText = { curX, textY, textRight, clientRc.bottom };
+                    DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
                 }
-            } else {
-                SetTextColor(memDC, pal.candidateTextColor);
-                RECT rcText = { curX, textY, rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
-                DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
             }
         }
 

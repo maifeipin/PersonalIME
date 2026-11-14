@@ -541,6 +541,78 @@ int main() {
         CHECK_EQ(wnd.GetNextButtonRect().right <= clientRc.right, true, L"Paging buttons stay inside clamped window");
         CHECK_EQ(wnd.GetManagerButtonRect().right <= clientRc.right, true, L"Manager button stays inside clamped window");
 
+        // 7b. Long first candidate must NOT starve subsequent candidates or overlap paging controls
+        CandidateDisplaySnapshot mixedLongSnap{};
+        mixedLongSnap.candidate_version = 10;
+        mixedLongSnap.context_id = 1;
+        mixedLongSnap.context_epoch = 1;
+        mixedLongSnap.input_generation = 1;
+        mixedLongSnap.page_index = 0;
+        mixedLongSnap.page_count = 3;
+        mixedLongSnap.query_code = L"longcand";
+        mixedLongSnap.candidates = {
+            L"1. " + std::wstring(120, L'长'),
+            L"2. 短词",
+            L"3. 备选"
+        };
+        int selectedViaClick = -1;
+        bool pagedNextViaClick = false;
+        wnd.SetOnSelectCandidateSnapshot([&](const CandidateDisplaySnapshot&, int idx) {
+            selectedViaClick = idx;
+        });
+        wnd.SetOnPageScrollSnapshot([&](const CandidateDisplaySnapshot&, bool nextPage) {
+            if (nextPage) pagedNextViaClick = true;
+        });
+        wnd.Show(mixedLongSnap, { 120, 120 });
+
+        const auto& candRects = wnd.GetCandidateRects();
+        CHECK_EQ(candRects.size(), static_cast<size_t>(3), L"All 3 candidate rects exist");
+        RECT rcPrev = wnd.GetPrevButtonRect();
+        RECT rcNext = wnd.GetNextButtonRect();
+        RECT rcMgr = wnd.GetManagerButtonRect();
+        for (size_t i = 0; i < candRects.size(); ++i) {
+            CHECK_EQ(!IsRectEmpty(&candRects[i]), true, L"Subsequent candidate after long first item has non-empty rect");
+            RECT dummy{};
+            CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcPrev) == 0, true, L"Candidate rect disjoint from Prev button");
+            CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcNext) == 0, true, L"Candidate rect disjoint from Next button");
+            CHECK_EQ(IntersectRect(&dummy, &candRects[i], &rcMgr) == 0, true, L"Candidate rect disjoint from Manager button");
+        }
+
+        // Clicking candidate 2 (after long candidate 0) selects index 2
+        POINT cand2Center = { (candRects[2].left + candRects[2].right) / 2, (candRects[2].top + candRects[2].bottom) / 2 };
+        SendMessageW(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cand2Center.x, cand2Center.y));
+        SendMessageW(hWnd, WM_LBUTTONUP, 0, MAKELPARAM(cand2Center.x, cand2Center.y));
+        CHECK_EQ(selectedViaClick, 2, L"Candidate after long first item is clickable and commits");
+
+        // Clicking Next paging button triggers paging, NOT candidate selection
+        selectedViaClick = -1;
+        POINT nextCenter = { (rcNext.left + rcNext.right) / 2, (rcNext.top + rcNext.bottom) / 2 };
+        SendMessageW(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(nextCenter.x, nextCenter.y));
+        SendMessageW(hWnd, WM_LBUTTONUP, 0, MAKELPARAM(nextCenter.x, nextCenter.y));
+        CHECK_EQ(pagedNextViaClick, true, L"Next button click triggers paging");
+        CHECK_EQ(selectedViaClick, -1, L"Next button click does not trigger candidate selection");
+
+        // 7c. WM_DPICHANGED preserves message DPI and uses suggested rect without snapping back to old m_lastShowPt DPI
+        wnd.Show(snap, { 120, 120 });
+        UINT initialDpi = wnd.GetCurrentDpi();
+        RECT beforeDpiRc{};
+        GetWindowRect(hWnd, &beforeDpiRc);
+        UINT targetDpi = (initialDpi == 144) ? 192 : 144;
+        RECT suggestedRc = {
+            mi.rcWork.left + 80,
+            mi.rcWork.top + 90,
+            mi.rcWork.left + 80 + (beforeDpiRc.right - beforeDpiRc.left) * 2,
+            mi.rcWork.top + 90 + (beforeDpiRc.bottom - beforeDpiRc.top) * 2
+        };
+        SendMessageW(hWnd, 0x02E0 /* WM_DPICHANGED */, MAKEWPARAM(targetDpi, targetDpi), reinterpret_cast<LPARAM>(&suggestedRc));
+        CHECK_EQ(wnd.GetCurrentDpi(), targetDpi, L"WM_DPICHANGED preserves new DPI instead of overwriting with old anchor DPI");
+        RECT afterDpiRc{};
+        GetWindowRect(hWnd, &afterDpiRc);
+        CHECK_EQ(afterDpiRc.left >= mi.rcWork.left && afterDpiRc.top >= mi.rcWork.top, true, L"WM_DPICHANGED window stays inside work area");
+        if (targetDpi > initialDpi) {
+            CHECK_EQ((afterDpiRc.bottom - afterDpiRc.top) > (beforeDpiRc.bottom - beforeDpiRc.top), true, L"Higher DPI increases scaled window height");
+        }
+
         CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(-1);
         wnd.Destroy();
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
