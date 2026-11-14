@@ -2106,6 +2106,7 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(s7Service.Start(s7Db, dictDir, s7Pipe, s7AdminPipe), L"Start service for Stage 7.1a E2E");
         IpcClient client;
         uint64_t sid = 7001, cid = 8001;
+        uint64_t ownerId = 0x123456789ABCDEF0ULL; // Explicitly distinct from sid!
         uint32_t ctxEpoch = 101;
 
         IpcKeyRequest pingReq{};
@@ -2119,12 +2120,13 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(client.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE4), L"SetMode Chinese");
         CHECK_TRUE(client.SetScheme(sid, cid, ime::InputScheme::Wubi86), L"SetScheme Wubi86");
 
-        // 20.1 Type 'yyyy' and select candidate -> ConfirmedWritten -> verify learning
+        // 20.1 Type 'yyyy' and select candidate -> ConfirmedWritten -> verify learning & owner!=session
         IpcKeyRequest keyReq{};
         keyReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
         keyReq.session_id = sid;
         keyReq.context_id = cid;
         keyReq.context_epoch = ctxEpoch;
+        SetIpcRequestOwnerInstanceId(keyReq, ownerId);
         keyReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
         IpcKeyResponse keyResp{};
         for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
@@ -2138,34 +2140,59 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for ConfirmedWritten");
         CHECK_EQUAL(keyResp.has_commit, 1u, L"has_commit == 1");
         uint64_t learnEvtId = keyResp.commit_event_id;
-        CHECK_TRUE(learnEvtId != 0, L"commit_event_id != 0");
+        uint32_t learnGen = keyResp.candidate_version;
+        CHECK_TRUE(learnEvtId != 0 && learnGen != 0, L"commit_event_id != 0 && learnGen != 0");
 
         IpcCommitDisposition outDisp = IpcCommitDisposition::None;
         bool outConflict = false;
         // Unknown event rejected
-        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId + 999999, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict),
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId + 999999, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen, ownerId, outDisp, outConflict),
                    L"Unknown event must be rejected");
         CHECK_TRUE(!outConflict, L"Unknown event must not report conflict");
 
-        // Wrong epoch rejected with conflict
-        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch + 1, outDisp, outConflict),
+        // Stored non-zero, request passes 0 -> MUST be rejected with conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, 0, learnGen, ownerId, outDisp, outConflict),
+                   L"Zero context_epoch when stored non-zero must conflict");
+        CHECK_TRUE(outConflict, L"Zero context_epoch sets conflict flag");
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, 0, ownerId, outDisp, outConflict),
+                   L"Zero expectedGeneration when stored non-zero must conflict");
+        CHECK_TRUE(outConflict, L"Zero expectedGeneration sets conflict flag");
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen, 0, outDisp, outConflict),
+                   L"Zero ownerInstanceId when stored non-zero must conflict");
+        CHECK_TRUE(outConflict, L"Zero ownerInstanceId sets conflict flag");
+
+        // Passing session_id instead of true owner_instance_id (owner != session) must conflict!
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen, sid, outDisp, outConflict),
+                   L"Passing session_id when owner_instance_id != session_id must conflict");
+        CHECK_TRUE(outConflict, L"owner==session mismatch sets conflict flag");
+
+        // Wrong epoch / owner / generation rejected with conflict
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch + 1, learnGen, ownerId, outDisp, outConflict),
                    L"Wrong context_epoch must conflict");
         CHECK_TRUE(outConflict, L"Wrong context_epoch sets conflict flag");
-
-        // Wrong ownerInstanceId rejected with conflict
-        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict, nullptr, 0, sid + 1),
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen, ownerId + 1, outDisp, outConflict),
                    L"Wrong ownerInstanceId must conflict");
         CHECK_TRUE(outConflict, L"Wrong ownerInstanceId sets conflict flag");
-
-        // Wrong expectedGeneration rejected with conflict
-        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict, nullptr, 99999, sid),
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen + 99, ownerId, outDisp, outConflict),
                    L"Wrong expectedGeneration must conflict");
         CHECK_TRUE(outConflict, L"Wrong expectedGeneration sets conflict flag");
 
-        // Correct ConfirmedWritten succeeds
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, outDisp, outConflict),
+        // Correct ConfirmedWritten with full (ctxEpoch, learnGen, ownerId) succeeds
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, learnEvtId, IpcCommitDisposition::ConfirmedWritten, ctxEpoch, learnGen, ownerId, outDisp, outConflict),
                    L"ConfirmedWritten succeeds");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::ConfirmedWritten, L"outDisp == ConfirmedWritten");
+
+        // QueryCommitStatus verification: zero or session_id owner fails, true ownerId != sid succeeds
+        IpcCommitDisposition queriedDisp = IpcCommitDisposition::None;
+        CHECK_TRUE(!client.QueryCommitStatus(sid, cid, learnEvtId, 0, ownerId, queriedDisp, learnGen),
+                   L"QueryCommitStatus with zero epoch must fail");
+        CHECK_TRUE(!client.QueryCommitStatus(sid, cid, learnEvtId, ctxEpoch, 0, queriedDisp, learnGen),
+                   L"QueryCommitStatus with zero ownerId must fail");
+        CHECK_TRUE(!client.QueryCommitStatus(sid, cid, learnEvtId, ctxEpoch, sid, queriedDisp, learnGen),
+                   L"QueryCommitStatus with sid instead of ownerId must fail");
+        CHECK_TRUE(client.QueryCommitStatus(sid, cid, learnEvtId, ctxEpoch, ownerId, queriedDisp, learnGen),
+                   L"QueryCommitStatus with true ownerId!=sid succeeds");
+        CHECK_TRUE(queriedDisp == IpcCommitDisposition::ConfirmedWritten, L"QueryCommitStatus returns ConfirmedWritten");
 
         // 20.2 CancelRestore + idempotent retry (ACK loss simulation)
         for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
@@ -2177,19 +2204,25 @@ int main(int argc, char* argv[]) {
         keyReq.candidate_version = keyResp.candidate_version;
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for CancelRestore");
         uint64_t cancelEvtId = keyResp.commit_event_id;
+        uint32_t cancelGen = keyResp.candidate_version;
 
         IpcKeyResponse cancelResp{};
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict, &cancelResp),
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, cancelGen, ownerId, outDisp, outConflict, &cancelResp),
                    L"Initial CancelRestore succeeds");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore applied");
         CHECK_TRUE(wcscmp(cancelResp.composition, L"yyyy") == 0, L"Composition restored to 'yyyy'");
 
         // Simulate lost ACK and retry CancelRestore: must succeed idempotently AND return restored composition
         IpcKeyResponse cancelRetryResp{};
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict, &cancelRetryResp),
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, cancelGen, ownerId, outDisp, outConflict, &cancelRetryResp),
                    L"Idempotent CancelRestore retry succeeds");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore retry preserves disposition without conflict");
         CHECK_TRUE(wcscmp(cancelRetryResp.composition, L"yyyy") == 0, L"CancelRestore retry returns restored composition");
+
+        // Zero-value on completed event retry must also conflict!
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, 0, cancelGen, ownerId, outDisp, outConflict),
+                   L"Zero epoch on completed CancelRestore retry must conflict");
+        CHECK_TRUE(outConflict, L"Zero epoch on completed retry sets conflict");
 
         // Clear restored composition
         keyReq.vk_code = VK_ESCAPE;
@@ -2206,6 +2239,7 @@ int main(int argc, char* argv[]) {
         keyReq.candidate_version = keyResp.candidate_version;
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for downgraded CancelRestore");
         uint64_t downgradeEvtId = keyResp.commit_event_id;
+        uint32_t downgradeGen = keyResp.candidate_version;
         // Advance context generation by typing 'A' and Esc so CancelRestore must downgrade to CancelDiscard
         keyReq.vk_code = 'A';
         keyReq.candidate_version = 0;
@@ -2213,16 +2247,17 @@ int main(int argc, char* argv[]) {
         keyReq.vk_code = VK_ESCAPE;
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Esc clears 'a'");
 
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, downgradeGen, ownerId, outDisp, outConflict),
                    L"Downgraded CancelRestore -> CancelDiscard succeeds");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelDiscard, L"Downgraded disposition is CancelDiscard");
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, downgradeGen, ownerId, outDisp, outConflict),
                    L"Retry of downgraded CancelRestore succeeds idempotently");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelDiscard, L"Retry of downgraded CancelRestore returns CancelDiscard without conflict");
 
-        // 20.3 Restart fidelity: create pending commit with context_epoch=555, restart service, verify epoch check + finalization
+        // 20.3 Restart fidelity: create pending commit with context_epoch=555 & ownerId!=sid, restart service, verify checks + finalization
         uint32_t restartEpoch = 555;
         keyReq.context_epoch = restartEpoch;
+        SetIpcRequestOwnerInstanceId(keyReq, ownerId);
         for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
             keyReq.vk_code = ch;
             keyReq.candidate_version = 0;
@@ -2232,6 +2267,7 @@ int main(int argc, char* argv[]) {
         keyReq.candidate_version = keyResp.candidate_version;
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 before restart");
         uint64_t restartEvtId = keyResp.commit_event_id;
+        uint32_t restartGen = keyResp.candidate_version;
 
         client.Disconnect();
         s7Service.Stop();
@@ -2239,15 +2275,27 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(s7Service.Start(s7Db, dictDir, s7Pipe, s7AdminPipe), L"Restart service for Stage 7.1a fidelity");
         CHECK_TRUE(client.SendRequest(pingReq, pingResp, 200), L"Ping restarted service");
 
-        // Wrong epoch after restart must conflict
-        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch + 1, outDisp, outConflict),
+        // Zero epoch / zero generation / zero owner / wrong owner (sid) after restart must all conflict!
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, 0, restartGen, ownerId, outDisp, outConflict),
+                   L"Zero epoch after restart conflicts");
+        CHECK_TRUE(outConflict, L"Zero epoch after restart sets conflict flag");
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch, 0, ownerId, outDisp, outConflict),
+                   L"Zero generation after restart conflicts");
+        CHECK_TRUE(outConflict, L"Zero generation after restart sets conflict flag");
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch, restartGen, sid, outDisp, outConflict),
+                   L"owner==sid (instead of ownerId) after restart conflicts");
+        CHECK_TRUE(outConflict, L"owner==sid after restart sets conflict flag");
+        CHECK_TRUE(!client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch + 1, restartGen, ownerId, outDisp, outConflict),
                    L"Wrong epoch after restart conflicts");
         CHECK_TRUE(outConflict, L"Wrong epoch after restart sets conflict flag");
 
-        // Correct epoch after restart succeeds
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch, outDisp, outConflict),
-                   L"Correct epoch after restart finalizes ConfirmedWritten");
+        // Correct (restartEpoch, restartGen, ownerId) after restart succeeds
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, restartEvtId, IpcCommitDisposition::ConfirmedWritten, restartEpoch, restartGen, ownerId, outDisp, outConflict),
+                   L"Correct epoch/gen/owner after restart finalizes ConfirmedWritten");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::ConfirmedWritten, L"Post-restart ConfirmedWritten succeeded");
+        CHECK_TRUE(client.QueryCommitStatus(sid, cid, restartEvtId, restartEpoch, ownerId, queriedDisp, restartGen),
+                   L"Post-restart QueryCommitStatus with ownerId!=sid succeeds");
+        CHECK_TRUE(queriedDisp == IpcCommitDisposition::ConfirmedWritten, L"Post-restart QueryCommitStatus returns ConfirmedWritten");
 
         client.Disconnect();
         s7Service.Stop();

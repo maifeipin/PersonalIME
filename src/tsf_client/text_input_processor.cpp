@@ -19,7 +19,9 @@ CTextInputProcessor::CTextInputProcessor() {
     uint64_t counter = static_cast<uint64_t>(InterlockedIncrement64(&s_sessionCounter));
     m_sessionId = (pid << 32) | (counter & 0xFFFFFFFF);
     m_ownerInstanceId = m_sessionId ^ (GetTickCount64() * 11400714819323198485ull);
-    if (m_ownerInstanceId == 0) m_ownerInstanceId = m_sessionId;
+    if (m_ownerInstanceId == 0 || m_ownerInstanceId == m_sessionId) {
+        m_ownerInstanceId = m_sessionId ^ 0x9E3779B97F4A7C15ULL;
+    }
     DllAddRef();
 
     m_candidateWindow.SetOnOpenManager([this]() {
@@ -934,6 +936,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     req.session_id = m_sessionId;
     req.context_id = reinterpret_cast<uint64_t>(pic);
     req.context_epoch = static_cast<uint32_t>(EnsureContextEpoch(contextId));
+    SetIpcRequestOwnerInstanceId(req, m_ownerInstanceId);
     req.vk_code = static_cast<uint32_t>(wParam);
     req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
     req.modifiers = 0;
@@ -1207,6 +1210,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     req.session_id = m_sessionId;
     req.context_id = contextId;
     req.context_epoch = static_cast<uint32_t>(EnsureContextEpoch(contextId));
+    SetIpcRequestOwnerInstanceId(req, m_ownerInstanceId);
     req.vk_code = static_cast<uint32_t>(wParam);
     req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
     req.modifiers = 0;

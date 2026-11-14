@@ -161,7 +161,7 @@ struct IpcKeyResponse {
     wchar_t  commit_text[1024]; // Committed text (or query_code when has_commit==0 && IPC_STATUS_HAS_QUERY_CODE) (offset 308, 2048 bytes)
 
     // Paginated candidate list
-    uint32_t candidate_version; // Candidate snapshot version / epoch (offset 2356)
+    uint32_t candidate_version; // Candidate snapshot version / epoch, or commit input_generation when has_commit==1 (offset 2356)
     uint32_t total_candidates;  // Total matching candidates for current code (offset 2360)
     uint32_t page_index;        // Current page index (0-based) (offset 2364)
     uint32_t page_count;        // Total candidate pages (offset 2368)
@@ -170,6 +170,17 @@ struct IpcKeyResponse {
 };                             // Total size: 4680 bytes
 
 #pragma pack(pop)
+
+// Stage 7 helper: encode/decode 64-bit owner_instance_id in (scheme_id, update_mask) for
+// non-SetMode/SetScheme requests (TestKeyDown, KeyDown, CommitTerminal, QueryCommitStatus)
+inline void SetIpcRequestOwnerInstanceId(IpcKeyRequest& req, uint64_t ownerInstanceId) {
+    req.scheme_id = static_cast<uint32_t>(ownerInstanceId & 0xFFFFFFFFULL);
+    req.update_mask = static_cast<uint32_t>((ownerInstanceId >> 32) & 0xFFFFFFFFULL);
+}
+
+inline uint64_t GetIpcRequestOwnerInstanceId(const IpcKeyRequest& req) {
+    return (static_cast<uint64_t>(req.update_mask) << 32) | static_cast<uint64_t>(req.scheme_id);
+}
 
 static_assert(sizeof(IpcKeyRequest) == 64, "IpcKeyRequest wire size must remain 64 bytes");
 static_assert(sizeof(IpcKeyResponse) == 4680, "IpcKeyResponse wire size must remain 4680 bytes");

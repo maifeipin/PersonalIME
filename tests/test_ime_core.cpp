@@ -1034,22 +1034,32 @@ int TestStage71aSchemaAndTerminalDisposition() {
 
     int finalDisp = 0;
     bool conflict = false;
-    // 1. ConfirmedWritten (1)
-    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict), "Finalize ConfirmedWritten");
+    // 1. Stored non-zero, request passes 0 must be rejected with conflict
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 0, 7, 1001), "Zero context_epoch when stored is 42 must conflict");
+    TEST_ASSERT(conflict, "Zero context_epoch sets conflict");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 42, 0, 1001), "Zero input_generation when stored is 7 must conflict");
+    TEST_ASSERT(conflict, "Zero input_generation sets conflict");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 42, 7, 0), "Zero owner_instance_id when stored is 1001 must conflict");
+    TEST_ASSERT(conflict, "Zero owner_instance_id sets conflict");
+
+    // ConfirmedWritten (1) with full matching ownership (owner 1001 != session 10)
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 42, 7, 1001), "Finalize ConfirmedWritten");
     TEST_ASSERT(!conflict && finalDisp == 1, "ConfirmedWritten succeeded without conflict");
     auto ce = repo.GetCommitEventRecord("evt-71a-confirm");
-    TEST_ASSERT(ce.status == 1 && ce.final_disposition == 1, "commit_events updated to status=1, final_disposition=1");
+    TEST_ASSERT(ce.status == 1 && ce.final_disposition == 1 && ce.owner_instance_id == 1001, "commit_events updated to status=1, final_disposition=1, owner=1001");
 
-    // 2. Idempotent replay of ConfirmedWritten (1)
-    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict), "Idempotent replay succeeds");
+    // 2. Idempotent replay of ConfirmedWritten (1) requires matching non-zero ownership
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 0, 0, 0), "Replay with zero ownership on finalized non-zero record must conflict");
+    TEST_ASSERT(conflict, "Replay with zero ownership sets conflict");
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict, 42, 7, 1001), "Idempotent replay with full ownership succeeds");
     TEST_ASSERT(!conflict && finalDisp == 1, "Idempotent replay has no conflict");
 
     // 3. Mutually exclusive CancelDiscard (3) conflicts
-    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 3, finalDisp, conflict), "CancelDiscard after ConfirmedWritten fails");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 3, finalDisp, conflict, 42, 7, 1001), "CancelDiscard after ConfirmedWritten fails");
     TEST_ASSERT(conflict && finalDisp == 1, "CancelDiscard after ConfirmedWritten sets conflict and preserves finalDisp=1");
 
     // 4. Wrong owner conflicts
-    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 99, 20, 1, finalDisp, conflict), "Wrong session conflicts");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 99, 20, 1, finalDisp, conflict, 42, 7, 1001), "Wrong session conflicts");
     TEST_ASSERT(conflict, "Wrong session sets conflict flag");
 
     // 5. DispatchedUnverified (4) then ClosedUnknown (5)
@@ -1061,12 +1071,15 @@ int TestStage71aSchemaAndTerminalDisposition() {
     pUnk.query_code = "bbbb";
     pUnk.entry_id = "e2";
     pUnk.text = L"了";
+    pUnk.context_epoch = 50;
+    pUnk.input_generation = 9;
+    pUnk.owner_instance_id = 2002;
     TEST_ASSERT(repo.SavePendingCommit(pUnk), "SavePendingCommit for DispatchedUnverified");
-    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 4, finalDisp, conflict), "Finalize DispatchedUnverified");
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 4, finalDisp, conflict, 50, 9, 2002), "Finalize DispatchedUnverified");
     TEST_ASSERT(!conflict && finalDisp == 4, "DispatchedUnverified recorded");
     auto ceUnk = repo.GetCommitEventRecord("evt-71a-unk");
     TEST_ASSERT(ceUnk.status == 2 && ceUnk.final_disposition == 4, "DispatchedUnverified sets status=2 (non-learned terminal) and final_disposition=4");
-    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 1, finalDisp, conflict), "ConfirmedWritten after DispatchedUnverified conflicts");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 1, finalDisp, conflict, 50, 9, 2002), "ConfirmedWritten after DispatchedUnverified conflicts");
     TEST_ASSERT(conflict && finalDisp == 4, "Conflict preserves DispatchedUnverified");
 
     // 6. Unknown event without pending snapshot must be rejected and NOT inserted into commit_events

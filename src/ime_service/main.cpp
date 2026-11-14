@@ -627,11 +627,24 @@ void HandleClient(HANDLE hPipe) {
             }
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::QueryCommitStatus)) {
-            if (req.event_id != 0 && g_engine.GetRepo()) {
+            if (req.event_id != 0 && req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 && g_engine.GetRepo()) {
+                uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
+                uint64_t reqGen = req.candidate_version;
                 auto rec = g_engine.GetRepo()->GetCommitEventRecord(std::to_string(req.event_id));
-                bool epochOk = (req.context_epoch == 0 || rec.context_epoch == 0 || rec.context_epoch == req.context_epoch);
-                bool ownerOk = (rec.owner_instance_id == 0 || rec.owner_instance_id == req.session_id);
-                if (rec.status != 0 && rec.session_id == req.session_id && rec.context_id == req.context_id && epochOk && ownerOk) {
+                bool legacyRow = (rec.final_disposition == 0 && rec.context_epoch == 0 && rec.input_generation == 0 && rec.owner_instance_id == 0);
+                bool ownershipMatch = false;
+                if (rec.status != 0 && rec.session_id == req.session_id && rec.context_id == req.context_id) {
+                    if (legacyRow) {
+                        ownershipMatch = true;
+                    } else {
+                        ownershipMatch = (req.context_epoch != 0 &&
+                                          reqOwnerId != 0 &&
+                                          rec.context_epoch == req.context_epoch &&
+                                          rec.owner_instance_id == reqOwnerId &&
+                                          (reqGen == 0 || rec.input_generation == reqGen));
+                    }
+                }
+                if (ownershipMatch) {
                     int disp = rec.final_disposition;
                     if (disp == 0) {
                         disp = (rec.status == 1)
@@ -650,12 +663,12 @@ void HandleClient(HANDLE hPipe) {
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
             uint32_t reqDisp = req.mode_arg;
-            if (req.event_id == 0 || reqDisp < 1 || reqDisp > 5 || !g_engine.GetRepo()) {
+            if (req.event_id == 0 || reqDisp < 1 || reqDisp > 5 ||
+                req.protocol_version < IPC_PROTOCOL_VERSION_STAGE7 || !g_engine.GetRepo()) {
                 resp.handled = 0;
             } else {
                 uint64_t expectedInputGen = req.candidate_version;
-                uint64_t encodedOwner = (static_cast<uint64_t>(req.scan_code) << 32) | static_cast<uint64_t>(req.vk_code);
-                uint64_t expectedOwnerId = (encodedOwner != 0) ? encodedOwner : req.session_id;
+                uint64_t expectedOwnerId = GetIpcRequestOwnerInstanceId(req);
 
                 std::unique_lock<std::mutex> lock(g_pendingMutex);
 
@@ -692,11 +705,19 @@ void HandleClient(HANDLE hPipe) {
                 }
 
                 if (hasCompleted) {
+                    bool legacyRow = (completedInfo.context_epoch == 0 &&
+                                      completedInfo.input_generation == 0 &&
+                                      completedInfo.owner_instance_id == 0);
                     bool ownerMatch = (completedInfo.session_id == req.session_id &&
                                        completedInfo.context_id == req.context_id &&
-                                       (expectedOwnerId == 0 || completedInfo.owner_instance_id == expectedOwnerId) &&
-                                       (req.context_epoch == 0 || completedInfo.context_epoch == req.context_epoch) &&
-                                       (expectedInputGen == 0 || completedInfo.input_generation == expectedInputGen));
+                                       (legacyRow
+                                        ? (req.context_epoch == 0 && expectedInputGen == 0 && expectedOwnerId == 0)
+                                        : (req.context_epoch != 0 &&
+                                           expectedInputGen != 0 &&
+                                           expectedOwnerId != 0 &&
+                                           completedInfo.owner_instance_id == expectedOwnerId &&
+                                           completedInfo.context_epoch == req.context_epoch &&
+                                           completedInfo.input_generation == expectedInputGen)));
                     int existingDisp = completedInfo.final_disposition;
                     if (existingDisp == 0) {
                         existingDisp = (completedInfo.state == CommitState::Recorded)
@@ -737,9 +758,9 @@ void HandleClient(HANDLE hPipe) {
                 ServerPendingCommit pc = it->second;
                 if (pc.session_id != req.session_id ||
                     pc.context_id != req.context_id ||
-                    (expectedOwnerId != 0 && pc.owner_instance_id != expectedOwnerId) ||
-                    (req.context_epoch != 0 && pc.context_epoch != req.context_epoch) ||
-                    (expectedInputGen != 0 && pc.generation != expectedInputGen)) {
+                    pc.owner_instance_id != expectedOwnerId ||
+                    pc.context_epoch != req.context_epoch ||
+                    pc.generation != expectedInputGen) {
                     resp.handled = 0;
                     resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
                     WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
@@ -1431,22 +1452,26 @@ void HandleClient(HANDLE hPipe) {
 
                                 bool learningOn = state.policy_snapshot ? state.policy_snapshot->learning_enabled : true;
                                 uint64_t nextGen = state.input_generation + 1;
-                                bool saved = g_engine.SavePendingCommit(
-                                    std::to_string(evId),
-                                    req.session_id,
-                                    req.context_id,
-                                    cand.scheme,
-                                    state.current_query_code,
-                                    cand.entry_id,
-                                    cand.text,
-                                    learningOn,
-                                    cand.layout_id,
-                                    cand.matched_code,
-                                    cand.resolved_code,
-                                    req.context_epoch,
-                                    nextGen,
-                                    req.session_id
-                                );
+                                uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
+                                bool stage7Req = (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
+                                uint64_t ownerId = stage7Req ? reqOwnerId : (reqOwnerId != 0 ? reqOwnerId : req.session_id);
+                                bool saved = (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
+                                             g_engine.SavePendingCommit(
+                                                 std::to_string(evId),
+                                                 req.session_id,
+                                                 req.context_id,
+                                                 cand.scheme,
+                                                 state.current_query_code,
+                                                 cand.entry_id,
+                                                 cand.text,
+                                                 learningOn,
+                                                 cand.layout_id,
+                                                 cand.matched_code,
+                                                 cand.resolved_code,
+                                                 req.context_epoch,
+                                                 nextGen,
+                                                 ownerId
+                                             );
 
                                 if (!saved) {
                                     // Durable persistence failed! Do NOT publish commit response!
@@ -1464,7 +1489,7 @@ void HandleClient(HANDLE hPipe) {
                                     pc.connection_epoch = state.connection_epoch;
                                     pc.generation = state.input_generation;
                                     pc.context_epoch = req.context_epoch;
-                                    pc.owner_instance_id = req.session_id;
+                                    pc.owner_instance_id = ownerId;
                                     pc.candidate = cand;
                                     pc.scheme = cand.scheme;
                                     pc.query_code = state.current_query_code;
@@ -1482,6 +1507,7 @@ void HandleClient(HANDLE hPipe) {
 
                                     SafeCopyCommitText(resp, cand.text);
                                     resp.commit_event_id = evId;
+                                    resp.candidate_version = static_cast<uint32_t>(pc.generation);
                                     state.composition.clear();
                                     state.cached_coord_query = {};
                                     state.current_dict_index = 0;
@@ -1519,22 +1545,26 @@ void HandleClient(HANDLE hPipe) {
 
                                     bool learningOn = state.policy_snapshot ? state.policy_snapshot->learning_enabled : true;
                                     uint64_t nextGen = state.input_generation + 1;
-                                    bool saved = g_engine.SavePendingCommit(
-                                        std::to_string(evId),
-                                        req.session_id,
-                                        req.context_id,
-                                        cand.scheme,
-                                        state.current_query_code,
-                                        cand.entry_id,
-                                        cand.text,
-                                        learningOn,
-                                        cand.layout_id,
-                                        cand.matched_code,
-                                        cand.resolved_code,
-                                        req.context_epoch,
-                                        nextGen,
-                                        req.session_id
-                                    );
+                                    uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
+                                    bool stage7Req = (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
+                                    uint64_t ownerId = stage7Req ? reqOwnerId : (reqOwnerId != 0 ? reqOwnerId : req.session_id);
+                                    bool saved = (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
+                                                 g_engine.SavePendingCommit(
+                                                     std::to_string(evId),
+                                                     req.session_id,
+                                                     req.context_id,
+                                                     cand.scheme,
+                                                     state.current_query_code,
+                                                     cand.entry_id,
+                                                     cand.text,
+                                                     learningOn,
+                                                     cand.layout_id,
+                                                     cand.matched_code,
+                                                     cand.resolved_code,
+                                                     req.context_epoch,
+                                                     nextGen,
+                                                     ownerId
+                                                 );
 
                                     if (!saved) {
                                         resp.handled = 0;
@@ -1551,7 +1581,7 @@ void HandleClient(HANDLE hPipe) {
                                         pc.connection_epoch = state.connection_epoch;
                                         pc.generation = state.input_generation;
                                         pc.context_epoch = req.context_epoch;
-                                        pc.owner_instance_id = req.session_id;
+                                        pc.owner_instance_id = ownerId;
                                         pc.candidate = cand;
                                         pc.scheme = cand.scheme;
                                         pc.query_code = state.current_query_code;
@@ -1569,6 +1599,7 @@ void HandleClient(HANDLE hPipe) {
 
                                         SafeCopyCommitText(resp, cand.text);
                                         resp.commit_event_id = evId;
+                                        resp.candidate_version = static_cast<uint32_t>(pc.generation);
                                         state.composition.clear();
                                         state.cached_coord_query = {};
                                         state.current_dict_index = 0;

@@ -688,10 +688,11 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
         uint64_t existingGen = static_cast<uint64_t>(stmtCheck->ColumnInt64(5));
         uint64_t existingOwner = static_cast<uint64_t>(stmtCheck->ColumnInt64(6));
 
+        bool legacyRow = (existingDisp == 0 && existingEpoch == 0 && existingGen == 0 && existingOwner == 0);
         if (existingSid != sessionId || existingCid != contextId ||
-            (expectedContextEpoch != 0 && expectedContextEpoch != existingEpoch) ||
-            (expectedInputGeneration != 0 && expectedInputGeneration != existingGen) ||
-            (expectedOwnerInstanceId != 0 && expectedOwnerInstanceId != existingOwner)) {
+            (!legacyRow && (existingEpoch != expectedContextEpoch ||
+                            existingGen != expectedInputGeneration ||
+                            existingOwner != expectedOwnerInstanceId))) {
             outConflict = true;
             outFinalDisposition = existingDisp;
             tx.Rollback();
@@ -750,9 +751,9 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
     ownerId = static_cast<uint64_t>(stmtPend->ColumnInt64(4));
 
     if (pSid != sessionId || pCid != contextId ||
-        (expectedContextEpoch != 0 && expectedContextEpoch != ctxEpoch) ||
-        (expectedInputGeneration != 0 && expectedInputGeneration != inputGen) ||
-        (expectedOwnerInstanceId != 0 && expectedOwnerInstanceId != ownerId)) {
+        ctxEpoch != expectedContextEpoch ||
+        inputGen != expectedInputGeneration ||
+        ownerId != expectedOwnerInstanceId) {
         outConflict = true;
         tx.Rollback();
         return false;

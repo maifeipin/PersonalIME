@@ -22,11 +22,12 @@ public:
     bool NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint64_t eventId, IpcKeyResponse* outResp = nullptr);
     bool NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
                               IpcCommitDisposition requestedDisp, uint32_t contextEpoch,
+                              uint32_t expectedGeneration, uint64_t ownerInstanceId,
                               IpcCommitDisposition& outFinalDisp, bool& outConflict,
-                              IpcKeyResponse* outResp = nullptr,
-                              uint32_t expectedGeneration = 0, uint64_t ownerInstanceId = 0);
+                              IpcKeyResponse* outResp = nullptr);
     bool QueryCommitStatus(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
-                           IpcCommitDisposition& outFinalDisp, uint32_t contextEpoch = 0);
+                           uint32_t contextEpoch, uint64_t ownerInstanceId,
+                           IpcCommitDisposition& outFinalDisp, uint32_t expectedGeneration = 0);
     bool NegotiateStage7Capability(uint64_t sessionId);
     bool IsStage7Capable() const { return m_stage7Capable; }
     bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion = IPC_PROTOCOL_VERSION_STAGE3, uint32_t updateMask = 0);
