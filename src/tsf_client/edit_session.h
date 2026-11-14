@@ -114,13 +114,15 @@ public:
                  bool hasCommit, const std::wstring& commitText,
                  const std::vector<std::wstring>& candidates,
                  uint64_t generation = 0,
-                 const CandidateDisplaySnapshot* pSnapshot = nullptr)
+                 const CandidateDisplaySnapshot* pSnapshot = nullptr,
+                 std::shared_ptr<EditRequestControlBlock> controlBlock = nullptr)
         : m_pTip(pTip), m_pContext(pContext), m_pCandWnd(pCandWnd),
           m_hasComp(hasComp), m_compText(compText),
           m_hasCommit(hasCommit), m_commitText(commitText),
           m_candidates(candidates),
           m_contextId(reinterpret_cast<uint64_t>(pContext)),
-          m_generation(generation) {
+          m_generation(generation),
+          m_controlBlock(std::move(controlBlock)) {
         if (pSnapshot) {
             m_snapshot = *pSnapshot;
         } else {
@@ -187,6 +189,16 @@ public:
         struct CompletionGuard {
             CEditSession* self;
             ~CompletionGuard() {
+                if (self->m_controlBlock) {
+                    self->m_controlBlock->outcome = self->m_result;
+                    self->m_controlBlock->hr = self->m_finalHr;
+                    if (self->m_controlBlock->state != RequestLifecycleState::RevokedBeforeWrite) {
+                        self->m_controlBlock->state =
+                            (self->m_controlBlock->revoked && !self->m_controlBlock->crossed_side_effect)
+                            ? RequestLifecycleState::RevokedBeforeWrite
+                            : RequestLifecycleState::Returned;
+                    }
+                }
                 if (self->m_pTip) {
                     self->m_pTip->EndInternalEdit();
                 }
@@ -207,6 +219,18 @@ public:
             return E_FAIL;
         }
 
+        if (!CheckPreSideEffectFence()) {
+            if (m_controlBlock) {
+                m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+            }
+            m_result = EditSessionResult::Unmodified;
+            m_finalHr = E_ABORT;
+            return E_ABORT;
+        }
+        if (m_controlBlock) {
+            m_controlBlock->state = RequestLifecycleState::Executing;
+        }
+
         auto hideOwnedWindow = [&]() {
             if (m_pCandWnd) {
                 if (m_generation != 0 && m_pTip) {
@@ -217,7 +241,8 @@ public:
             }
         };
 
-        if (m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined) {
+        if (m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined &&
+            !(m_controlBlock && m_controlBlock->unknown_pending && !m_controlBlock->revoked)) {
             hideOwnedWindow();
             m_result = EditSessionResult::Unmodified;
             m_finalHr = E_FAIL;
@@ -296,6 +321,14 @@ public:
                     return m_finalHr;
                 }
 
+                if (!CheckPreSideEffectFence()) {
+                    pRange->Release();
+                    if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                    m_result = EditSessionResult::Unmodified;
+                    m_finalHr = E_ABORT;
+                    return E_ABORT;
+                }
+                MarkCrossingSideEffect();
                 ClearDisplayAttribute(ec, pRange);
                 hr = pRange->SetText(ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()));
                 if (FAILED(hr)) {
@@ -358,10 +391,25 @@ public:
                     return E_FAIL;
                 }
 
+                if (!CheckPreSideEffectFence()) {
+                    if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                    m_result = EditSessionResult::Unmodified;
+                    m_finalHr = E_ABORT;
+                    return E_ABORT;
+                }
+
                 TF_SELECTION sel{};
                 ULONG cFetched = 0;
                 HRESULT hr = m_pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &cFetched);
                 if (SUCCEEDED(hr) && cFetched > 0 && sel.range) {
+                    if (!CheckPreSideEffectFence()) {
+                        sel.range->Release();
+                        if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                        m_result = EditSessionResult::Unmodified;
+                        m_finalHr = E_ABORT;
+                        return E_ABORT;
+                    }
+                    MarkCrossingSideEffect();
                     hr = sel.range->SetText(ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()));
                     if (SUCCEEDED(hr)) {
                         HRESULT hrCollapse = sel.range->Collapse(ec, TF_ANCHOR_END);
@@ -390,6 +438,14 @@ public:
                     // Fallback within Level 2: ITfInsertAtSelection when GetSelection is unavailable
                     ITfInsertAtSelection* pInsertAtSel = nullptr;
                     if (SUCCEEDED(m_pContext->QueryInterface(IID_ITfInsertAtSelection, (void**)&pInsertAtSel)) && pInsertAtSel) {
+                        if (!CheckPreSideEffectFence()) {
+                            pInsertAtSel->Release();
+                            if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                            m_result = EditSessionResult::Unmodified;
+                            m_finalHr = E_ABORT;
+                            return E_ABORT;
+                        }
+                        MarkCrossingSideEffect();
                         ITfRange* pInsertedRange = nullptr;
                         HRESULT hrIns = pInsertAtSel->InsertTextAtSelection(
                             ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()), &pInsertedRange);
@@ -505,6 +561,15 @@ public:
                         return m_finalHr;
                     }
 
+                    if (!CheckPreSideEffectFence()) {
+                        sel.range->Release();
+                        pContextComp->Release();
+                        if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                        m_result = EditSessionResult::Unmodified;
+                        m_finalHr = E_ABORT;
+                        return E_ABORT;
+                    }
+                    MarkCrossingSideEffect();
                     ITfComposition* pNewComp = nullptr;
                     hr = pContextComp->StartComposition(ec, sel.range, m_pTip, &pNewComp);
                     sel.range->Release();
@@ -534,6 +599,14 @@ public:
                     return m_finalHr;
                 }
 
+                if (!CheckPreSideEffectFence()) {
+                    pRange->Release();
+                    if (m_controlBlock) m_controlBlock->state = RequestLifecycleState::RevokedBeforeWrite;
+                    m_result = EditSessionResult::Unmodified;
+                    m_finalHr = E_ABORT;
+                    return E_ABORT;
+                }
+                MarkCrossingSideEffect();
                 hr = pRange->SetText(ec, 0, m_compText.c_str(), static_cast<LONG>(m_compText.length()));
                 if (FAILED(hr)) {
                     pRange->Release();
@@ -703,6 +776,25 @@ private:
         m_finalHr = S_OK;
         return S_OK;
     }
+    bool CheckPreSideEffectFence() const {
+        if (!m_controlBlock) {
+            return true;
+        }
+        if (m_controlBlock->target_context && m_controlBlock->target_context.Get() != m_pContext) {
+            return false;
+        }
+        if (m_controlBlock->revoked && !m_controlBlock->crossed_side_effect) {
+            return false;
+        }
+        return true;
+    }
+
+    void MarkCrossingSideEffect() {
+        if (m_controlBlock) {
+            m_controlBlock->crossed_side_effect = true;
+        }
+    }
+
     LONG m_cRef = 1;
     CTextInputProcessor* m_pTip = nullptr;
     ITfContext* m_pContext = nullptr;
@@ -715,6 +807,7 @@ private:
     uint64_t m_contextId = 0;
     uint64_t m_generation = 0;
     CandidateDisplaySnapshot m_snapshot;
+    std::shared_ptr<EditRequestControlBlock> m_controlBlock;
     bool m_executed = false;
     EditSessionResult m_result = EditSessionResult::Unmodified;
     HRESULT m_finalHr = S_OK;

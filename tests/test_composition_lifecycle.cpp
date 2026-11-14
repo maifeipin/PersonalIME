@@ -5,10 +5,12 @@
 #include <vector>
 #include <atomic>
 #include <thread>
+#include <fstream>
 #include "../src/common/ime_guids.h"
 #include "../src/tsf_client/globals.h"
 #include "../src/tsf_client/edit_session.h"
 #include "../src/tsf_client/text_input_processor.h"
+#include "../src/tsf_client/receipt_journal_v2.h"
 
 LONG g_cDllRef = 0;
 HINSTANCE g_hInst = nullptr;
@@ -1438,9 +1440,12 @@ public:
 
     std::map<uint64_t, ContextMockState> m_ctxStates;
     std::map<uint64_t, PendingCommitRecord> m_pendingCommits;
+    std::map<uint64_t, IpcCommitDisposition> m_terminalDispositions;
     uint64_t m_nextEventId = 5000;
     std::atomic<int> m_commitSuccessCount{0};
     std::atomic<int> m_commitCancelCount{0};
+    std::atomic<int> m_commitTerminalCount{0};
+    std::atomic<int> m_queryCommitStatusCount{0};
     std::atomic<int> m_learnedCount{0};
     std::atomic<int> m_resetCount{0};
     std::atomic<uint32_t> m_lastSelectVersion{0};
@@ -1714,6 +1719,45 @@ public:
                             }
                         }
                     }
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
+                    pThis->m_commitTerminalCount.fetch_add(1);
+                    IpcCommitDisposition reqDisp = static_cast<IpcCommitDisposition>(req.mode_arg);
+                    auto termIt = pThis->m_terminalDispositions.find(req.event_id);
+                    if (termIt != pThis->m_terminalDispositions.end()) {
+                        resp.commit_length = static_cast<uint32_t>(termIt->second);
+                        if (termIt->second != reqDisp) {
+                            resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                            resp.handled = 0;
+                        } else {
+                            resp.handled = 1;
+                        }
+                    } else {
+                        auto pendIt = pThis->m_pendingCommits.find(req.event_id);
+                        if (pendIt != pThis->m_pendingCommits.end()) {
+                            pThis->m_terminalDispositions[req.event_id] = reqDisp;
+                            pendIt->second.state = (reqDisp == IpcCommitDisposition::ConfirmedWritten) ? 1 : 2;
+                            if (reqDisp == IpcCommitDisposition::ConfirmedWritten) {
+                                pThis->m_commitSuccessCount.fetch_add(1);
+                                pThis->m_learnedCount.fetch_add(1);
+                            } else {
+                                pThis->m_commitCancelCount.fetch_add(1);
+                            }
+                            resp.commit_length = static_cast<uint32_t>(reqDisp);
+                            resp.handled = 1;
+                        } else {
+                            resp.handled = 0;
+                        }
+                    }
+                } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::QueryCommitStatus)) {
+                    pThis->m_queryCommitStatusCount.fetch_add(1);
+                    auto termIt = pThis->m_terminalDispositions.find(req.event_id);
+                    if (termIt != pThis->m_terminalDispositions.end()) {
+                        resp.commit_length = static_cast<uint32_t>(termIt->second);
+                        resp.handled = 1;
+                    } else {
+                        resp.commit_length = static_cast<uint32_t>(IpcCommitDisposition::None);
+                        resp.handled = 1;
                     }
                 } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitSuccess)) {
                     auto it = pThis->m_pendingCommits.find(req.event_id);
@@ -2604,6 +2648,245 @@ int TestStage71bReviewFixes() {
     return 0;
 }
 
+// Test 21: Stage 7.1c - Request Control Block Fence, Observation Timeout -> UnknownPending -> Quarantined,
+// Late Callback Arbitration, v2 WAL Conflict/Corrupt Tail Resilience, and Startup/Crash Recovery
+int TestStage71cRequestFenceAndWalRecovery() {
+    std::wcout << L"[TEST 21] Testing Stage 7.1c Request Fence, UnknownPending/Quarantine & WAL v2 Recovery..." << std::endl;
+
+    auto cleanupWals = []() {
+        std::error_code ec;
+        std::filesystem::remove(receipt_journal_v2::Path(), ec);
+        std::filesystem::remove(receipt_journal::Directory() / L"PersonalIME_receipts.wal", ec);
+    };
+    cleanupWals();
+
+    const std::wstring testPipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_T21_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(testPipeName);
+    server.m_advertiseStage7.store(true);
+    CHECK_TRUE(server.Start(3), L"Stage 7.1c mock server must start");
+    IpcClient::SetPipeNameForTest(testPipeName.c_str());
+
+    // 1. Pre-side-effect revocation on EditRequestControlBlock:
+    //    Revoking a queued async commit before DoEditSession executes must abort with Unmodified,
+    //    transition controlBlock->state to RevokedBeforeWrite, perform ZERO host writes,
+    //    and persist V2_PREP -> V2_RES(CancelDiscard) -> V2_ACK.
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7 must succeed");
+
+        MockContext ctx;
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'A' eaten");
+
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        std::wstring compBefore = ctx.m_activeCompRange;
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async commit queued");
+        CHECK_TRUE(ctx.m_pDeferredSession != nullptr, L"Deferred EditSession captured");
+
+        auto cb = tip.GetRequestControlBlockForTest(2); // req 1 = 'A', req 2 = VK_SPACE commit
+        CHECK_TRUE(cb != nullptr, L"EditRequestControlBlock exists for queued commit");
+        CHECK_TRUE(cb->wal_prepared, L"V2_PREP persisted before queuing commit");
+        CHECK_TRUE(cb->state == RequestLifecycleState::Queued, L"Control block starts in Queued");
+
+        // Revoke before DoEditSession runs (e.g. focus loss / context switch)
+        tip.SuppressQueuedEditSessionsForContext(reinterpret_cast<uint64_t>(&ctx), true);
+        CHECK_TRUE(cb->revoked, L"Control block marked revoked");
+        CHECK_TRUE(!cb->crossed_side_effect, L"Control block has NOT crossed side effect");
+
+        // Now host runs the late deferred EditSession
+        HRESULT hrLate = ctx.m_pDeferredSession->DoEditSession(1);
+        CHECK_EQUAL(hrLate, E_ABORT, L"Revoked pre-side-effect EditSession must abort with E_ABORT");
+        CHECK_TRUE(cb->state == RequestLifecycleState::RevokedBeforeWrite, L"Control block transitioned to RevokedBeforeWrite");
+        CHECK_TRUE(!cb->crossed_side_effect, L"crossed_side_effect remains false");
+        CHECK_EQUAL(ctx.m_activeCompRange, compBefore, L"ZERO host SetText writes occurred after revocation!");
+        CHECK_TRUE(cb->wal_resolved && cb->wal_acked, L"V2_RES and V2_ACK persisted for CancelDiscard");
+        CHECK_TRUE(server.m_terminalDispositions[cb->commit_event_id] == IpcCommitDisposition::CancelDiscard,
+                   L"Server recorded CancelDiscard");
+
+        ctx.m_pDeferredSession->Release();
+        ctx.m_pDeferredSession = nullptr;
+        tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 2. Observation timeout -> UnknownPending (V2_UNK) -> Quarantined -> key passthrough ->
+    //    independent second context stays usable -> late Success resolves & retires Quarantined!
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7 must succeed");
+
+        MockContext ctx1;
+        MockContext ctx2;
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx1, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctx1 'A' eaten");
+
+        ctx1.m_forceSyncBlocked = true;
+        ctx1.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctx1, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctx1 commit queued async");
+
+        auto cb = tip.GetRequestControlBlockForTest(2);
+        CHECK_TRUE(cb != nullptr, L"ctx1 commit control block exists");
+        uint64_t ctx1Id = reinterpret_cast<uint64_t>(&ctx1);
+
+        CHECK_TRUE(tip.MarkObservationTimeout(cb->edit_request_id), L"MarkObservationTimeout succeeded");
+        CHECK_TRUE(tip.GetContextState(ctx1Id) == CompositionState::Quarantined, L"ctx1 transitioned to Quarantined");
+
+        // Verify V2_UNK persisted and NOT ClosedUnknown
+        {
+            receipt_journal_v2::Snapshot snap;
+            CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot v2 succeeded");
+            auto itEv = snap.events.find(cb->commit_event_id);
+            CHECK_TRUE(itEv != snap.events.end(), L"Event found in v2 WAL");
+            CHECK_TRUE(itEv->second.has_unknown_pending, L"V2_UNK recorded in v2 WAL");
+            CHECK_TRUE(!itEv->second.has_resolved, L"Timeout alone MUST NOT force ClosedUnknown / Resolved!");
+        }
+
+        // Quarantined ctx1 passes keys through without eating
+        eaten = TRUE;
+        tip.OnTestKeyDown(&ctx1, 'B', 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Quarantined ctx1 OnTestKeyDown passes key through");
+        eaten = TRUE;
+        tip.OnKeyDown(&ctx1, 'B', 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Quarantined ctx1 OnKeyDown passes key through");
+
+        // Late callback on ctx1 completes with Success (without revocation) -> resolves V2_RES(ConfirmedWritten),
+        // sends CommitTerminal(ConfirmedWritten), records V2_ACK, and retires Quarantined -> None!
+        // Note: first test late Success before switching to ctx2 (since switching to ctx2 revokes ctx1's queued session).
+        HRESULT hrLate = ctx1.m_pDeferredSession->DoEditSession(1);
+        CHECK_EQUAL(hrLate, S_OK, L"Late callback succeeded on ctx1");
+        CHECK_TRUE(cb->crossed_side_effect, L"crossed_side_effect is true");
+        CHECK_TRUE(cb->wal_resolved && cb->wal_acked, L"Late Success recorded V2_RES and V2_ACK");
+        CHECK_TRUE(server.m_terminalDispositions[cb->commit_event_id] == IpcCommitDisposition::ConfirmedWritten,
+                   L"Server confirmed ConfirmedWritten for late callback");
+        CHECK_TRUE(tip.GetContextState(ctx1Id) == CompositionState::None,
+                   L"ctx1 retired from Quarantined -> None after late callback resolved and no potential writers remain");
+
+        ctx1.m_pDeferredSession->Release();
+        ctx1.m_pDeferredSession = nullptr;
+        tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 3. v2 WAL contradictory terminal frame & corrupt tail resilience
+    {
+        receipt_journal_v2::Entry e{};
+        e.owner_id = 0x1111;
+        e.session_id = 0x2222;
+        e.context_id = 0x3333;
+        e.context_epoch = 1;
+        e.input_generation = 1;
+        e.edit_request_id = 1;
+        e.commit_event_id = 7777;
+        e.text_len = 1;
+        e.text_digest = receipt_journal_v2::TextDigest(L"工");
+        CHECK_TRUE(receipt_journal_v2::AppendPrepared(e), L"AppendPrepared succeeded");
+        e.disposition = static_cast<uint32_t>(IpcCommitDisposition::ConfirmedWritten);
+        CHECK_TRUE(receipt_journal_v2::AppendResolved(e), L"First AppendResolved(ConfirmedWritten) succeeded");
+        e.disposition = static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard);
+        CHECK_TRUE(!receipt_journal_v2::AppendResolved(e), L"AppendResolved rejects contradictory terminal disposition");
+
+        // Append corrupt tail bytes
+        {
+            std::ofstream ofs(receipt_journal_v2::Path(), std::ios::binary | std::ios::app);
+            ofs << "V2_RES\t999\tCORRUPT_TAIL_NO_CRC\n";
+        }
+
+        receipt_journal_v2::Snapshot snap;
+        CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot survives corrupt tail");
+        CHECK_TRUE(snap.v2_corrupt_tail_ignored, L"Corrupt tail flagged");
+        auto it = snap.events.find(7777);
+        CHECK_TRUE(it != snap.events.end(), L"Event 7777 loaded");
+        CHECK_EQUAL(it->second.resolved_disposition, static_cast<uint32_t>(IpcCommitDisposition::ConfirmedWritten),
+                    L"First terminal disposition preserved immutably");
+    }
+
+    cleanupWals();
+
+    // 4. Startup / Crash Recovery (RecoverReceiptsFromWal):
+    //    - Dead-owner Prepared without Resolved -> QueryCommitStatus(None) -> settles ClosedUnknown (V2_RES + CommitTerminal + V2_ACK)
+    //    - Resolved without ServiceAck -> resends CommitTerminal + records V2_ACK
+    //    - Legacy v1 P1 ignored, R1 replayed & ACKed
+    //    - Zero SetText / SendInput / UI resurrection
+    {
+        uint64_t evDeadPrep = 8001;
+        uint64_t evUnackedRes = 8002;
+        uint64_t evLegacyP1 = 8003;
+        uint64_t evLegacyR1 = 8004;
+
+        EnterCriticalSection(&server.m_cs);
+        server.m_pendingCommits[evDeadPrep] = { 0xBEEF, 0xCAFE1, L"工", L"a", 0, {L"工"}, 0 };
+        server.m_pendingCommits[evUnackedRes] = { 0xBEEF, 0xCAFE2, L"戈", L"b", 0, {L"戈"}, 0 };
+        server.m_pendingCommits[evLegacyP1] = { 0xBEEF, 0xCAFE3, L"阿", L"c", 0, {L"阿"}, 0 };
+        server.m_pendingCommits[evLegacyR1] = { 0xBEEF, 0xCAFE4, L"啊", L"d", 0, {L"啊"}, 0 };
+        LeaveCriticalSection(&server.m_cs);
+
+        receipt_journal_v2::Entry e1{};
+        e1.owner_id = 0xDEAD1234;
+        e1.session_id = 0xBEEF;
+        e1.context_id = 0xCAFE1;
+        e1.context_epoch = 1;
+        e1.input_generation = 1;
+        e1.edit_request_id = 10;
+        e1.commit_event_id = evDeadPrep;
+        CHECK_TRUE(receipt_journal_v2::AppendPrepared(e1), L"Write dead-owner V2_PREP");
+
+        receipt_journal_v2::Entry e2{};
+        e2.owner_id = 0xDEAD1234;
+        e2.session_id = 0xBEEF;
+        e2.context_id = 0xCAFE2;
+        e2.context_epoch = 1;
+        e2.input_generation = 2;
+        e2.edit_request_id = 11;
+        e2.commit_event_id = evUnackedRes;
+        e2.disposition = static_cast<uint32_t>(IpcCommitDisposition::ConfirmedWritten);
+        CHECK_TRUE(receipt_journal_v2::AppendPrepared(e2), L"Write V2_PREP for unacked resolved");
+        CHECK_TRUE(receipt_journal_v2::AppendResolved(e2), L"Write V2_RES(ConfirmedWritten) without V2_ACK");
+
+        // Legacy v1 P1 + R1
+        CHECK_TRUE(receipt_journal::Prepare({ 0xBEEF, 0xCAFE3, evLegacyP1, 0, 0 }), L"Write v1 P1");
+        CHECK_TRUE(receipt_journal::Append({ { 0xBEEF, 0xCAFE4, evLegacyR1, 0, 0 } }), L"Write v1 R1");
+
+        CTextInputProcessor tip2;
+        tip2.SetClientIdForTest(1);
+        CHECK_TRUE(tip2.NegotiateStage7ForTest(), L"NegotiateStage7 for recovery TIP");
+        int learnedBefore = server.m_learnedCount.load();
+        tip2.RecoverReceiptsFromWal();
+
+        CHECK_TRUE(server.m_terminalDispositions[evDeadPrep] == IpcCommitDisposition::ClosedUnknown,
+                   L"Dead-owner Prepared settled as ClosedUnknown");
+        CHECK_TRUE(server.m_terminalDispositions[evUnackedRes] == IpcCommitDisposition::ConfirmedWritten,
+                   L"Unacked Resolved resent CommitTerminal(ConfirmedWritten)");
+        CHECK_EQUAL(server.m_pendingCommits[evLegacyP1].state, 0,
+                    L"Legacy v1 P1 intent-only record was NEVER inferred as success or cancel!");
+        CHECK_EQUAL(server.m_pendingCommits[evLegacyR1].state, 1,
+                    L"Legacy v1 R1 record was replayed and confirmed");
+        CHECK_TRUE(server.m_learnedCount.load() >= learnedBefore + 1,
+                   L"ConfirmedWritten increased learned count while ClosedUnknown did not");
+        CHECK_EQUAL(IsWindowVisible(tip2.GetCandidateWindowForTest().GetHwnd()) != FALSE, false,
+                    L"Startup recovery NEVER resurrects candidate UI");
+
+        receipt_journal_v2::Snapshot postSnap;
+        CHECK_TRUE(receipt_journal_v2::LoadSnapshot(postSnap, true), L"Post-recovery LoadSnapshot");
+        CHECK_TRUE(postSnap.events[evDeadPrep].has_service_ack, L"ClosedUnknown got V2_ACK");
+        CHECK_TRUE(postSnap.events[evUnackedRes].has_service_ack, L"Resent ConfirmedWritten got V2_ACK");
+    }
+
+    cleanupWals();
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Stage 7.1c Request Fence, UnknownPending & WAL v2 Recovery verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -2627,6 +2910,7 @@ int main() {
     if (TestPluginSyncNonBlockingAndDisabledClickRejection() != 0) return 1;
     if (TestStage71bCompositionlessAndDisplayAttributes() != 0) return 1;
     if (TestStage71bReviewFixes() != 0) return 1;
+    if (TestStage71cRequestFenceAndWalRecovery() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

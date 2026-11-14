@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <filesystem>
 #include "receipt_journal.h"
+#include "receipt_journal_v2.h"
 #include "receipt_retry.h"
 
 static LONG64 s_sessionCounter = 0;
@@ -504,6 +505,9 @@ void CTextInputProcessor::SuppressQueuedEditSessionsForContext(uint64_t contextI
             if (terminateAfter) {
                 p.terminateAfterEdit = true;
             }
+            if (p.controlBlock) {
+                p.controlBlock->revoked = true;
+            }
         }
     }
 }
@@ -514,6 +518,9 @@ void CTextInputProcessor::SuppressAllQueuedEditSessions(bool terminateAfter) {
             p.uiSuppressed = true;
             if (terminateAfter) {
                 p.terminateAfterEdit = true;
+            }
+            if (p.controlBlock) {
+                p.controlBlock->revoked = true;
             }
         }
     }
@@ -567,12 +574,63 @@ void CTextInputProcessor::OnEditSessionCompleted(
         }
     };
 
+    auto finalizeStage7Commit = [&](IpcCommitDisposition disp, IpcKeyResponse* outResp) -> bool {
+        auto cb = pending.controlBlock;
+        if (!cb) return false;
+        receipt_journal_v2::Entry entry{};
+        entry.owner_id = cb->owner_id;
+        entry.session_id = cb->session_id;
+        entry.context_id = cb->context_id;
+        entry.context_epoch = cb->context_epoch;
+        entry.input_generation = cb->input_generation;
+        entry.edit_request_id = cb->edit_request_id;
+        entry.commit_event_id = cb->commit_event_id;
+        entry.channel = 0; // 0 = TSF EditSession
+        entry.text_len = static_cast<uint32_t>(cb->commit_text.size());
+        entry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
+        entry.disposition = static_cast<uint32_t>(disp);
+        entry.hr = static_cast<int32_t>(hrFinal);
+
+        if (!receipt_journal_v2::AppendResolved(entry)) {
+            m_walBarrierFaulted = true;
+            SetContextState(contextId, CompositionState::Quarantined);
+            return false;
+        }
+        cb->wal_resolved = true;
+
+        IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+        bool conflict = false;
+        bool ok = m_ipcClient.NotifyCommitTerminal(
+            cb->session_id,
+            cb->context_id,
+            cb->commit_event_id,
+            disp,
+            cb->context_epoch,
+            cb->input_generation,
+            cb->owner_id,
+            finalDisp,
+            conflict,
+            outResp);
+        if (conflict) {
+            SetContextState(contextId, CompositionState::Quarantined);
+            return false;
+        }
+        if (ok) {
+            entry.disposition = static_cast<uint32_t>(finalDisp);
+            if (receipt_journal_v2::AppendServiceAck(entry)) {
+                cb->wal_acked = true;
+            }
+        }
+        return ok;
+    };
+
     if (result == EditSessionResult::Success) {
         if (pending.terminateAfterEdit && !pending.hasCommit) {
             HideCandidateWindowIfOwnedBy(contextId);
             ExitCompositionlessMode(contextId);
             applySnapshotState(0, 0, 0);
             m_ipcClient.ResetContext(m_sessionId, contextId);
+            RetireContextIfNoPotentialWriter(contextId);
             return;
         }
 
@@ -588,8 +646,12 @@ void CTextInputProcessor::OnEditSessionCompleted(
         }
 
         if (pending.hasCommit && pending.commitEventId != 0) {
-            EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
-            DrainUnconfirmedCommits(true);
+            if (m_ipcClient.IsStage7Capable() && pending.controlBlock && pending.controlBlock->wal_prepared) {
+                finalizeStage7Commit(IpcCommitDisposition::ConfirmedWritten, nullptr);
+            } else {
+                EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
+                DrainUnconfirmedCommits(true);
+            }
         }
 
         if (pending.terminateAfterEdit || pending.uiSuppressed) {
@@ -598,6 +660,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
     } else if (result == EditSessionResult::UiOnlyHandled) {
         if (pending.terminateAfterEdit && !pending.hasCommit) {
             ResetCompositionlessContext(contextId, false, true);
+            RetireContextIfNoPotentialWriter(contextId);
             return;
         }
 
@@ -631,13 +694,21 @@ void CTextInputProcessor::OnEditSessionCompleted(
         }
 
         if (pending.hasCommit && pending.commitEventId != 0) {
-            EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
-            DrainUnconfirmedCommits(true);
+            if (m_ipcClient.IsStage7Capable() && pending.controlBlock && pending.controlBlock->wal_prepared) {
+                finalizeStage7Commit(IpcCommitDisposition::ConfirmedWritten, nullptr);
+            } else {
+                EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
+                DrainUnconfirmedCommits(true);
+            }
         }
     } else if (result == EditSessionResult::Indeterminate) {
         HideCandidateWindowIfOwnedBy(contextId);
         ExitCompositionlessMode(contextId);
-        SetContextState(contextId, CompositionState::Quarantined);
+        if (pending.controlBlock) {
+            MarkContextUnknownPending(pending.controlBlock->edit_request_id);
+        } else {
+            SetContextState(contextId, CompositionState::Quarantined);
+        }
         applySnapshotState(0, 0, 0);
     } else {
         // Unmodified or RecoveryBlocked: current key text was NOT applied to host!
@@ -648,27 +719,18 @@ void CTextInputProcessor::OnEditSessionCompleted(
 
         IpcKeyResponse cancelOrRollbackResp{};
         if (pending.hasCommit && pending.commitEventId != 0) {
-            bool durableClaim = EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Cancel);
-            bool cancelOk = false;
-            if (durableClaim) {
-                cancelOk = m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, pending.commitEventId, &cancelOrRollbackResp);
-                if (cancelOk) {
-                    if (RemoveConfirmedSpilloverRecord(pending.commitEventId)) {
-                        for (auto itU = m_unconfirmedCommits.begin(); itU != m_unconfirmedCommits.end(); ++itU) {
-                            if (itU->event_id == pending.commitEventId) {
-                                m_unconfirmedCommits.erase(itU);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (!durableClaim || !cancelOk) {
-                applySnapshotState(0, 0, 0);
-                ExitCompositionlessMode(contextId);
-            } else {
-                if (cancelOrRollbackResp.candidate_count > 0 ||
-                    (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+            if (m_ipcClient.IsStage7Capable() && pending.controlBlock && pending.controlBlock->wal_prepared) {
+                IpcCommitDisposition disp =
+                    (pending.uiSuppressed || pending.terminateAfterEdit ||
+                     pending.controlBlock->revoked || IsContextQuarantined(contextId))
+                    ? IpcCommitDisposition::CancelDiscard
+                    : IpcCommitDisposition::CancelRestore;
+                bool ok = finalizeStage7Commit(disp, &cancelOrRollbackResp);
+                if (!ok || disp == IpcCommitDisposition::CancelDiscard) {
+                    applySnapshotState(0, 0, 0);
+                    ExitCompositionlessMode(contextId);
+                } else if (cancelOrRollbackResp.candidate_count > 0 ||
+                           (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
                     applySnapshotState(
                         cancelOrRollbackResp.candidate_version,
                         cancelOrRollbackResp.page_index,
@@ -676,6 +738,37 @@ void CTextInputProcessor::OnEditSessionCompleted(
                 } else {
                     applySnapshotState(0, 0, 0);
                     ExitCompositionlessMode(contextId);
+                }
+            } else {
+                bool durableClaim = EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Cancel);
+                bool cancelOk = false;
+                if (durableClaim) {
+                    cancelOk = m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, pending.commitEventId, &cancelOrRollbackResp);
+                    if (cancelOk) {
+                        if (RemoveConfirmedSpilloverRecord(pending.commitEventId)) {
+                            for (auto itU = m_unconfirmedCommits.begin(); itU != m_unconfirmedCommits.end(); ++itU) {
+                                if (itU->event_id == pending.commitEventId) {
+                                    m_unconfirmedCommits.erase(itU);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!durableClaim || !cancelOk) {
+                    applySnapshotState(0, 0, 0);
+                    ExitCompositionlessMode(contextId);
+                } else {
+                    if (cancelOrRollbackResp.candidate_count > 0 ||
+                        (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                        applySnapshotState(
+                            cancelOrRollbackResp.candidate_version,
+                            cancelOrRollbackResp.page_index,
+                            cancelOrRollbackResp.page_count);
+                    } else {
+                        applySnapshotState(0, 0, 0);
+                        ExitCompositionlessMode(contextId);
+                    }
                 }
             }
         } else {
@@ -703,6 +796,225 @@ void CTextInputProcessor::OnEditSessionCompleted(
                 applySnapshotState(0, 0, 0);
                 ExitCompositionlessMode(contextId);
                 m_ipcClient.ResetContext(m_sessionId, contextId);
+            }
+        }
+    }
+    if (pending.controlBlock) {
+        pending.controlBlock->target_context.Reset();
+        if (!pending.controlBlock->unknown_pending &&
+            (!pending.controlBlock->has_commit || !pending.controlBlock->wal_prepared || pending.controlBlock->wal_resolved)) {
+            m_activeRequestBlocks.erase(pending.controlBlock->edit_request_id);
+        }
+    }
+    RetireContextIfNoPotentialWriter(contextId);
+}
+
+bool CTextInputProcessor::IsContextQuarantined(uint64_t contextId) const {
+    return GetContextState(contextId) == CompositionState::Quarantined;
+}
+
+bool CTextInputProcessor::HasPotentialWriterForContext(uint64_t contextId) const {
+    for (const auto& p : m_pendingEditSessions) {
+        if (p.contextId == contextId && !p.completed) {
+            if (!p.controlBlock ||
+                p.controlBlock->state == RequestLifecycleState::Queued ||
+                p.controlBlock->state == RequestLifecycleState::Executing) {
+                return true;
+            }
+        }
+    }
+    for (const auto& kv : m_activeRequestBlocks) {
+        const auto& cb = kv.second;
+        if (cb && cb->context_id == contextId &&
+            (cb->state == RequestLifecycleState::Queued ||
+             cb->state == RequestLifecycleState::Executing)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::shared_ptr<EditRequestControlBlock> CTextInputProcessor::GetRequestControlBlockForTest(uint64_t editRequestId) const {
+    auto it = m_activeRequestBlocks.find(editRequestId);
+    return (it != m_activeRequestBlocks.end()) ? it->second : nullptr;
+}
+
+bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId) {
+    auto it = m_activeRequestBlocks.find(editRequestId);
+    if (it == m_activeRequestBlocks.end() || !it->second) {
+        return false;
+    }
+    auto cb = it->second;
+    cb->unknown_pending = true;
+
+    if (cb->has_commit && cb->commit_event_id != 0) {
+        receipt_journal_v2::Entry entry{};
+        entry.owner_id = cb->owner_id;
+        entry.session_id = cb->session_id;
+        entry.context_id = cb->context_id;
+        entry.context_epoch = cb->context_epoch;
+        entry.input_generation = cb->input_generation;
+        entry.edit_request_id = cb->edit_request_id;
+        entry.commit_event_id = cb->commit_event_id;
+        entry.channel = 0; // 0 = TSF EditSession
+        entry.text_len = static_cast<uint32_t>(cb->commit_text.size());
+        entry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
+        entry.disposition = static_cast<uint32_t>(IpcCommitDisposition::None);
+        entry.hr = static_cast<int32_t>(cb->hr);
+        if (!receipt_journal_v2::AppendUnknownPending(entry)) {
+            m_walBarrierFaulted = true;
+        }
+    }
+
+    SetContextState(cb->context_id, CompositionState::Quarantined);
+    HideCandidateWindowIfOwnedBy(cb->context_id);
+    return true;
+}
+
+bool CTextInputProcessor::MarkObservationTimeout(uint64_t editRequestId) {
+    auto it = m_activeRequestBlocks.find(editRequestId);
+    if (it == m_activeRequestBlocks.end() || !it->second) {
+        return false;
+    }
+    it->second->observation_timed_out = true;
+    // Timeout alone NEVER forces ClosedUnknown; mark UnknownPending and quarantine only this context.
+    return MarkContextUnknownPending(editRequestId);
+}
+
+void CTextInputProcessor::RetireContextIfNoPotentialWriter(uint64_t contextId) {
+    if (GetContextState(contextId) != CompositionState::Quarantined) {
+        return;
+    }
+    if (HasPotentialWriterForContext(contextId)) {
+        return;
+    }
+    for (const auto& kv : m_activeRequestBlocks) {
+        const auto& cb = kv.second;
+        if (cb && cb->context_id == contextId && cb->has_commit && cb->wal_prepared && !cb->wal_resolved) {
+            return;
+        }
+    }
+    if (m_pComposition && m_compositionContextId == contextId) {
+        SetContextState(contextId, CompositionState::CommitPendingEnd);
+    } else {
+        SetContextState(contextId, CompositionState::None);
+    }
+    AdvanceContextInputGeneration(contextId);
+}
+
+void CTextInputProcessor::RecoverReceiptsFromWal() {
+    receipt_journal_v2::Snapshot snap;
+    if (!receipt_journal_v2::LoadSnapshot(snap, true)) {
+        return;
+    }
+
+    // Legacy v1 R1/REC records (P1 intent-only records are already excluded by receipt_journal::Read).
+    for (const auto& rec : snap.legacy_records) {
+        auto v2It = snap.events.find(rec.eid);
+        if (v2It != snap.events.end() && v2It->second.has_service_ack) {
+            continue;
+        }
+        bool ok = false;
+        if (rec.action == 0) {
+            ok = m_ipcClient.NotifyCommitSuccess(rec.sid, rec.cid, rec.eid);
+        } else {
+            ok = m_ipcClient.NotifyCommitCancel(rec.sid, rec.cid, rec.eid, nullptr);
+        }
+        if (ok) {
+            receipt_journal::Ack(rec.eid);
+            receipt_journal_v2::Entry ack{};
+            ack.owner_id = m_ownerInstanceId;
+            ack.session_id = rec.sid;
+            ack.context_id = rec.cid;
+            ack.commit_event_id = rec.eid;
+            ack.disposition = static_cast<uint32_t>(
+                (rec.action == 0)
+                ? IpcCommitDisposition::ConfirmedWritten
+                : IpcCommitDisposition::CancelDiscard);
+            receipt_journal_v2::AppendServiceAck(ack);
+        }
+    }
+
+    for (const auto& kv : snap.events) {
+        const auto& ev = kv.second;
+        if (ev.conflicted) {
+            continue;
+        }
+
+        receipt_journal_v2::Entry base{};
+        base.owner_id = ev.owner_id;
+        base.session_id = ev.session_id;
+        base.context_id = ev.context_id;
+        base.context_epoch = ev.context_epoch;
+        base.input_generation = ev.input_generation;
+        base.edit_request_id = ev.edit_request_id;
+        base.commit_event_id = ev.commit_event_id;
+        base.channel = ev.channel;
+        base.text_len = ev.text_len;
+        base.text_digest = ev.text_digest;
+
+        if (ev.has_resolved && !ev.has_service_ack) {
+            IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+            bool conflict = false;
+            bool ok = m_ipcClient.NotifyCommitTerminal(
+                ev.session_id,
+                ev.context_id,
+                ev.commit_event_id,
+                static_cast<IpcCommitDisposition>(ev.resolved_disposition),
+                static_cast<uint32_t>(ev.context_epoch),
+                static_cast<uint32_t>(ev.input_generation),
+                ev.owner_id,
+                finalDisp,
+                conflict,
+                nullptr);
+            if (ok && !conflict) {
+                base.disposition = static_cast<uint32_t>(finalDisp);
+                receipt_journal_v2::AppendServiceAck(base);
+            }
+        } else if ((ev.has_prepared || ev.has_injection_attempt || ev.has_unknown_pending) && !ev.has_resolved) {
+            IpcCommitDisposition queriedDisp = IpcCommitDisposition::None;
+            if (!m_ipcClient.QueryCommitStatus(
+                    ev.session_id,
+                    ev.context_id,
+                    ev.commit_event_id,
+                    static_cast<uint32_t>(ev.context_epoch),
+                    ev.owner_id,
+                    queriedDisp,
+                    static_cast<uint32_t>(ev.input_generation))) {
+                continue;
+            }
+            if (queriedDisp != IpcCommitDisposition::None) {
+                base.disposition = static_cast<uint32_t>(queriedDisp);
+                if (receipt_journal_v2::AppendResolved(base)) {
+                    receipt_journal_v2::AppendServiceAck(base);
+                }
+                continue;
+            }
+
+            // Server still has pending commit. Only settle ClosedUnknown if original owner/writer is dead.
+            bool ownerDead = (ev.owner_id != m_ownerInstanceId) || !HasPotentialWriterForContext(ev.context_id);
+            if (ownerDead) {
+                base.disposition = static_cast<uint32_t>(IpcCommitDisposition::ClosedUnknown);
+                if (!receipt_journal_v2::AppendResolved(base)) {
+                    continue;
+                }
+                IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+                bool conflict = false;
+                bool ok = m_ipcClient.NotifyCommitTerminal(
+                    ev.session_id,
+                    ev.context_id,
+                    ev.commit_event_id,
+                    IpcCommitDisposition::ClosedUnknown,
+                    static_cast<uint32_t>(ev.context_epoch),
+                    static_cast<uint32_t>(ev.input_generation),
+                    ev.owner_id,
+                    finalDisp,
+                    conflict,
+                    nullptr);
+                if (ok && !conflict) {
+                    base.disposition = static_cast<uint32_t>(finalDisp);
+                    receipt_journal_v2::AppendServiceAck(base);
+                }
             }
         }
     }
@@ -933,6 +1245,7 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     }
 
     m_ipcClient.NegotiateStage7Capability(m_sessionId);
+    RecoverReceiptsFromWal();
 
     return S_OK;
 }
@@ -1109,7 +1422,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     }
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
-    if (HasQueuedEditSession(contextId)) {
+    if (HasQueuedEditSession(contextId) || IsContextQuarantined(contextId)) {
         return S_OK;
     }
 
@@ -1481,16 +1794,70 @@ bool CTextInputProcessor::ProcessKeyInternal(
         };
 
         if (resp.has_composition || resp.has_commit) {
-            if (resp.has_commit && resp.commit_event_id != 0 &&
-                !receipt_journal::Prepare({m_sessionId, contextId, resp.commit_event_id, 0, 0})) {
-                IpcKeyResponse restored{};
-                if (m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &restored)) {
-                    m_contextCandidateVersions[contextId] = restored.candidate_version;
-                    m_latestServerCandidateVersions[contextId] = restored.candidate_version;
-                    m_contextPageIndices[contextId] = restored.page_index;
-                    m_contextPageCounts[contextId] = restored.page_count;
+            std::shared_ptr<EditRequestControlBlock> controlBlock = std::make_shared<EditRequestControlBlock>();
+            controlBlock->edit_request_id = ++m_nextEditRequestId;
+            controlBlock->owner_id = m_ownerInstanceId;
+            controlBlock->session_id = m_sessionId;
+            controlBlock->context_id = contextId;
+            controlBlock->context_epoch = static_cast<uint32_t>(currentEpoch);
+            controlBlock->input_generation = static_cast<uint32_t>(currentInputGen);
+            controlBlock->commit_event_id = resp.commit_event_id;
+            controlBlock->commit_text = resp.commit_text;
+            controlBlock->target_context = pic;
+            controlBlock->has_commit = (resp.has_commit != 0);
+
+            if (resp.has_commit && resp.commit_event_id != 0) {
+                if (m_ipcClient.IsStage7Capable()) {
+                    bool prepOk = false;
+                    if (!m_walBarrierFaulted) {
+                        receipt_journal_v2::Entry prepEntry{};
+                        prepEntry.owner_id = controlBlock->owner_id;
+                        prepEntry.session_id = controlBlock->session_id;
+                        prepEntry.context_id = controlBlock->context_id;
+                        prepEntry.context_epoch = controlBlock->context_epoch;
+                        prepEntry.input_generation = controlBlock->input_generation;
+                        prepEntry.edit_request_id = controlBlock->edit_request_id;
+                        prepEntry.commit_event_id = controlBlock->commit_event_id;
+                        prepEntry.channel = 0; // 0 = TSF EditSession
+                        prepEntry.text_len = static_cast<uint32_t>(controlBlock->commit_text.size());
+                        prepEntry.text_digest = receipt_journal_v2::TextDigest(controlBlock->commit_text);
+                        prepEntry.disposition = static_cast<uint32_t>(IpcCommitDisposition::None);
+                        prepOk = receipt_journal_v2::AppendPrepared(prepEntry);
+                    }
+                    if (!prepOk) {
+                        m_walBarrierFaulted = true;
+                        IpcKeyResponse restored{};
+                        IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+                        bool conflict = false;
+                        if (m_ipcClient.NotifyCommitTerminal(
+                                m_sessionId,
+                                contextId,
+                                resp.commit_event_id,
+                                IpcCommitDisposition::CancelRestore,
+                                controlBlock->context_epoch,
+                                controlBlock->input_generation,
+                                m_ownerInstanceId,
+                                finalDisp,
+                                conflict,
+                                &restored)) {
+                            m_contextCandidateVersions[contextId] = restored.candidate_version;
+                            m_latestServerCandidateVersions[contextId] = restored.candidate_version;
+                            m_contextPageIndices[contextId] = restored.page_index;
+                            m_contextPageCounts[contextId] = restored.page_count;
+                        }
+                        return false; // Pause host commit writes when WAL barrier fails.
+                    }
+                    controlBlock->wal_prepared = true;
+                } else if (!receipt_journal::Prepare({m_sessionId, contextId, resp.commit_event_id, 0, 0})) {
+                    IpcKeyResponse restored{};
+                    if (m_ipcClient.NotifyCommitCancel(m_sessionId, contextId, resp.commit_event_id, &restored)) {
+                        m_contextCandidateVersions[contextId] = restored.candidate_version;
+                        m_latestServerCandidateVersions[contextId] = restored.candidate_version;
+                        m_contextPageIndices[contextId] = restored.page_index;
+                        m_contextPageCounts[contextId] = restored.page_count;
+                    }
+                    return false; // No host edit when the preflight barrier cannot persist.
                 }
-                return false; // No host edit when the preflight barrier cannot persist.
             }
 
             CandidateDisplaySnapshot snap{};
@@ -1601,6 +1968,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             }
 
             uint64_t editGen = ++m_editSessionGeneration;
+            m_activeRequestBlocks[controlBlock->edit_request_id] = controlBlock;
             m_pendingEditSessions.emplace_back(
                 contextId,
                 pic,
@@ -1611,7 +1979,8 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 resp.commit_text,
                 resp.commit_event_id,
                 snap,
-                PendingEditStatus::PendingSync);
+                PendingEditStatus::PendingSync,
+                controlBlock);
 
             CEditSession* pSession = new CEditSession(
                 this, pic, &m_candidateWindow,
@@ -1619,7 +1988,8 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 resp.has_commit != 0, resp.commit_text,
                 cands,
                 editGen,
-                &snap
+                &snap,
+                controlBlock
             );
 
             HRESULT hrSession = S_OK;

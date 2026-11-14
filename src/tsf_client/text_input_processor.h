@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
+#include <atomic>
 #include <chrono>
 #include <wrl/client.h>
 #include "candidate_window.h"
@@ -48,6 +50,37 @@ enum class EditSessionResult {
     Success,           // All operations succeeded. (*pfEaten = TRUE).
     UiOnlyHandled,     // Stage 7: Compositionless UI updated cleanly without touching host document (*pfEaten = TRUE, no rollback).
     Indeterminate      // Stage 7: Side-effect uncertain; quarantine context and eat key (*pfEaten = TRUE).
+};
+
+enum class RequestLifecycleState {
+    Queued,
+    Executing,
+    Returned,
+    RevokedBeforeWrite
+};
+
+struct EditRequestControlBlock {
+    uint64_t edit_request_id = 0;
+    uint64_t owner_id = 0;
+    uint64_t session_id = 0;
+    uint64_t context_id = 0;
+    uint32_t context_epoch = 0;
+    uint32_t input_generation = 0;
+    uint64_t commit_event_id = 0;
+    std::wstring commit_text;
+    Microsoft::WRL::ComPtr<ITfContext> target_context;
+    RequestLifecycleState state = RequestLifecycleState::Queued;
+    bool revoked = false;
+    bool crossed_side_effect = false;
+    bool has_commit = false;
+    bool wal_prepared = false;
+    bool wal_resolved = false;
+    bool wal_acked = false;
+    bool unknown_pending = false;
+    bool observation_timed_out = false;
+    EditSessionResult outcome = EditSessionResult::Unmodified;
+    HRESULT hr = S_OK;
+    std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
 };
 
 class CTextInputProcessor : 
@@ -220,17 +253,19 @@ public:
         bool completed = false;
         EditSessionResult finalResult = EditSessionResult::Unmodified;
         HRESULT finalHr = S_OK;
+        std::shared_ptr<EditRequestControlBlock> controlBlock;
 
         PendingEditSession() = default;
         PendingEditSession(uint64_t ctxId, ITfContext* ctx, uint64_t gen,
                            bool hasComp, const std::wstring& comp,
                            bool hasCom, const std::wstring& comText, uint64_t comEvId,
                            const CandidateDisplaySnapshot& snap,
-                           PendingEditStatus st)
+                           PendingEditStatus st,
+                           std::shared_ptr<EditRequestControlBlock> cb = nullptr)
             : contextId(ctxId), pContext(ctx), generation(gen),
               hasComposition(hasComp), composition(comp),
               hasCommit(hasCom), commitText(comText), commitEventId(comEvId),
-              displaySnapshot(snap), status(st) {
+              displaySnapshot(snap), status(st), controlBlock(std::move(cb)) {
             if (pContext) pContext->AddRef();
         }
 
@@ -244,7 +279,8 @@ public:
               hasCommit(o.hasCommit), commitText(o.commitText), commitEventId(o.commitEventId),
               displaySnapshot(o.displaySnapshot), status(o.status),
               uiSuppressed(o.uiSuppressed), terminateAfterEdit(o.terminateAfterEdit),
-              completed(o.completed), finalResult(o.finalResult), finalHr(o.finalHr) {
+              completed(o.completed), finalResult(o.finalResult), finalHr(o.finalHr),
+              controlBlock(o.controlBlock) {
             if (pContext) pContext->AddRef();
         }
 
@@ -266,6 +302,7 @@ public:
                 completed = o.completed;
                 finalResult = o.finalResult;
                 finalHr = o.finalHr;
+                controlBlock = o.controlBlock;
                 if (pContext) pContext->AddRef();
             }
             return *this;
@@ -327,6 +364,15 @@ public:
 
     // Receipt and drain helpers
     void DrainUnconfirmedCommits(bool forceNow = false);
+    bool IsContextQuarantined(uint64_t contextId) const;
+    bool HasPotentialWriterForContext(uint64_t contextId) const;
+    bool MarkContextUnknownPending(uint64_t editRequestId);
+    bool MarkObservationTimeout(uint64_t editRequestId);
+    void RetireContextIfNoPotentialWriter(uint64_t contextId);
+    void RecoverReceiptsFromWal();
+    void ClearWalBarrierFaultForTest() { m_walBarrierFaulted = false; }
+    bool IsWalBarrierFaulted() const { return m_walBarrierFaulted; }
+    std::shared_ptr<EditRequestControlBlock> GetRequestControlBlockForTest(uint64_t editRequestId) const;
 
     // Retained unconfirmed commits for bounded recovery
     enum class UnconfirmedAction {
@@ -408,6 +454,9 @@ private:
     std::map<uint64_t, CompositionState> m_contextStates;
     std::map<uint64_t, CandidateWindowMode> m_contextModes;
     std::map<uint64_t, Microsoft::WRL::ComPtr<ITfContext>> m_compositionlessContextLeases;
+    std::map<uint64_t, std::shared_ptr<EditRequestControlBlock>> m_activeRequestBlocks;
+    uint64_t m_nextEditRequestId = 0;
+    bool m_walBarrierFaulted = false;
 
     struct TextEditSinkBinding {
         Microsoft::WRL::ComPtr<ITfContext> context;
