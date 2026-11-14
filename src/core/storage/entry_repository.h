@@ -64,8 +64,14 @@ public:
         uint64_t context_id = 0;
         int status = 0; // 0 = not found, 1 = Recorded, 2 = Cancelled
         int64_t committed_at = 0;
+        int final_disposition = 0; // Stage 7: IpcCommitDisposition
+        uint64_t context_epoch = 0;
+        uint64_t input_generation = 0;
+        uint64_t owner_instance_id = 0;
     };
     CommitEventRecord GetCommitEventRecord(const std::string& eventId);
+    bool FinalizeTerminalCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                     int requestedDisposition, int& outFinalDisposition, bool& outConflict);
 
     // Sort Preferences (Pin / Rank)
     bool SetPinPreference(InputScheme scheme, const std::string& code, const std::string& entryId, bool isPinned, int orderRank = 1,
@@ -142,6 +148,9 @@ public:
         std::string resolved_code;
         int64_t global_epoch = 0;
         int64_t entry_epoch = 0;
+        uint64_t context_epoch = 0;
+        uint64_t input_generation = 0;
+        uint64_t owner_instance_id = 0;
     };
     bool SavePendingCommit(const PendingCommitRecord& rec);
     bool RemovePendingCommit(const std::string& eventId);

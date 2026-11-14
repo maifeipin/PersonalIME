@@ -18,15 +18,40 @@ struct CandidatePluginItem {
     bool isPressed = false;
 };
 
+enum class CandidateWindowMode {
+    StandardInline  = 0, // Host renders inline composition + CandidateWindow shows Preedit Header
+    Compositionless = 1  // Host lacks inline composition; CandidateWindow exclusively renders Preedit Header
+};
+
+enum class PreeditDisplayMode {
+    Always              = 0, // Always show Preedit Header above candidate list
+    CompositionlessOnly = 1, // Show Preedit Header only when host is in Compositionless mode
+    Disabled            = 2  // Pure candidate list only
+};
+
+enum class ThemeMode {
+    FollowSystem = 0, // Track AppsUseLightTheme
+    Light        = 1, // Force Light palette
+    Dark         = 2  // Force Dark palette
+};
+
 struct CandidateDisplaySnapshot {
     uint64_t session_id = 0;
     uint64_t context_id = 0;
-    ITfContext* pContext = nullptr;
+    ITfContext* pContext = nullptr;      // Non-owning borrowed pointer; issuer holds COM ref until invalidated
+    uint64_t input_generation = 0;      // Bound to context input generation
+    uint64_t context_epoch = 0;         // Bound to context lifecycle epoch (prevents pointer reuse)
     uint32_t candidate_version = 0;
     uint32_t page_index = 0;
     uint32_t page_count = 0;
     std::vector<std::wstring> candidates;
     int initial_selected_index = 0;
+
+    // Stage 7 extensions
+    CandidateWindowMode mode = CandidateWindowMode::StandardInline;
+    std::wstring raw_input;             // Raw keystrokes (e.g. "dajia")
+    std::wstring query_code;            // Normalized/segmented code (e.g. "da'jia")
+    std::wstring preview_text;          // Currently highlighted candidate preview text (e.g. "大家")
 };
 
 class CCandidateWindow {

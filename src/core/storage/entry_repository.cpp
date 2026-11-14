@@ -638,7 +638,11 @@ bool EntryRepository::HasCommitEvent(const std::string& eventId) {
 EntryRepository::CommitEventRecord EntryRepository::GetCommitEventRecord(const std::string& eventId) {
     CommitEventRecord rec;
     if (eventId.empty()) return rec;
-    auto stmt = m_db.Prepare("SELECT session_id, context_id, status, committed_at FROM commit_events WHERE event_id = ?;");
+    auto stmt = m_db.Prepare(
+        "SELECT session_id, context_id, status, committed_at, "
+        "final_disposition, context_epoch, input_generation, owner_instance_id "
+        "FROM commit_events WHERE event_id = ?;"
+    );
     if (!stmt) return rec;
     stmt->BindText(1, eventId);
     if (stmt->Step()) {
@@ -647,8 +651,127 @@ EntryRepository::CommitEventRecord EntryRepository::GetCommitEventRecord(const s
         rec.context_id = static_cast<uint64_t>(stmt->ColumnInt64(1));
         rec.status = stmt->ColumnInt(2);
         rec.committed_at = stmt->ColumnInt64(3);
+        rec.final_disposition = stmt->ColumnInt(4);
+        rec.context_epoch = static_cast<uint64_t>(stmt->ColumnInt64(5));
+        rec.input_generation = static_cast<uint64_t>(stmt->ColumnInt64(6));
+        rec.owner_instance_id = static_cast<uint64_t>(stmt->ColumnInt64(7));
     }
     return rec;
+}
+
+bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, uint64_t sessionId, uint64_t contextId,
+                                                int requestedDisposition, int& outFinalDisposition, bool& outConflict) {
+    outFinalDisposition = 0;
+    outConflict = false;
+    if (eventId.empty() || requestedDisposition <= 0) return false;
+
+    SqliteDb::Transaction tx(m_db);
+    if (!tx.IsStarted()) return false;
+
+    auto stmtCheck = m_db.Prepare(
+        "SELECT session_id, context_id, status, final_disposition "
+        "FROM commit_events WHERE event_id = ?;"
+    );
+    if (!stmtCheck) {
+        tx.Rollback();
+        return false;
+    }
+    stmtCheck->BindText(1, eventId);
+    if (stmtCheck->Step()) {
+        uint64_t existingSid = static_cast<uint64_t>(stmtCheck->ColumnInt64(0));
+        uint64_t existingCid = static_cast<uint64_t>(stmtCheck->ColumnInt64(1));
+        int existingStatus = stmtCheck->ColumnInt(2);
+        int existingDisp = stmtCheck->ColumnInt(3);
+
+        if (existingSid != sessionId || existingCid != contextId) {
+            outConflict = true;
+            outFinalDisposition = existingDisp;
+            tx.Rollback();
+            return false;
+        }
+        if (existingDisp != 0) {
+            outFinalDisposition = existingDisp;
+            if (existingDisp == requestedDisposition) {
+                return tx.Commit();
+            }
+            outConflict = true;
+            tx.Rollback();
+            return false;
+        }
+        // Legacy row without final_disposition
+        bool legacyConfirmed = (existingStatus == 1);
+        bool reqConfirmed = (requestedDisposition == 1);
+        if (legacyConfirmed != reqConfirmed) {
+            outConflict = true;
+            outFinalDisposition = legacyConfirmed ? 1 : 3;
+            tx.Rollback();
+            return false;
+        }
+        auto stmtUpd = m_db.Prepare("UPDATE commit_events SET final_disposition = ? WHERE event_id = ?;");
+        if (!stmtUpd) { tx.Rollback(); return false; }
+        stmtUpd->BindInt(1, requestedDisposition);
+        stmtUpd->BindText(2, eventId);
+        if (!stmtUpd->Step() && stmtUpd->HasError()) { tx.Rollback(); return false; }
+        outFinalDisposition = requestedDisposition;
+        return tx.Commit();
+    }
+    if (stmtCheck->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    // Check pending_commits ownership and delete
+    uint64_t ctxEpoch = 0, inputGen = 0, ownerId = 0;
+    auto stmtPend = m_db.Prepare(
+        "SELECT session_id, context_id, context_epoch, input_generation, owner_instance_id "
+        "FROM pending_commits WHERE event_id = ?;"
+    );
+    if (!stmtPend) { tx.Rollback(); return false; }
+    stmtPend->BindText(1, eventId);
+    if (stmtPend->Step()) {
+        uint64_t pSid = static_cast<uint64_t>(stmtPend->ColumnInt64(0));
+        uint64_t pCid = static_cast<uint64_t>(stmtPend->ColumnInt64(1));
+        if (pSid != sessionId || pCid != contextId) {
+            outConflict = true;
+            tx.Rollback();
+            return false;
+        }
+        ctxEpoch = static_cast<uint64_t>(stmtPend->ColumnInt64(2));
+        inputGen = static_cast<uint64_t>(stmtPend->ColumnInt64(3));
+        ownerId = static_cast<uint64_t>(stmtPend->ColumnInt64(4));
+
+        auto stmtDel = m_db.Prepare("DELETE FROM pending_commits WHERE event_id = ?;");
+        if (!stmtDel) { tx.Rollback(); return false; }
+        stmtDel->BindText(1, eventId);
+        if (!stmtDel->Step() && stmtDel->HasError()) { tx.Rollback(); return false; }
+    } else if (stmtPend->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    int status = (requestedDisposition == 1) ? 1 : 2;
+    auto stmtIns = m_db.Prepare(
+        "INSERT INTO commit_events (event_id, session_id, context_id, status, committed_at, "
+        "final_disposition, context_epoch, input_generation, owner_instance_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);"
+    );
+    if (!stmtIns) { tx.Rollback(); return false; }
+    stmtIns->BindText(1, eventId);
+    stmtIns->BindInt64(2, static_cast<int64_t>(sessionId));
+    stmtIns->BindInt64(3, static_cast<int64_t>(contextId));
+    stmtIns->BindInt(4, status);
+    stmtIns->BindInt64(5, m_clock->Now());
+    stmtIns->BindInt(6, requestedDisposition);
+    stmtIns->BindInt64(7, static_cast<int64_t>(ctxEpoch));
+    stmtIns->BindInt64(8, static_cast<int64_t>(inputGen));
+    stmtIns->BindInt64(9, static_cast<int64_t>(ownerId));
+    if (!stmtIns->Step() && stmtIns->HasError()) {
+        tx.Rollback();
+        return false;
+    }
+
+    outFinalDisposition = requestedDisposition;
+    return tx.Commit();
 }
 
 bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
@@ -657,8 +780,9 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     auto stmt = m_db.Prepare(
         "INSERT INTO pending_commits "
         "(event_id, session_id, context_id, scheme, query_code, entry_id, text, created_at, "
-        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
+        "learning_enabled, layout_id, matched_code, resolved_code, global_epoch, entry_epoch, "
+        "context_epoch, input_generation, owner_instance_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"
     );
     if (!stmt) return false;
     stmt->BindText(1, rec.event_id);
@@ -744,6 +868,9 @@ bool EntryRepository::SavePendingCommit(const PendingCommitRecord& rec) {
     }
     stmt->BindInt64(13, gEpoch);
     stmt->BindInt64(14, eEpoch);
+    stmt->BindInt64(15, static_cast<int64_t>(rec.context_epoch));
+    stmt->BindInt64(16, static_cast<int64_t>(rec.input_generation));
+    stmt->BindInt64(17, static_cast<int64_t>(rec.owner_instance_id));
     return stmt->Execute();
 }
 

@@ -168,6 +168,34 @@ bool Migration::Migrate(SqliteDb& db) {
         }
     }
 
+    bool needsV7 = (currentVer < 7);
+    if (!needsV7) {
+        auto checkCol = [&](const char* table, const char* colName) -> bool {
+            std::string sql = std::string("PRAGMA table_info(") + table + ");";
+            auto stmt = db.Prepare(sql);
+            if (!stmt) return false;
+            while (stmt->Step()) {
+                if (stmt->ColumnText(1) == colName) return true;
+            }
+            return false;
+        };
+        if (!checkCol("commit_events", "final_disposition") ||
+            !checkCol("commit_events", "context_epoch") ||
+            !checkCol("commit_events", "input_generation") ||
+            !checkCol("commit_events", "owner_instance_id") ||
+            !checkCol("pending_commits", "context_epoch") ||
+            !checkCol("pending_commits", "input_generation") ||
+            !checkCol("pending_commits", "owner_instance_id")) {
+            needsV7 = true;
+        }
+    }
+
+    if (needsV7) {
+        if (!ApplyVersion7(db)) {
+            return false;
+        }
+    }
+
     if (!EnsureDefaultPluginsSeeded(db)) {
         return false;
     }
@@ -660,6 +688,52 @@ bool Migration::ApplyVersion6(SqliteDb& db) {
     }
 
     if (!db.Execute("PRAGMA user_version = 6;")) {
+        tx.Rollback();
+        return false;
+    }
+
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion7(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    auto ensureColumn = [&](const char* table, const char* colName, const char* alterSql) -> bool {
+        std::string pragmaSql = std::string("PRAGMA table_info(") + table + ");";
+        auto stmt = db.Prepare(pragmaSql);
+        if (!stmt) return false;
+        bool exists = false;
+        while (stmt->Step()) {
+            if (stmt->ColumnText(1) == colName) {
+                exists = true;
+                break;
+            }
+        }
+        if (stmt->HasError()) return false;
+        if (!exists) {
+            if (!db.Execute(alterSql)) return false;
+        }
+        return true;
+    };
+
+    if (!ensureColumn("commit_events", "final_disposition", "ALTER TABLE commit_events ADD COLUMN final_disposition INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("commit_events", "context_epoch",     "ALTER TABLE commit_events ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("commit_events", "input_generation",  "ALTER TABLE commit_events ADD COLUMN input_generation INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("commit_events", "owner_instance_id", "ALTER TABLE commit_events ADD COLUMN owner_instance_id INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("pending_commits", "context_epoch",     "ALTER TABLE pending_commits ADD COLUMN context_epoch INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("pending_commits", "input_generation",  "ALTER TABLE pending_commits ADD COLUMN input_generation INTEGER NOT NULL DEFAULT 0;") ||
+        !ensureColumn("pending_commits", "owner_instance_id", "ALTER TABLE pending_commits ADD COLUMN owner_instance_id INTEGER NOT NULL DEFAULT 0;")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '7');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 7;")) {
         tx.Rollback();
         return false;
     }

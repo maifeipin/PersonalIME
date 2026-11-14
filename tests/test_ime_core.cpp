@@ -996,6 +996,83 @@ static int TestStage4C2ReverseLookupCore(ImeEngine& engine) {
     return 0;
 }
 
+int TestStage71aSchemaAndTerminalDisposition() {
+    std::cout << "[TEST] Testing Stage 7.1a Schema v7 Migration & FinalizeTerminalCommitEvent..." << std::endl;
+    SqliteDb db;
+    TEST_ASSERT(db.Open(":memory:"), "Open in-memory DB for Stage 7.1a");
+    TEST_ASSERT(Migration::Migrate(db), "Migrate in-memory DB to v7");
+    TEST_ASSERT(Migration::GetSchemaVersion(db) == 7, "Schema version is 7");
+
+    auto hasColumn = [&](const char* table, const std::string& col) {
+        auto stmt = db.Prepare(std::string("PRAGMA table_info(") + table + ");");
+        while (stmt && stmt->Step()) {
+            if (stmt->ColumnText(1) == col) return true;
+        }
+        return false;
+    };
+    TEST_ASSERT(hasColumn("commit_events", "final_disposition"), "commit_events has final_disposition");
+    TEST_ASSERT(hasColumn("commit_events", "context_epoch"), "commit_events has context_epoch");
+    TEST_ASSERT(hasColumn("commit_events", "input_generation"), "commit_events has input_generation");
+    TEST_ASSERT(hasColumn("commit_events", "owner_instance_id"), "commit_events has owner_instance_id");
+    TEST_ASSERT(hasColumn("pending_commits", "context_epoch"), "pending_commits has context_epoch");
+    TEST_ASSERT(hasColumn("pending_commits", "input_generation"), "pending_commits has input_generation");
+    TEST_ASSERT(hasColumn("pending_commits", "owner_instance_id"), "pending_commits has owner_instance_id");
+
+    EntryRepository repo(db, std::make_shared<MockClock>());
+    EntryRepository::PendingCommitRecord pending;
+    pending.event_id = "evt-71a-confirm";
+    pending.session_id = 10;
+    pending.context_id = 20;
+    pending.scheme = InputScheme::Wubi86;
+    pending.query_code = "aaaa";
+    pending.entry_id = "e1";
+    pending.text = L"工";
+    pending.context_epoch = 42;
+    pending.input_generation = 7;
+    pending.owner_instance_id = 1001;
+    TEST_ASSERT(repo.SavePendingCommit(pending), "SavePendingCommit with Stage 7.1a fields");
+
+    int finalDisp = 0;
+    bool conflict = false;
+    // 1. ConfirmedWritten (1)
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict), "Finalize ConfirmedWritten");
+    TEST_ASSERT(!conflict && finalDisp == 1, "ConfirmedWritten succeeded without conflict");
+    auto ce = repo.GetCommitEventRecord("evt-71a-confirm");
+    TEST_ASSERT(ce.status == 1 && ce.final_disposition == 1, "commit_events updated to status=1, final_disposition=1");
+
+    // 2. Idempotent replay of ConfirmedWritten (1)
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 1, finalDisp, conflict), "Idempotent replay succeeds");
+    TEST_ASSERT(!conflict && finalDisp == 1, "Idempotent replay has no conflict");
+
+    // 3. Mutually exclusive CancelDiscard (3) conflicts
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 10, 20, 3, finalDisp, conflict), "CancelDiscard after ConfirmedWritten fails");
+    TEST_ASSERT(conflict && finalDisp == 1, "CancelDiscard after ConfirmedWritten sets conflict and preserves finalDisp=1");
+
+    // 4. Wrong owner conflicts
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-confirm", 99, 20, 1, finalDisp, conflict), "Wrong session conflicts");
+    TEST_ASSERT(conflict, "Wrong session sets conflict flag");
+
+    // 5. DispatchedUnverified (4) then ClosedUnknown (5)
+    EntryRepository::PendingCommitRecord pUnk;
+    pUnk.event_id = "evt-71a-unk";
+    pUnk.session_id = 10;
+    pUnk.context_id = 21;
+    pUnk.scheme = InputScheme::Wubi86;
+    pUnk.query_code = "bbbb";
+    pUnk.entry_id = "e2";
+    pUnk.text = L"了";
+    TEST_ASSERT(repo.SavePendingCommit(pUnk), "SavePendingCommit for DispatchedUnverified");
+    TEST_ASSERT(repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 4, finalDisp, conflict), "Finalize DispatchedUnverified");
+    TEST_ASSERT(!conflict && finalDisp == 4, "DispatchedUnverified recorded");
+    auto ceUnk = repo.GetCommitEventRecord("evt-71a-unk");
+    TEST_ASSERT(ceUnk.status == 2 && ceUnk.final_disposition == 4, "DispatchedUnverified sets status=2 (non-learned terminal) and final_disposition=4");
+    TEST_ASSERT(!repo.FinalizeTerminalCommitEvent("evt-71a-unk", 10, 21, 1, finalDisp, conflict), "ConfirmedWritten after DispatchedUnverified conflicts");
+    TEST_ASSERT(conflict && finalDisp == 4, "Conflict preserves DispatchedUnverified");
+
+    std::cout << "[PASS] Stage 7.1a Schema v7 Migration & FinalizeTerminalCommitEvent verified!\n";
+    return 0;
+}
+
 int main() {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -1042,6 +1119,9 @@ int main() {
     std::cout << "Step 15: Starting TestStage4C2ReverseLookupCore..." << std::endl;
     if (TestStage4C2ReverseLookupCore(engine) != 0) return 1;
 
-    std::cout << "=== ALL Stage 2 & 4C-2 Core Test Suites (15/15) PASSED WITH ZERO ERRORS! ===" << std::endl;
+    std::cout << "Step 16: Starting TestStage71aSchemaAndTerminalDisposition..." << std::endl;
+    if (TestStage71aSchemaAndTerminalDisposition() != 0) return 1;
+
+    std::cout << "=== ALL Stage 2, 4C-2 & 7.1a Core Test Suites (16/16) PASSED WITH ZERO ERRORS! ===" << std::endl;
     return 0;
 }

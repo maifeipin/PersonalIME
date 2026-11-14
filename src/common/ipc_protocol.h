@@ -5,25 +5,38 @@
 
 constexpr uint32_t IPC_PROTOCOL_VERSION_STAGE3 = 0x0300;
 constexpr uint32_t IPC_PROTOCOL_VERSION_STAGE4 = 0x0400;
+constexpr uint32_t IPC_PROTOCOL_VERSION_STAGE7 = 0x0700;
 
 enum class IpcMsgType : uint32_t {
-    Ping           = 1,
-    Pong           = 2,
-    TestKeyDown    = 3,
-    KeyDown        = 4,
-    Reset          = 5,
-    Rollback       = 6,
-    ContextLost    = 7,
-    CommitSuccess  = 8,  // Host document successfully inserted text; record learning
-    CommitCancel   = 9,  // Host document edit failed; cancel learning
-    SetMode        = 10, // Explicitly set mode flags
-    GetMode        = 11, // Query mode flags
-    NextDictionary = 12, // Step to next dictionary in priority order
-    SetScheme      = 13, // Explicitly set input scheme (Stage 4)
-    GetScheme      = 14, // Query input scheme (Stage 4)
-    OpenManager    = 15, // Open or activate Manager (Stage 5)
-    ExecutePlugin  = 16, // Execute a registered plugin by ID (Stage 5 Extension)
-    GetPlugins     = 17  // Fetch active plugins list (Stage 5 Extension)
+    Ping              = 1,
+    Pong              = 2,
+    TestKeyDown       = 3,
+    KeyDown           = 4,
+    Reset             = 5,
+    Rollback          = 6,
+    ContextLost       = 7,
+    CommitSuccess     = 8,  // Host document successfully inserted text; record learning
+    CommitCancel      = 9,  // Host document edit failed; cancel learning
+    SetMode           = 10, // Explicitly set mode flags
+    GetMode           = 11, // Query mode flags
+    NextDictionary    = 12, // Step to next dictionary in priority order
+    SetScheme         = 13, // Explicitly set input scheme (Stage 4)
+    GetScheme         = 14, // Query input scheme (Stage 4)
+    OpenManager       = 15, // Open or activate Manager (Stage 5)
+    ExecutePlugin     = 16, // Execute a registered plugin by ID (Stage 5 Extension)
+    GetPlugins        = 17, // Fetch active plugins list (Stage 5 Extension)
+    CommitTerminal    = 18, // Stage 7: Versioned idempotent commit finalization
+    QueryCommitStatus = 19  // Stage 7: Query persisted final disposition for commit_event_id
+};
+
+// Stage 7: Terminal commit disposition for idempotent finalization & WAL v2 recovery
+enum class IpcCommitDisposition : uint32_t {
+    None                 = 0,
+    ConfirmedWritten     = 1, // Host text confirmed written; record learning and finalize
+    CancelRestore        = 2, // Unmodified & same epoch/generation; restore candidates if valid
+    CancelDiscard        = 3, // Unmodified & stale/unfocused; discard pending commit
+    DispatchedUnverified = 4, // Unicode events dispatched via SendInput; consume input without learning
+    ClosedUnknown        = 5  // No potential writer remains & outcome unknown; finalize without learning
 };
 
 // Independent Scheme Identifier (Wire Protocol Values)
@@ -72,14 +85,17 @@ inline IpcSchemeId InputSchemeToIpcSchemeId(ime::InputScheme scheme) {
 
 // Mode flags bitmask
 enum IpcModeFlags : uint32_t {
-    IPC_MODE_CHINESE         = 1 << 0, // 1 = Chinese input mode, 0 = English direct passthrough
-    IPC_MODE_PINYIN          = 1 << 1, // Legacy Stage 3: 1 = Pinyin scheme, 0 = Wubi86 scheme
-    IPC_MODE_FULL_WIDTH      = 1 << 2, // 1 = Full-width (全角), 0 = Half-width (半角)
-    IPC_MODE_CHINESE_PUNCT   = 1 << 3, // 1 = Chinese punctuation, 0 = English punctuation
-    IPC_STATUS_HAS_NEXT_DICT = 1 << 4, // 1 = Next dictionary fallback available
-    IPC_STATUS_TRUNCATED     = 1 << 5, // 1 = Ambiguity exploration / candidate / plugin budget truncated
-    IPC_STATUS_ERROR         = 1 << 6, // 1 = Query encountered storage / internal error
-    IPC_STATUS_HAS_PLUGINS_REV = 1 << 7 // 1 = status_flags bits 24..31 carry 8-bit plugins revision tag
+    IPC_MODE_CHINESE           = 1 << 0,  // 1 = Chinese input mode, 0 = English direct passthrough
+    IPC_MODE_PINYIN            = 1 << 1,  // Legacy Stage 3: 1 = Pinyin scheme, 0 = Wubi86 scheme
+    IPC_MODE_FULL_WIDTH        = 1 << 2,  // 1 = Full-width (全角), 0 = Half-width (半角)
+    IPC_MODE_CHINESE_PUNCT     = 1 << 3,  // 1 = Chinese punctuation, 0 = English punctuation
+    IPC_STATUS_HAS_NEXT_DICT   = 1 << 4,  // 1 = Next dictionary fallback available
+    IPC_STATUS_TRUNCATED       = 1 << 5,  // 1 = Ambiguity exploration / candidate / plugin budget truncated
+    IPC_STATUS_ERROR           = 1 << 6,  // 1 = Query encountered storage / internal error
+    IPC_STATUS_HAS_PLUGINS_REV = 1 << 7,  // 1 = status_flags bits 24..31 carry 8-bit plugins revision tag
+    IPC_STATUS_STAGE7_CAPABLE  = 1 << 8,  // 1 = Server supports Stage 7 protocol (CommitTerminal / QueryCommitStatus / QueryCode)
+    IPC_STATUS_CONFLICT_ERROR  = 1 << 9,  // 1 = CommitTerminal rejected due to mutually exclusive disposition conflict
+    IPC_STATUS_HAS_QUERY_CODE  = 1 << 10  // 1 = When has_commit==0, commit_text carries segmented query_code for Preedit Header
 };
 
 // Scheme encoding in status_flags (bits 16..23)
@@ -117,10 +133,11 @@ struct IpcKeyRequest {
     uint32_t mode_arg;         // Argument for SetMode or extra flags (offset 44)
     uint32_t candidate_version;// Candidate snapshot version selected by client (offset 48)
     
-    // Stage 4 protocol extensions (replaces reserved[12], total struct size remains 64 bytes)
+    // Stage 4 protocol extensions (total struct size remains 64 bytes)
     uint32_t scheme_id;        // Explicit IpcSchemeId / InputScheme (offset 52)
     uint32_t update_mask;      // IpcUpdateMask bitmask (offset 56)
-    uint8_t  reserved[4];      // Reserved for alignment & future expansion (offset 60)
+    // Stage 7 protocol extension (replaces reserved[4], total struct size remains 64 bytes)
+    uint32_t context_epoch;    // Context lifecycle epoch for ownership verification (offset 60)
 };                             // Total size: 64 bytes
 
 struct IpcKeyResponse {
@@ -130,7 +147,7 @@ struct IpcKeyResponse {
     uint32_t handled;          // 1 = eaten by IME, 0 = pass-through (offset 20)
     
     // Stage 3 status & flags
-    uint32_t protocol_version; // IPC_PROTOCOL_VERSION_STAGE3 (offset 24)
+    uint32_t protocol_version; // IPC_PROTOCOL_VERSION_STAGE3/4/7 (offset 24)
     uint32_t status_flags;     // IpcModeFlags bitmask (offset 28)
 
     // Composition string
@@ -141,7 +158,7 @@ struct IpcKeyResponse {
     uint32_t has_commit;        // 1 = commit text present (offset 292)
     uint64_t commit_event_id;   // Unique commit event token for host confirmation (offset 296)
     uint32_t commit_length;     // Character length of commit text (offset 304)
-    wchar_t  commit_text[1024]; // Committed text (null-terminated, supports long phrases/Emoji) (offset 308, 2048 bytes)
+    wchar_t  commit_text[1024]; // Committed text (or query_code when has_commit==0 && IPC_STATUS_HAS_QUERY_CODE) (offset 308, 2048 bytes)
 
     // Paginated candidate list
     uint32_t candidate_version; // Candidate snapshot version / epoch (offset 2356)
@@ -153,3 +170,6 @@ struct IpcKeyResponse {
 };                             // Total size: 4680 bytes
 
 #pragma pack(pop)
+
+static_assert(sizeof(IpcKeyRequest) == 64, "IpcKeyRequest wire size must remain 64 bytes");
+static_assert(sizeof(IpcKeyResponse) == 4680, "IpcKeyResponse wire size must remain 4680 bytes");

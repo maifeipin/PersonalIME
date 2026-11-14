@@ -18,6 +18,8 @@ CTextInputProcessor::CTextInputProcessor() {
     uint64_t pid = static_cast<uint64_t>(GetCurrentProcessId());
     uint64_t counter = static_cast<uint64_t>(InterlockedIncrement64(&s_sessionCounter));
     m_sessionId = (pid << 32) | (counter & 0xFFFFFFFF);
+    m_ownerInstanceId = m_sessionId ^ (GetTickCount64() * 11400714819323198485ull);
+    if (m_ownerInstanceId == 0) m_ownerInstanceId = m_sessionId;
     DllAddRef();
 
     m_candidateWindow.SetOnOpenManager([this]() {
@@ -1415,4 +1417,56 @@ STDMETHODIMP CTextInputProcessor::OnCompositionTerminated(TfEditCookie ecWrite, 
     // 3. Stale or late notification for unknown / already-finalized composition: safely ignored
     s_hitLateNotificationIgnored.fetch_add(1, std::memory_order_relaxed);
     return S_OK;
+}
+
+uint64_t CTextInputProcessor::EnsureContextEpoch(uint64_t contextId) {
+    if (contextId == 0) return 0;
+    auto it = m_contextEpochs.find(contextId);
+    if (it == m_contextEpochs.end() || it->second == 0) {
+        uint64_t newEpoch = 1;
+        m_contextEpochs[contextId] = newEpoch;
+        return newEpoch;
+    }
+    return it->second;
+}
+
+uint64_t CTextInputProcessor::GetContextEpoch(uint64_t contextId) const {
+    if (contextId == 0) return 0;
+    auto it = m_contextEpochs.find(contextId);
+    return (it != m_contextEpochs.end()) ? it->second : 0;
+}
+
+uint64_t CTextInputProcessor::AdvanceContextEpoch(uint64_t contextId) {
+    if (contextId == 0) return 0;
+    uint64_t& epoch = m_contextEpochs[contextId];
+    epoch = (epoch == 0) ? 1 : (epoch + 1);
+    return epoch;
+}
+
+uint64_t CTextInputProcessor::GetContextInputGeneration(uint64_t contextId) const {
+    if (contextId == 0) return 0;
+    auto it = m_contextInputGenerations.find(contextId);
+    return (it != m_contextInputGenerations.end()) ? it->second : 0;
+}
+
+uint64_t CTextInputProcessor::AdvanceContextInputGeneration(uint64_t contextId) {
+    if (contextId == 0) return 0;
+    uint64_t& gen = m_contextInputGenerations[contextId];
+    gen++;
+    return gen;
+}
+
+CompositionState CTextInputProcessor::GetContextState(uint64_t contextId) const {
+    if (contextId == 0) return CompositionState::None;
+    auto it = m_contextStates.find(contextId);
+    return (it != m_contextStates.end()) ? it->second : CompositionState::None;
+}
+
+void CTextInputProcessor::SetContextState(uint64_t contextId, CompositionState state) {
+    if (contextId == 0) return;
+    if (state == CompositionState::None) {
+        m_contextStates.erase(contextId);
+    } else {
+        m_contextStates[contextId] = state;
+    }
 }

@@ -20,6 +20,14 @@ public:
     bool Rollback(uint64_t sessionId, uint64_t contextId, IpcKeyResponse* outResp = nullptr);
     bool NotifyCommitSuccess(uint64_t sessionId, uint64_t contextId, uint64_t eventId);
     bool NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint64_t eventId, IpcKeyResponse* outResp = nullptr);
+    bool NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
+                              IpcCommitDisposition requestedDisp, uint32_t contextEpoch,
+                              IpcCommitDisposition& outFinalDisp, bool& outConflict,
+                              IpcKeyResponse* outResp = nullptr);
+    bool QueryCommitStatus(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
+                           IpcCommitDisposition& outFinalDisp);
+    bool NegotiateStage7Capability(uint64_t sessionId);
+    bool IsStage7Capable() const { return m_stage7Capable; }
     bool SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion = IPC_PROTOCOL_VERSION_STAGE3, uint32_t updateMask = 0);
     bool GetMode(uint64_t sessionId, uint64_t contextId, uint32_t& outModeFlags, ime::InputScheme& outScheme);
     bool SetScheme(uint64_t sessionId, uint64_t contextId, ime::InputScheme scheme);
@@ -80,4 +88,5 @@ private:
     bool EnsureConnected(ULONGLONG deadline);
 
     HANDLE m_hPipe = INVALID_HANDLE_VALUE;
+    bool m_stage7Capable = false;
 };

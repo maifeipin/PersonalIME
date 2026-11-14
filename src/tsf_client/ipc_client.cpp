@@ -301,6 +301,68 @@ bool IpcClient::NotifyCommitCancel(uint64_t sessionId, uint64_t contextId, uint6
     return ok && (resp.handled == 1);
 }
 
+bool IpcClient::NotifyCommitTerminal(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
+                                      IpcCommitDisposition requestedDisp, uint32_t contextEpoch,
+                                      IpcCommitDisposition& outFinalDisp, bool& outConflict,
+                                      IpcKeyResponse* outResp) {
+    outFinalDisp = IpcCommitDisposition::None;
+    outConflict = false;
+    if (eventId == 0) return false;
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::CommitTerminal);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.event_id = eventId;
+    req.mode_arg = static_cast<uint32_t>(requestedDisp);
+    req.context_epoch = contextEpoch;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+    IpcKeyResponse resp{};
+    bool ok = SendRequest(req, resp, 80);
+    if (outResp) *outResp = resp;
+    if (!ok) return false;
+    if ((resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
+        m_stage7Capable = true;
+    }
+    outConflict = (resp.status_flags & IPC_STATUS_CONFLICT_ERROR) != 0;
+    outFinalDisp = static_cast<IpcCommitDisposition>(resp.commit_length);
+    return (resp.handled == 1) && !outConflict;
+}
+
+bool IpcClient::QueryCommitStatus(uint64_t sessionId, uint64_t contextId, uint64_t eventId,
+                                  IpcCommitDisposition& outFinalDisp) {
+    outFinalDisp = IpcCommitDisposition::None;
+    if (eventId == 0) return false;
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::QueryCommitStatus);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.event_id = eventId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+    IpcKeyResponse resp{};
+    if (!SendRequest(req, resp, 80)) return false;
+    if ((resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
+        m_stage7Capable = true;
+    }
+    if (resp.handled != 1) return false;
+    outFinalDisp = static_cast<IpcCommitDisposition>(resp.commit_length);
+    return true;
+}
+
+bool IpcClient::NegotiateStage7Capability(uint64_t sessionId) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+    req.session_id = sessionId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+    IpcKeyResponse resp{};
+    if (SendRequest(req, resp, 50) && resp.handled == 1 &&
+        (resp.status_flags & IPC_STATUS_STAGE7_CAPABLE) != 0) {
+        m_stage7Capable = true;
+        return true;
+    }
+    m_stage7Capable = false;
+    return false;
+}
+
 bool IpcClient::SetMode(uint64_t sessionId, uint64_t contextId, uint32_t modeFlags, uint32_t protocolVersion, uint32_t updateMask) {
     IpcKeyRequest req{};
     req.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);

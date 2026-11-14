@@ -10,8 +10,33 @@
 
 enum class CompositionState {
     None,
-    Composing,        // Active composition with in-progress input string (can be updated or canceled)
-    CommitPendingEnd  // Text was written to document, but EndComposition failed
+    Composing,                // Active inline composition with in-progress input string
+    CompositionlessComposing, // Valid context without host inline composition; UI-only preedit
+    CommitPendingEnd,         // Text was written to document, but EndComposition failed
+    Quarantined               // Unknown outcome or target invalidated with pending request
+};
+
+// Stage 7: Separate edit handling, commit outcome, and injection outcome contracts
+enum class EditHandling {
+    Applied,          // Inline composition updated or ended normally
+    UiOnlyHandled,    // Compositionless mode: UI/candidates updated without modifying host document
+    Unmodified,       // Host untouched and key not handled
+    RecoveryBlocked,  // Previous commit pending end; blocks new edit without bypass
+    Indeterminate     // Side-effect uncertain; context quarantined
+};
+
+enum class CommitOutcome {
+    Success,           // Commit text confirmed written + tail cleanup succeeded
+    PartiallyModified, // Commit text confirmed written, tail Selection/EndComposition failed
+    Unmodified,        // Confirmed commit text was NOT written to host
+    Unknown            // Outcome uncertain (timeout, disconnect, or crash)
+};
+
+enum class InjectionOutcome {
+    NotAttempted,         // SendInput not called
+    NotDispatched,        // SendInput returned 0
+    DispatchedUnverified, // SendInput returned cInputs; delivery to host unverified
+    Unknown               // Partial send (0 < ret < cInputs) or lost result
 };
 
 // Outcome of an edit session to govern key consumption and server synchronization
@@ -19,7 +44,9 @@ enum class EditSessionResult {
     Unmodified,        // Host text was not touched by this session (SetText failed or not reached). Safe to rollback server & pass key (*pfEaten = FALSE).
     PartiallyModified, // THIS session modified host text by SetText, but tail operation (SetSelection/EndComposition) failed. Must eat key (*pfEaten = TRUE), do NOT rollback server.
     RecoveryBlocked,   // Previous commit could not be ended, so THIS session could not execute. Current request text was NOT touched. Must NOT eat key (*pfEaten = FALSE), and MUST rollback server for current key!
-    Success            // All operations succeeded. (*pfEaten = TRUE).
+    Success,           // All operations succeeded. (*pfEaten = TRUE).
+    UiOnlyHandled,     // Stage 7: Compositionless UI updated cleanly without touching host document (*pfEaten = TRUE, no rollback).
+    Indeterminate      // Stage 7: Side-effect uncertain; quarantine context and eat key (*pfEaten = TRUE).
 };
 
 class CTextInputProcessor : 
@@ -320,6 +347,21 @@ private:
     std::map<uint64_t, uint32_t> m_contextPageCounts;
     uint32_t m_currentPageIndex = 0;
     uint32_t m_currentPageCount = 0;
+
+    // Stage 7: Per-context ownership, lifecycle epochs, input generations & compositionless states
+    uint64_t m_ownerInstanceId = 0;
+    std::map<uint64_t, uint64_t> m_contextEpochs;
+    std::map<uint64_t, uint64_t> m_contextInputGenerations;
+    std::map<uint64_t, CompositionState> m_contextStates;
+    std::map<uint64_t, CandidateWindowMode> m_contextModes;
+
+    uint64_t EnsureContextEpoch(uint64_t contextId);
+    uint64_t GetContextEpoch(uint64_t contextId) const;
+    uint64_t AdvanceContextEpoch(uint64_t contextId);
+    uint64_t GetContextInputGeneration(uint64_t contextId) const;
+    uint64_t AdvanceContextInputGeneration(uint64_t contextId);
+    CompositionState GetContextState(uint64_t contextId) const;
+    void SetContextState(uint64_t contextId, CompositionState state);
 
     bool ProcessKeyInternal(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten,
                             bool hasExplicitVersion, uint32_t explicitCandidateVersion);

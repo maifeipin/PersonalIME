@@ -276,6 +276,20 @@ static void PopulateCandidates(ContextState& st, IpcKeyResponse& resp) {
     resp.candidate_version = st.candidate_version;
 
     PopulateCandidatesPage(resp, st);
+
+    if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 &&
+        resp.has_commit == 0 &&
+        !st.cached_coord_query.candidates.empty()) {
+        const auto& topCand = st.cached_coord_query.candidates[0];
+        std::wstring qCode = !topCand.resolved_code.empty()
+            ? ime::Utf8ToWide(topCand.resolved_code)
+            : st.composition;
+        if (!qCode.empty()) {
+            SafeCopyCandidateText(resp.commit_text, sizeof(resp.commit_text) / sizeof(wchar_t), qCode);
+            resp.commit_length = 0;
+            resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+        }
+    }
 }
 
 static std::wstring MapChinesePunctuation(uint32_t vk, uint32_t modifiers) {
@@ -399,10 +413,15 @@ void HandleClient(HANDLE hPipe) {
         resp.context_id = req.context_id;
         resp.protocol_version = req.protocol_version;
         resp.status_flags = ComputeModeFlags(state);
+        if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
+            req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
+            resp.status_flags |= IPC_STATUS_STAGE7_CAPABLE;
+        }
 
-        // Strict protocol version validation (accept Stage 3 legacy and Stage 4 modern)
+        // Strict protocol version validation (accept Stage 3, Stage 4, and Stage 7)
         if (req.protocol_version != IPC_PROTOCOL_VERSION_STAGE3 &&
-            req.protocol_version != IPC_PROTOCOL_VERSION_STAGE4) {
+            req.protocol_version != IPC_PROTOCOL_VERSION_STAGE4 &&
+            req.protocol_version != IPC_PROTOCOL_VERSION_STAGE7) {
             resp.handled = 0;
             WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
             FlushFileBuffers(hPipe);
@@ -599,6 +618,115 @@ void HandleClient(HANDLE hPipe) {
                 }
             } else {
                 resp.handled = 0;
+            }
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::QueryCommitStatus)) {
+            if (req.event_id != 0 && g_engine.GetRepo()) {
+                auto rec = g_engine.GetRepo()->GetCommitEventRecord(std::to_string(req.event_id));
+                if (rec.status != 0 && rec.session_id == req.session_id && rec.context_id == req.context_id) {
+                    int disp = rec.final_disposition;
+                    if (disp == 0) {
+                        disp = (rec.status == 1)
+                            ? static_cast<int>(IpcCommitDisposition::ConfirmedWritten)
+                            : static_cast<int>(IpcCommitDisposition::CancelDiscard);
+                    }
+                    resp.commit_event_id = req.event_id;
+                    resp.commit_length = static_cast<uint32_t>(disp);
+                    resp.handled = 1;
+                } else {
+                    resp.handled = 0;
+                }
+            } else {
+                resp.handled = 0;
+            }
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
+            uint32_t reqDisp = req.mode_arg;
+            if (req.event_id == 0 || reqDisp < 1 || reqDisp > 5 || !g_engine.GetRepo()) {
+                resp.handled = 0;
+            } else {
+                int effectiveDisp = static_cast<int>(reqDisp);
+                std::unique_lock<std::mutex> lock(g_pendingMutex);
+                auto it = g_pendingCommits.find(req.event_id);
+                ServerPendingCommit pc;
+                bool hadPending = false;
+                if (it != g_pendingCommits.end()) {
+                    if (it->second.session_id != req.session_id || it->second.context_id != req.context_id) {
+                        resp.handled = 0;
+                        resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                        WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
+                        FlushFileBuffers(hPipe);
+                        continue;
+                    }
+                    pc = it->second;
+                    hadPending = true;
+                }
+
+                // Atomically downgrade CancelRestore -> CancelDiscard when preconditions fail
+                if (reqDisp == static_cast<uint32_t>(IpcCommitDisposition::CancelRestore)) {
+                    if (!hadPending ||
+                        state.connection_epoch != pc.connection_epoch ||
+                        state.input_generation != pc.generation ||
+                        !state.composition.empty()) {
+                        effectiveDisp = static_cast<int>(IpcCommitDisposition::CancelDiscard);
+                    }
+                }
+                lock.unlock();
+
+                int outFinalDisp = 0;
+                bool outConflict = false;
+                bool ok = g_engine.GetRepo()->FinalizeTerminalCommitEvent(
+                    std::to_string(req.event_id),
+                    req.session_id,
+                    req.context_id,
+                    effectiveDisp,
+                    outFinalDisp,
+                    outConflict
+                );
+
+                lock.lock();
+                if (outConflict) {
+                    resp.handled = 0;
+                    resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
+                    resp.commit_event_id = req.event_id;
+                    resp.commit_length = static_cast<uint32_t>(outFinalDisp);
+                } else if (!ok) {
+                    resp.handled = 0;
+                } else {
+                    g_pendingCommits.erase(req.event_id);
+                    CommitState cState = (outFinalDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten))
+                        ? CommitState::Recorded
+                        : CommitState::Cancelled;
+                    g_completedEvents[req.event_id] = { req.session_id, req.context_id, cState };
+                    if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {
+                        g_completedEvents.erase(g_completedEvents.begin());
+                    }
+
+                    // Only ConfirmedWritten records learning, and only once when transitioning from pending
+                    if (hadPending && outFinalDisp == static_cast<int>(IpcCommitDisposition::ConfirmedWritten) && g_engine.GetCoordinator()) {
+                        lock.unlock();
+                        bool learnOn = pc.policy_snapshot ? pc.policy_snapshot->learning_enabled : true;
+                        if (learnOn) {
+                            g_engine.GetCoordinator()->CommitCandidate(
+                                pc.candidate,
+                                std::to_string(req.event_id),
+                                req.session_id,
+                                req.context_id,
+                                pc.policy_snapshot
+                            );
+                        }
+                        lock.lock();
+                    } else if (outFinalDisp == static_cast<int>(IpcCommitDisposition::CancelRestore) && hadPending) {
+                        state.composition = pc.composition_before_commit;
+                        state.current_page = pc.page_before_commit;
+                        PopulateCandidates(state, resp);
+                        state.AdvanceGeneration();
+                    }
+
+                    resp.commit_event_id = req.event_id;
+                    resp.commit_length = static_cast<uint32_t>(outFinalDisp);
+                    resp.handled = 1;
+                }
             }
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::SetMode)) {
