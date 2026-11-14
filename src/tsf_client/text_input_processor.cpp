@@ -585,83 +585,10 @@ void CTextInputProcessor::OnEditSessionCompleted(
     };
 
     auto finalizeStage7Commit = [&](IpcCommitDisposition disp, IpcKeyResponse* outResp) -> bool {
-        auto cb = pending.controlBlock;
-        if (!cb) return false;
-        receipt_journal_v2::Entry entry{};
-        entry.owner_id = cb->owner_id;
-        entry.session_id = cb->session_id;
-        entry.context_id = cb->context_id;
-        entry.context_epoch = cb->context_epoch;
-        entry.input_generation = cb->server_commit_generation;
-        entry.edit_request_id = cb->edit_request_id;
-        entry.commit_event_id = cb->commit_event_id;
-        entry.channel = 0; // 0 = TSF EditSession
-        entry.text_len = static_cast<uint32_t>(cb->commit_text.size());
-        entry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
-        entry.disposition = static_cast<uint32_t>(disp);
-        entry.hr = static_cast<int32_t>(hrFinal);
-
-        auto buildPendingReceipt = [&](bool resolvedInWal, bool ackedFromServer, IpcCommitDisposition ackedDisp) {
-            PendingV2Receipt r{};
-            r.owner_id = cb->owner_id;
-            r.session_id = cb->session_id;
-            r.context_id = cb->context_id;
-            r.context_epoch = cb->context_epoch;
-            r.input_generation = cb->server_commit_generation;
-            r.edit_request_id = cb->edit_request_id;
-            r.commit_event_id = cb->commit_event_id;
-            r.channel = 0;
-            r.text_len = entry.text_len;
-            r.text_digest = entry.text_digest;
-            r.requested_disp = disp;
-            r.acked_disp = ackedDisp;
-            r.hr = entry.hr;
-            r.has_resolved_in_wal = resolvedInWal;
-            r.has_acked_from_server = ackedFromServer;
-            return r;
-        };
-
-        if (!receipt_journal_v2::AppendResolved(entry)) {
-            RecordWalFault(cb->commit_event_id, WalFaultStage::Resolved);
-            SetContextState(contextId, CompositionState::Quarantined);
-            EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None));
-            return false;
-        }
-        cb->wal_resolved = true;
-        ClearWalFault(cb->commit_event_id, WalFaultStage::Resolved);
-
-        IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
-        bool conflict = false;
-        bool ok = m_ipcClient.NotifyCommitTerminal(
-            cb->session_id,
-            cb->context_id,
-            cb->commit_event_id,
-            disp,
-            cb->context_epoch,
-            cb->server_commit_generation,
-            cb->owner_id,
-            finalDisp,
-            conflict,
-            outResp);
-        if (conflict) {
-            SetContextState(contextId, CompositionState::Quarantined);
-            return false;
-        }
-        if (ok) {
-            entry.disposition = static_cast<uint32_t>(finalDisp);
-            if (receipt_journal_v2::AppendServiceAck(entry)) {
-                cb->wal_acked = true;
-                ClearAllWalFaultsForEvent(cb->commit_event_id);
-            } else {
-                RecordWalFault(cb->commit_event_id, WalFaultStage::ServiceAck);
-            }
-        }
-        if (!cb->wal_acked) {
-            EnqueuePendingV2Receipt(buildPendingReceipt(true, ok, ok ? finalDisp : IpcCommitDisposition::None));
-        }
-        return ok;
+        return FinalizeStage7CommitForBlock(pending.controlBlock, disp, hrFinal, 0, outResp);
     };
 
+    bool deferredUnicodeInjection = false;
     if (result == EditSessionResult::Success) {
         if (pending.terminateAfterEdit && !pending.hasCommit) {
             HideCandidateWindowIfOwnedBy(contextId);
@@ -758,18 +685,19 @@ void CTextInputProcessor::OnEditSessionCompleted(
         IpcKeyResponse cancelOrRollbackResp{};
         if (pending.hasCommit && pending.commitEventId != 0) {
             if (m_ipcClient.IsStage7Capable() && pending.controlBlock && pending.controlBlock->wal_prepared) {
-                InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
-                if (result == EditSessionResult::Unmodified) {
-                    injOutcome = TryUnicodeInjectionFallback(pending, pending.controlBlock, pending.pContext);
-                }
-                if (injOutcome == InjectionOutcome::DispatchedUnverified) {
-                    finalizeStage7Commit(IpcCommitDisposition::DispatchedUnverified, nullptr);
-                    applySnapshotState(0, 0, 0);
-                    ExitCompositionlessMode(contextId);
-                } else if (injOutcome == InjectionOutcome::Unknown) {
-                    MarkContextUnknownPending(pending.controlBlock->edit_request_id);
-                    applySnapshotState(0, 0, 0);
-                    ExitCompositionlessMode(contextId);
+                if (result == EditSessionResult::Unmodified &&
+                    IsUnicodeInjectionEligiblePrecheck(pending, pending.controlBlock, pending.pContext)) {
+                    PendingUnicodeInjection injItem{};
+                    injItem.edit_request_id = pending.controlBlock->edit_request_id;
+                    injItem.controlBlock = pending.controlBlock;
+                    injItem.pContext = pending.pContext;
+                    injItem.uiSuppressed = pending.uiSuppressed;
+                    injItem.terminateAfterEdit = pending.terminateAfterEdit;
+                    m_pendingUnicodeInjections.push_back(std::move(injItem));
+                    deferredUnicodeInjection = true;
+                    if (m_syncEditSessionDepth == 0) {
+                        StartDrainTimer();
+                    }
                 } else {
                     IpcCommitDisposition disp =
                         (pending.uiSuppressed || pending.terminateAfterEdit ||
@@ -853,7 +781,8 @@ void CTextInputProcessor::OnEditSessionCompleted(
     }
     if (pending.controlBlock) {
         pending.controlBlock->target_context.Reset();
-        if (!pending.controlBlock->unknown_pending &&
+        if (!deferredUnicodeInjection &&
+            !pending.controlBlock->unknown_pending &&
             (!pending.controlBlock->has_commit || !pending.controlBlock->wal_prepared || pending.controlBlock->wal_resolved)) {
             m_activeRequestBlocks.erase(pending.controlBlock->edit_request_id);
         }
@@ -880,11 +809,135 @@ std::vector<INPUT> CTextInputProcessor::BuildUnicodeInputs(const std::wstring& t
 
 static bool IsContextReadOnly(ITfContext* pic);
 
-InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
+bool CTextInputProcessor::FinalizeStage7CommitForBlock(
+    const std::shared_ptr<EditRequestControlBlock>& cb,
+    IpcCommitDisposition disp,
+    HRESULT hrFinal,
+    uint32_t channel,
+    IpcKeyResponse* outResp)
+{
+    if (!cb) return false;
+    uint64_t contextId = cb->context_id;
+    receipt_journal_v2::Entry entry{};
+    entry.owner_id = cb->owner_id;
+    entry.session_id = cb->session_id;
+    entry.context_id = cb->context_id;
+    entry.context_epoch = cb->context_epoch;
+    entry.input_generation = cb->server_commit_generation;
+    entry.edit_request_id = cb->edit_request_id;
+    entry.commit_event_id = cb->commit_event_id;
+    entry.channel = channel;
+    entry.text_len = static_cast<uint32_t>(cb->commit_text.size());
+    entry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
+    entry.disposition = static_cast<uint32_t>(disp);
+    entry.hr = static_cast<int32_t>(hrFinal);
+
+    auto buildPendingReceipt = [&](bool resolvedInWal, bool ackedFromServer, IpcCommitDisposition ackedDisp) {
+        PendingV2Receipt r{};
+        r.owner_id = cb->owner_id;
+        r.session_id = cb->session_id;
+        r.context_id = cb->context_id;
+        r.context_epoch = cb->context_epoch;
+        r.input_generation = cb->server_commit_generation;
+        r.edit_request_id = cb->edit_request_id;
+        r.commit_event_id = cb->commit_event_id;
+        r.channel = channel;
+        r.text_len = entry.text_len;
+        r.text_digest = entry.text_digest;
+        r.requested_disp = disp;
+        r.acked_disp = ackedDisp;
+        r.hr = entry.hr;
+        r.has_resolved_in_wal = resolvedInWal;
+        r.has_acked_from_server = ackedFromServer;
+        return r;
+    };
+
+    if (!receipt_journal_v2::AppendResolved(entry)) {
+        RecordWalFault(cb->commit_event_id, WalFaultStage::Resolved);
+        SetContextState(contextId, CompositionState::Quarantined);
+        EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None));
+        return false;
+    }
+    cb->wal_resolved = true;
+    ClearWalFault(cb->commit_event_id, WalFaultStage::Resolved);
+
+    IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
+    bool conflict = false;
+    bool ok = m_ipcClient.NotifyCommitTerminal(
+        cb->session_id,
+        cb->context_id,
+        cb->commit_event_id,
+        disp,
+        cb->context_epoch,
+        cb->server_commit_generation,
+        cb->owner_id,
+        finalDisp,
+        conflict,
+        outResp);
+    if (conflict) {
+        SetContextState(contextId, CompositionState::Quarantined);
+        return false;
+    }
+    if (ok) {
+        entry.disposition = static_cast<uint32_t>(finalDisp);
+        if (receipt_journal_v2::AppendServiceAck(entry)) {
+            cb->wal_acked = true;
+            ClearAllWalFaultsForEvent(cb->commit_event_id);
+        } else {
+            RecordWalFault(cb->commit_event_id, WalFaultStage::ServiceAck);
+        }
+    }
+    if (!cb->wal_acked) {
+        EnqueuePendingV2Receipt(buildPendingReceipt(true, ok, ok ? finalDisp : IpcCommitDisposition::None));
+    }
+    return ok;
+}
+
+bool CTextInputProcessor::IsUnicodeInjectionEligiblePrecheck(
     const PendingEditSession& pending,
     const std::shared_ptr<EditRequestControlBlock>& cb,
-    ITfContext* pContext)
+    ITfContext* pContext) const
 {
+    if (!m_unicodeInjectionEnabled || !m_ipcClient.IsStage7Capable()) {
+        return false;
+    }
+    if (!cb || !cb->was_compositionless || cb->commit_text.empty() || cb->commit_event_id == 0) {
+        return false;
+    }
+    if (m_pComposition != nullptr ||
+        GetContextState(cb->context_id) == CompositionState::CommitPendingEnd ||
+        GetContextState(cb->context_id) == CompositionState::Quarantined) {
+        return false;
+    }
+    if (cb->revoked || cb->crossed_side_effect || cb->injection_attempted || IsWalBarrierFaulted()) {
+        return false;
+    }
+    if (pending.uiSuppressed || pending.terminateAfterEdit) {
+        return false;
+    }
+    if (HasQueuedEditSession(cb->context_id) || HasPotentialWriterForContext(cb->context_id)) {
+        return false;
+    }
+    if (m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
+        !pContext || IsContextReadOnly(pContext)) {
+        return false;
+    }
+    if (GetContextEpoch(cb->context_id) != cb->context_epoch ||
+        GetContextInputGeneration(cb->context_id) != cb->input_generation) {
+        return false;
+    }
+    return true;
+}
+
+InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
+    const PendingUnicodeInjection& item)
+{
+    const auto& cb = item.controlBlock;
+    ITfContext* pContext = item.pContext.Get();
+    // 0. Must NEVER execute SendInput while inside DoEditSession.
+    if (IsInEditSession()) {
+        return InjectionOutcome::NotAttempted;
+    }
     // 1. Default OFF; requires explicit opt-in and Stage 7 capable server.
     if (!m_unicodeInjectionEnabled || !m_ipcClient.IsStage7Capable()) {
         return InjectionOutcome::NotAttempted;
@@ -902,7 +955,7 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
     if (cb->revoked || cb->crossed_side_effect || cb->injection_attempted || IsWalBarrierFaulted()) {
         return InjectionOutcome::NotAttempted;
     }
-    if (pending.uiSuppressed || pending.terminateAfterEdit) {
+    if (item.uiSuppressed || item.terminateAfterEdit) {
         return InjectionOutcome::NotAttempted;
     }
     // 4. All TSF write requests for this context must have returned or been revoked before write.
@@ -923,21 +976,37 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
         ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0) {
         return InjectionOutcome::NotAttempted;
     }
-    // 6. Window and foreground root ownership verification (unless bypassed in headless unit test).
+    // 6. Window, foreground root, and GUI focus control verification (unless bypassed in headless unit test).
+    HWND origHwnd = nullptr;
+    HWND origRoot = nullptr;
+    HWND origGuiFocus = nullptr;
+    Microsoft::WRL::ComPtr<ITfDocumentMgr> origFocusDoc;
     if (!m_bypassWindowCheckForTest) {
         ITfContextView* pView = nullptr;
-        HWND hwnd = nullptr;
         if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView) {
-            pView->GetWnd(&hwnd);
+            pView->GetWnd(&origHwnd);
             pView->Release();
         }
-        if (!hwnd || !IsWindow(hwnd)) {
+        if (!origHwnd || !IsWindow(origHwnd)) {
             return InjectionOutcome::NotAttempted;
         }
-        HWND rootWnd = GetAncestor(hwnd, GA_ROOT);
+        origRoot = GetAncestor(origHwnd, GA_ROOT);
         HWND fgWnd = GetForegroundWindow();
-        if (!rootWnd || rootWnd != fgWnd) {
+        if (!origRoot || origRoot != fgWnd) {
             return InjectionOutcome::NotAttempted;
+        }
+        GUITHREADINFO gti{};
+        gti.cbSize = sizeof(gti);
+        DWORD fgTid = GetWindowThreadProcessId(fgWnd, nullptr);
+        if (!fgTid || !GetGUIThreadInfo(fgTid, &gti) || !gti.hwndFocus) {
+            return InjectionOutcome::NotAttempted;
+        }
+        if (gti.hwndFocus != origHwnd && !IsChild(origRoot, gti.hwndFocus)) {
+            return InjectionOutcome::NotAttempted;
+        }
+        origGuiFocus = gti.hwndFocus;
+        if (m_pThreadMgr) {
+            m_pThreadMgr->GetFocus(&origFocusDoc);
         }
     }
     // 7. Ensure no prior InjectionAttempt or terminal frame exists in v2 WAL for this commit_event_id.
@@ -976,11 +1045,44 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
     }
     cb->injection_attempted = true;
 
-    // 9. Re-check target and fence immediately before calling SendInput.
-    if (m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
+    // 9. Re-check cached fence AND real foreground target immediately before calling SendInput.
+    if (IsInEditSession() ||
+        m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
         cb->revoked ||
         GetContextEpoch(cb->context_id) != cb->context_epoch ||
         GetContextInputGeneration(cb->context_id) != cb->input_generation) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
+        (GetKeyState(VK_MENU) & 0x8000) != 0 ||
+        ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if (!m_bypassWindowCheckForTest) {
+        ITfContextView* pViewNow = nullptr;
+        HWND hwndNow = nullptr;
+        if (SUCCEEDED(pContext->GetActiveView(&pViewNow)) && pViewNow) {
+            pViewNow->GetWnd(&hwndNow);
+            pViewNow->Release();
+        }
+        HWND fgNow = GetForegroundWindow();
+        if (!hwndNow || hwndNow != origHwnd || !IsWindow(hwndNow) || !fgNow || fgNow != origRoot) {
+            return InjectionOutcome::NotAttempted;
+        }
+        GUITHREADINFO gtiNow{};
+        gtiNow.cbSize = sizeof(gtiNow);
+        DWORD fgTidNow = GetWindowThreadProcessId(fgNow, nullptr);
+        if (!fgTidNow || !GetGUIThreadInfo(fgTidNow, &gtiNow) || gtiNow.hwndFocus != origGuiFocus) {
+            return InjectionOutcome::NotAttempted;
+        }
+        if (m_pThreadMgr && origFocusDoc) {
+            Microsoft::WRL::ComPtr<ITfDocumentMgr> nowFocusDoc;
+            if (FAILED(m_pThreadMgr->GetFocus(&nowFocusDoc)) || nowFocusDoc.Get() != origFocusDoc.Get()) {
+                return InjectionOutcome::NotAttempted;
+            }
+        }
+    }
+    if (m_targetReverifyHookForTest && !m_targetReverifyHookForTest()) {
         return InjectionOutcome::NotAttempted;
     }
 
@@ -996,6 +1098,101 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
         return InjectionOutcome::DispatchedUnverified;
     }
     return InjectionOutcome::Unknown;
+}
+
+InjectionOutcome CTextInputProcessor::ExecutePendingUnicodeInjection(const PendingUnicodeInjection& item) {
+    auto cb = item.controlBlock;
+    if (!cb) return InjectionOutcome::NotAttempted;
+    uint64_t contextId = cb->context_id;
+
+    auto clearSnapshotState = [&]() {
+        m_contextCandidateVersions[contextId] = 0;
+        m_latestServerCandidateVersions[contextId] = 0;
+        m_contextPageIndices[contextId] = 0;
+        m_contextPageCounts[contextId] = 0;
+        if (contextId == m_activeContextId) {
+            m_currentPageIndex = 0;
+            m_currentPageCount = 0;
+        }
+    };
+
+    InjectionOutcome injOutcome = TryUnicodeInjectionFallback(item);
+    if (injOutcome == InjectionOutcome::DispatchedUnverified) {
+        FinalizeStage7CommitForBlock(cb, IpcCommitDisposition::DispatchedUnverified, S_OK, 1, nullptr);
+        clearSnapshotState();
+        ExitCompositionlessMode(contextId);
+    } else if (injOutcome == InjectionOutcome::Unknown) {
+        MarkContextUnknownPending(cb->edit_request_id, 1);
+        clearSnapshotState();
+        ExitCompositionlessMode(contextId);
+        // Since all TSF write requests have already returned, converge immediately to ClosedUnknown.
+        if (!HasPotentialWriterForContext(contextId)) {
+            FinalizeStage7CommitForBlock(cb, IpcCommitDisposition::ClosedUnknown, cb->hr, 1, nullptr);
+            if (cb->wal_resolved) {
+                RetireContextIfNoPotentialWriter(contextId);
+            }
+        }
+    } else {
+        IpcCommitDisposition disp =
+            (item.uiSuppressed || item.terminateAfterEdit ||
+             cb->revoked || IsContextQuarantined(contextId))
+            ? IpcCommitDisposition::CancelDiscard
+            : IpcCommitDisposition::CancelRestore;
+        IpcKeyResponse cancelOrRollbackResp{};
+        bool ok = FinalizeStage7CommitForBlock(cb, disp, cb->hr, 0, &cancelOrRollbackResp);
+        if (!ok || disp == IpcCommitDisposition::CancelDiscard) {
+            clearSnapshotState();
+            ExitCompositionlessMode(contextId);
+        } else if (cancelOrRollbackResp.candidate_count > 0 ||
+                   (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+            m_contextCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
+            m_latestServerCandidateVersions[contextId] = cancelOrRollbackResp.candidate_version;
+            m_contextPageIndices[contextId] = cancelOrRollbackResp.page_index;
+            m_contextPageCounts[contextId] = cancelOrRollbackResp.page_count;
+            if (contextId == m_activeContextId) {
+                m_currentPageIndex = cancelOrRollbackResp.page_index;
+                m_currentPageCount = cancelOrRollbackResp.page_count;
+            }
+        } else {
+            clearSnapshotState();
+            ExitCompositionlessMode(contextId);
+        }
+    }
+
+    if (!cb->unknown_pending || cb->wal_resolved) {
+        if (!cb->has_commit || !cb->wal_prepared || cb->wal_resolved) {
+            m_activeRequestBlocks.erase(cb->edit_request_id);
+        }
+    }
+    RetireContextIfNoPotentialWriter(contextId);
+    return injOutcome;
+}
+
+bool CTextInputProcessor::ProcessPendingUnicodeInjectionForRequest(
+    uint64_t editRequestId,
+    InjectionOutcome* outOutcome)
+{
+    for (auto it = m_pendingUnicodeInjections.begin(); it != m_pendingUnicodeInjections.end(); ++it) {
+        if (it->edit_request_id == editRequestId) {
+            PendingUnicodeInjection item = std::move(*it);
+            m_pendingUnicodeInjections.erase(it);
+            InjectionOutcome outcome = ExecutePendingUnicodeInjection(item);
+            if (outOutcome) *outOutcome = outcome;
+            return true;
+        }
+    }
+    return false;
+}
+
+void CTextInputProcessor::DrainPendingUnicodeInjections() {
+    if (IsInEditSession() || m_pendingUnicodeInjections.empty()) {
+        return;
+    }
+    auto pendingList = std::move(m_pendingUnicodeInjections);
+    m_pendingUnicodeInjections.clear();
+    for (const auto& item : pendingList) {
+        ExecutePendingUnicodeInjection(item);
+    }
 }
 
 bool CTextInputProcessor::IsContextQuarantined(uint64_t contextId) const {
@@ -1028,7 +1225,7 @@ std::shared_ptr<EditRequestControlBlock> CTextInputProcessor::GetRequestControlB
     return (it != m_activeRequestBlocks.end()) ? it->second : nullptr;
 }
 
-bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId) {
+bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId, uint32_t channel) {
     auto it = m_activeRequestBlocks.find(editRequestId);
     if (it == m_activeRequestBlocks.end() || !it->second) {
         return false;
@@ -1045,7 +1242,7 @@ bool CTextInputProcessor::MarkContextUnknownPending(uint64_t editRequestId) {
         entry.input_generation = cb->server_commit_generation;
         entry.edit_request_id = cb->edit_request_id;
         entry.commit_event_id = cb->commit_event_id;
-        entry.channel = 0; // 0 = TSF EditSession
+        entry.channel = channel;
         entry.text_len = static_cast<uint32_t>(cb->commit_text.size());
         entry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
         entry.disposition = static_cast<uint32_t>(IpcCommitDisposition::None);
@@ -1934,6 +2131,7 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
 }
 
 void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
+    DrainPendingUnicodeInjections();
     DrainPendingV2Receipts(forceNow);
     constexpr size_t MAX_QUEUE_SIZE = 512;
     if (m_unconfirmedCommits.empty()) {
@@ -2404,13 +2602,24 @@ bool CTextInputProcessor::ProcessKeyInternal(
             );
 
             HRESULT hrSession = S_OK;
-            HRESULT hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
+            HRESULT hr = E_FAIL;
+            {
+                struct SyncEditGuard {
+                    int& depth;
+                    explicit SyncEditGuard(int& d) : depth(d) { ++depth; }
+                    ~SyncEditGuard() { if (depth > 0) --depth; }
+                } syncGuard{m_syncEditSessionDepth};
+                hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
+            }
             bool isSyncBlocked = (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS);
             if (isSyncBlocked) {
                 bool sinkAdvised = EnsureTextEditSinkAdvised(pic);
                 if (!sinkAdvised && resp.has_commit && GetComposition(pic) == nullptr) {
                     // Cannot monitor same-context selection changes for an unguarded compositionless async commit
                     OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, E_ACCESSDENIED);
+                    if (controlBlock) {
+                        ProcessPendingUnicodeInjectionForRequest(controlBlock->edit_request_id);
+                    }
                     pSession->Release();
                     *pfEaten = FALSE;
                     return false;
@@ -2426,6 +2635,15 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 if (FAILED(hr) || FAILED(hrSession)) {
                     if (!pSession->HasExecuted()) {
                         OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, FAILED(hr) ? hr : hrSession);
+                    }
+                    if (controlBlock) {
+                        InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
+                        if (ProcessPendingUnicodeInjectionForRequest(controlBlock->edit_request_id, &injOutcome) &&
+                            (injOutcome == InjectionOutcome::DispatchedUnverified || injOutcome == InjectionOutcome::Unknown)) {
+                            pSession->Release();
+                            *pfEaten = TRUE;
+                            return true;
+                        }
                     }
                     pSession->Release();
                     *pfEaten = FALSE;
@@ -2450,12 +2668,29 @@ bool CTextInputProcessor::ProcessKeyInternal(
                     }
                     return true;
                 }
+                if (controlBlock) {
+                    InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
+                    if (ProcessPendingUnicodeInjectionForRequest(controlBlock->edit_request_id, &injOutcome) &&
+                        (injOutcome == InjectionOutcome::DispatchedUnverified || injOutcome == InjectionOutcome::Unknown)) {
+                        *pfEaten = TRUE;
+                        return true;
+                    }
+                }
                 *pfEaten = FALSE;
                 return false;
             }
 
             if (!pSession->HasExecuted()) {
                 OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, FAILED(hr) ? hr : hrSession);
+                if (controlBlock) {
+                    InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
+                    if (ProcessPendingUnicodeInjectionForRequest(controlBlock->edit_request_id, &injOutcome) &&
+                        (injOutcome == InjectionOutcome::DispatchedUnverified || injOutcome == InjectionOutcome::Unknown)) {
+                        pSession->Release();
+                        *pfEaten = TRUE;
+                        return true;
+                    }
+                }
                 pSession->Release();
                 *pfEaten = FALSE;
                 return false;
@@ -2477,6 +2712,14 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 *pfEaten = TRUE;
                 return true;
             } else {
+                if (controlBlock) {
+                    InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
+                    if (ProcessPendingUnicodeInjectionForRequest(controlBlock->edit_request_id, &injOutcome) &&
+                        (injOutcome == InjectionOutcome::DispatchedUnverified || injOutcome == InjectionOutcome::Unknown)) {
+                        *pfEaten = TRUE;
+                        return true;
+                    }
+                }
                 *pfEaten = FALSE;
                 return false;
             }

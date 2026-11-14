@@ -129,6 +129,9 @@ public:
     STDMETHODIMP OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) override;
     void BeginInternalEdit() { ++m_internalEditDepth; }
     void EndInternalEdit() { if (m_internalEditDepth > 0) --m_internalEditDepth; }
+    void BeginEditSessionFrame() { ++m_inEditSessionDepth; }
+    void EndEditSessionFrame() { if (m_inEditSessionDepth > 0) --m_inEditSessionDepth; }
+    bool IsInEditSession() const { return m_inEditSessionDepth > 0; }
     bool EnsureTextEditSinkAdvised(ITfContext* pic);
     bool HasTextEditSinkAdvised(uint64_t contextId) const;
     void UnadviseTextEditSink(uint64_t contextId);
@@ -371,7 +374,7 @@ public:
     void DrainUnconfirmedCommits(bool forceNow = false);
     bool IsContextQuarantined(uint64_t contextId) const;
     bool HasPotentialWriterForContext(uint64_t contextId) const;
-    bool MarkContextUnknownPending(uint64_t editRequestId);
+    bool MarkContextUnknownPending(uint64_t editRequestId, uint32_t channel = 0);
     bool MarkObservationTimeout(uint64_t editRequestId);
     void CheckObservationTimeouts(std::chrono::milliseconds timeout = std::chrono::milliseconds(1500));
     void RetireContextIfNoPotentialWriter(uint64_t contextId);
@@ -387,8 +390,12 @@ public:
     void SetUnicodeInjectionEnabled(bool enabled) { m_unicodeInjectionEnabled = enabled; }
     bool IsUnicodeInjectionEnabled() const { return m_unicodeInjectionEnabled; }
     using SendInputOverrideFunc = std::function<UINT(UINT, LPINPUT, int)>;
+    using TargetReverifyHookForTest = std::function<bool()>;
     void SetSendInputOverrideForTest(SendInputOverrideFunc fn) { m_sendInputOverride = std::move(fn); }
     void SetWindowForegroundBypassForTest(bool bypass) { m_bypassWindowCheckForTest = bypass; }
+    void SetTargetReverifyHookForTest(TargetReverifyHookForTest fn) { m_targetReverifyHookForTest = std::move(fn); }
+    void DrainPendingUnicodeInjections();
+    size_t GetPendingUnicodeInjectionCountForTest() const { return m_pendingUnicodeInjections.size(); }
     static std::vector<INPUT> BuildUnicodeInputs(const std::wstring& text);
 
     // Retained unconfirmed commits for bounded recovery
@@ -510,10 +517,33 @@ private:
     bool m_unicodeInjectionEnabled = false;
     bool m_bypassWindowCheckForTest = false;
     SendInputOverrideFunc m_sendInputOverride;
-    InjectionOutcome TryUnicodeInjectionFallback(
+    TargetReverifyHookForTest m_targetReverifyHookForTest;
+    int m_inEditSessionDepth = 0;
+    int m_syncEditSessionDepth = 0;
+
+    struct PendingUnicodeInjection {
+        uint64_t edit_request_id = 0;
+        std::shared_ptr<EditRequestControlBlock> controlBlock;
+        Microsoft::WRL::ComPtr<ITfContext> pContext;
+        bool uiSuppressed = false;
+        bool terminateAfterEdit = false;
+    };
+    std::vector<PendingUnicodeInjection> m_pendingUnicodeInjections;
+
+    bool FinalizeStage7CommitForBlock(
+        const std::shared_ptr<EditRequestControlBlock>& cb,
+        IpcCommitDisposition disp,
+        HRESULT hrFinal,
+        uint32_t channel,
+        IpcKeyResponse* outResp);
+    bool IsUnicodeInjectionEligiblePrecheck(
         const PendingEditSession& pending,
         const std::shared_ptr<EditRequestControlBlock>& cb,
-        ITfContext* pContext);
+        ITfContext* pContext) const;
+    InjectionOutcome ExecutePendingUnicodeInjection(const PendingUnicodeInjection& item);
+    bool ProcessPendingUnicodeInjectionForRequest(uint64_t editRequestId, InjectionOutcome* outOutcome = nullptr);
+    InjectionOutcome TryUnicodeInjectionFallback(
+        const PendingUnicodeInjection& item);
 
     struct TextEditSinkBinding {
         Microsoft::WRL::ComPtr<ITfContext> context;

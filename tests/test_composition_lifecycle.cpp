@@ -3256,8 +3256,10 @@ int TestStage71dUnicodeInjectionChannel() {
 
         int sendCalls = 0;
         UINT lastCInputs = 0;
+        bool inEditSessionDuringSend = false;
         tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
             ++sendCalls;
+            inEditSessionDuringSend = tip.IsInEditSession();
             lastCInputs = cInputs;
             return cInputs;
         });
@@ -3273,6 +3275,7 @@ int TestStage71dUnicodeInjectionChannel() {
         tip.OnKeyDown(&ctx, 'A', 0, &eaten);
         CHECK_EQUAL(eaten, TRUE, L"Entered CompositionlessComposing");
         tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"NotAttempted confirm key not eaten");
         CHECK_EQUAL(sendCalls, 0, L"No HWND -> SendInput NotAttempted");
 
         // (b) With window bypass, but V2_INJ _commit fails -> SendInput NotAttempted
@@ -3287,20 +3290,35 @@ int TestStage71dUnicodeInjectionChannel() {
         ctx.m_forceSyncBlocked = false;
         ctx.m_deferAsyncSession = false;
         ctx.ExecuteDeferredSession();
+        CHECK_EQUAL(sendCalls, 0, L"SendInput MUST NOT run inside DoEditSession");
+        tip.DrainPendingUnicodeInjections();
         CHECK_EQUAL(sendCalls, 0, L"V2_INJ persistence failure -> SendInput NotAttempted");
 
-        // (c) Full send (sent == cInputs) -> DispatchedUnverified, zero learning, candidates not restored
+        // (c) Full send (sent == cInputs) -> DispatchedUnverified, zero learning, candidates not restored, eaten == TRUE, outside DoEditSession
         int learnedBefore = server.m_learnedCount.load();
         tip.OnKeyDown(&ctx, 'A', 0, &eaten);
         CHECK_EQUAL(eaten, TRUE, L"Re-entered CompositionlessComposing");
         tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Confirm key MUST be eaten after DispatchedUnverified");
         CHECK_EQUAL(sendCalls, 1, L"SendInput called exactly once");
+        CHECK_TRUE(!inEditSessionDuringSend, L"SendInput MUST run after DoEditSession exited");
         CHECK_EQUAL(lastCInputs, 2u, L"1 BMP char '工' -> 2 INPUT events");
         CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"DispatchedUnverified MUST NOT trigger learning");
         CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()) != FALSE, false,
                     L"DispatchedUnverified MUST NOT restore candidates");
         CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::None,
                    L"Context returns to None after DispatchedUnverified");
+
+        // (d) Target switches between V2_INJ persistence and SendInput -> SendInput blocked, eaten == FALSE, CancelRestore
+        tip.SetTargetReverifyHookForTest([]() { return false; });
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Re-entered CompositionlessComposing");
+        int cancelBeforeSwitch = server.m_commitCancelCount.load();
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Confirm key not eaten when post-WAL target reverify fails");
+        CHECK_EQUAL(sendCalls, 1, L"SendInput MUST NOT be called when real target changed after WAL");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBeforeSwitch + 1, L"Target change after WAL fell back to CancelRestore");
+        tip.SetTargetReverifyHookForTest(nullptr);
 
         receipt_journal_v2::Snapshot snap;
         CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot");
@@ -3338,33 +3356,64 @@ int TestStage71dUnicodeInjectionChannel() {
         ctx.m_failInsertAtSelection = true;
         BOOL eaten = FALSE;
 
-        // NotDispatched (sent == 0) -> CancelRestore
+        // NotDispatched (sent == 0) -> CancelRestore, eaten == FALSE
         sendMode = 0;
         tip.OnKeyDown(&ctx, 'A', 0, &eaten);
         CHECK_EQUAL(eaten, TRUE, L"Compositionless 'A'");
         int cancelBefore = server.m_commitCancelCount.load();
         tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"NotDispatched confirm key not eaten");
         CHECK_EQUAL(sendCalls, 1, L"SendInput called once for NotDispatched");
         CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"NotDispatched fell back to CancelRestore");
 
-        // Partial send (0 < sent < cInputs) -> UnknownPending (V2_UNK) + Quarantined, NO retry, NO rollback
+        // Partial send (0 < sent < cInputs) -> eaten == TRUE, UnknownPending (V2_UNK) -> converges to ClosedUnknown + retires Quarantined
         sendMode = 1;
+        int learnedBeforePartial = server.m_learnedCount.load();
         tip.OnKeyDown(&ctx, 'A', 0, &eaten);
         CHECK_EQUAL(eaten, TRUE, L"Compositionless 'A'");
         tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Confirm key MUST be eaten after partial SendInput");
         CHECK_EQUAL(sendCalls, 2, L"SendInput called once for partial send (no retry/remainder)");
-        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::Quarantined,
-                   L"Partial SendInput transitions context to Quarantined");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBeforePartial, L"Partial send ClosedUnknown MUST NOT learn");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::None,
+                   L"Partial SendInput converges to ClosedUnknown and retires Quarantined once no potential writer remains");
 
         receipt_journal_v2::Snapshot snap;
         CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot");
-        bool foundPartialUnknown = false;
+        bool foundPartialConverged = false;
         for (const auto& kv : snap.events) {
-            if (kv.second.has_injection_attempt && kv.second.has_unknown_pending && !kv.second.has_resolved) {
-                foundPartialUnknown = true;
+            if (kv.second.has_injection_attempt &&
+                kv.second.has_unknown_pending &&
+                kv.second.has_resolved &&
+                kv.second.acked_disposition == static_cast<uint32_t>(IpcCommitDisposition::ClosedUnknown)) {
+                foundPartialConverged = true;
             }
         }
-        CHECK_TRUE(foundPartialUnknown, L"Partial SendInput recorded V2_INJ + V2_UNK without V2_RES");
+        CHECK_TRUE(foundPartialConverged, L"Partial SendInput recorded V2_INJ -> V2_UNK -> V2_RES(ClosedUnknown) -> V2_ACK");
+
+        // Verify subsequent input works cleanly after ClosedUnknown retirement
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Context accepts new input after ClosedUnknown retirement");
+        tip.OnKeyDown(&ctx, VK_ESCAPE, 0, &eaten);
+
+        // Partial send when V2_RES(ClosedUnknown) fails initially -> stays Quarantined -> DrainUnconfirmedCommits(true) converges & lifts Quarantine
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Compositionless 'A'");
+        tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
+            ++sendCalls;
+            receipt_journal_v2::FailCommitInjectCountForTest() = 2; // fail V2_UNK + initial V2_RES(ClosedUnknown)
+            return cInputs > 1 ? 1u : 0u;
+        });
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Confirm key eaten on partial send even when V2_RES initially fails");
+        CHECK_EQUAL(sendCalls, 3, L"Partial send executed once");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::Quarantined,
+                   L"Stays Quarantined while V2_RES(ClosedUnknown) is not yet persisted");
+        CHECK_TRUE(tip.IsWalBarrierFaulted(), L"WAL barrier faulted while V2_RES(ClosedUnknown) pending");
+        tip.DrainUnconfirmedCommits(true);
+        CHECK_TRUE(!tip.IsWalBarrierFaulted(), L"WAL barrier cleared after DrainUnconfirmedCommits(true)");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::None,
+                   L"Quarantine lifted after V2_RES(ClosedUnknown) -> V2_ACK converged");
         tip.Deactivate();
     }
 

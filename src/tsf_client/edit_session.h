@@ -186,6 +186,16 @@ public:
         }
         m_executed = true;
 
+        struct EditSessionFrameGuard {
+            CTextInputProcessor* tip;
+            explicit EditSessionFrameGuard(CTextInputProcessor* t) : tip(t) {
+                if (tip) tip->BeginEditSessionFrame();
+            }
+            ~EditSessionFrameGuard() {
+                if (tip) tip->EndEditSessionFrame();
+            }
+        } frameGuard{m_pTip};
+
         struct CompletionGuard {
             CEditSession* self;
             ~CompletionGuard() {
