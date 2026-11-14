@@ -758,24 +758,38 @@ void CTextInputProcessor::OnEditSessionCompleted(
         IpcKeyResponse cancelOrRollbackResp{};
         if (pending.hasCommit && pending.commitEventId != 0) {
             if (m_ipcClient.IsStage7Capable() && pending.controlBlock && pending.controlBlock->wal_prepared) {
-                IpcCommitDisposition disp =
-                    (pending.uiSuppressed || pending.terminateAfterEdit ||
-                     pending.controlBlock->revoked || IsContextQuarantined(contextId))
-                    ? IpcCommitDisposition::CancelDiscard
-                    : IpcCommitDisposition::CancelRestore;
-                bool ok = finalizeStage7Commit(disp, &cancelOrRollbackResp);
-                if (!ok || disp == IpcCommitDisposition::CancelDiscard) {
+                InjectionOutcome injOutcome = InjectionOutcome::NotAttempted;
+                if (result == EditSessionResult::Unmodified) {
+                    injOutcome = TryUnicodeInjectionFallback(pending, pending.controlBlock, pending.pContext);
+                }
+                if (injOutcome == InjectionOutcome::DispatchedUnverified) {
+                    finalizeStage7Commit(IpcCommitDisposition::DispatchedUnverified, nullptr);
                     applySnapshotState(0, 0, 0);
                     ExitCompositionlessMode(contextId);
-                } else if (cancelOrRollbackResp.candidate_count > 0 ||
-                           (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
-                    applySnapshotState(
-                        cancelOrRollbackResp.candidate_version,
-                        cancelOrRollbackResp.page_index,
-                        cancelOrRollbackResp.page_count);
+                } else if (injOutcome == InjectionOutcome::Unknown) {
+                    MarkContextUnknownPending(pending.controlBlock->edit_request_id);
+                    applySnapshotState(0, 0, 0);
+                    ExitCompositionlessMode(contextId);
                 } else {
-                    applySnapshotState(0, 0, 0);
-                    ExitCompositionlessMode(contextId);
+                    IpcCommitDisposition disp =
+                        (pending.uiSuppressed || pending.terminateAfterEdit ||
+                         pending.controlBlock->revoked || IsContextQuarantined(contextId))
+                        ? IpcCommitDisposition::CancelDiscard
+                        : IpcCommitDisposition::CancelRestore;
+                    bool ok = finalizeStage7Commit(disp, &cancelOrRollbackResp);
+                    if (!ok || disp == IpcCommitDisposition::CancelDiscard) {
+                        applySnapshotState(0, 0, 0);
+                        ExitCompositionlessMode(contextId);
+                    } else if (cancelOrRollbackResp.candidate_count > 0 ||
+                               (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
+                        applySnapshotState(
+                            cancelOrRollbackResp.candidate_version,
+                            cancelOrRollbackResp.page_index,
+                            cancelOrRollbackResp.page_count);
+                    } else {
+                        applySnapshotState(0, 0, 0);
+                        ExitCompositionlessMode(contextId);
+                    }
                 }
             } else {
                 bool durableClaim = EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Cancel);
@@ -845,6 +859,143 @@ void CTextInputProcessor::OnEditSessionCompleted(
         }
     }
     RetireContextIfNoPotentialWriter(contextId);
+}
+
+std::vector<INPUT> CTextInputProcessor::BuildUnicodeInputs(const std::wstring& text) {
+    std::vector<INPUT> inputs;
+    inputs.reserve(text.size() * 2);
+    for (wchar_t ch : text) {
+        INPUT down{};
+        down.type = INPUT_KEYBOARD;
+        down.ki.wVk = 0;
+        down.ki.wScan = static_cast<WORD>(ch);
+        down.ki.dwFlags = KEYEVENTF_UNICODE;
+        INPUT up = down;
+        up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+        inputs.push_back(down);
+        inputs.push_back(up);
+    }
+    return inputs;
+}
+
+static bool IsContextReadOnly(ITfContext* pic);
+
+InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
+    const PendingEditSession& pending,
+    const std::shared_ptr<EditRequestControlBlock>& cb,
+    ITfContext* pContext)
+{
+    // 1. Default OFF; requires explicit opt-in and Stage 7 capable server.
+    if (!m_unicodeInjectionEnabled || !m_ipcClient.IsStage7Capable()) {
+        return InjectionOutcome::NotAttempted;
+    }
+    // 2. Only eligible for unmodified, non-RecoveryBlocked, pure compositionless rounds.
+    if (!cb || !cb->was_compositionless || cb->commit_text.empty() || cb->commit_event_id == 0) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if (m_pComposition != nullptr ||
+        GetContextState(cb->context_id) == CompositionState::CommitPendingEnd ||
+        GetContextState(cb->context_id) == CompositionState::Quarantined) {
+        return InjectionOutcome::NotAttempted;
+    }
+    // 3. No prior side effects, no revocation, no prior injection attempt, and WAL barrier healthy.
+    if (cb->revoked || cb->crossed_side_effect || cb->injection_attempted || IsWalBarrierFaulted()) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if (pending.uiSuppressed || pending.terminateAfterEdit) {
+        return InjectionOutcome::NotAttempted;
+    }
+    // 4. All TSF write requests for this context must have returned or been revoked before write.
+    if (HasQueuedEditSession(cb->context_id) || HasPotentialWriterForContext(cb->context_id)) {
+        return InjectionOutcome::NotAttempted;
+    }
+    // 5. Focus, context, epoch, generation, read-only, and modifier state checks.
+    if (m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
+        !pContext || IsContextReadOnly(pContext)) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if (GetContextEpoch(cb->context_id) != cb->context_epoch ||
+        GetContextInputGeneration(cb->context_id) != cb->input_generation) {
+        return InjectionOutcome::NotAttempted;
+    }
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
+        (GetKeyState(VK_MENU) & 0x8000) != 0 ||
+        ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0) {
+        return InjectionOutcome::NotAttempted;
+    }
+    // 6. Window and foreground root ownership verification (unless bypassed in headless unit test).
+    if (!m_bypassWindowCheckForTest) {
+        ITfContextView* pView = nullptr;
+        HWND hwnd = nullptr;
+        if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView) {
+            pView->GetWnd(&hwnd);
+            pView->Release();
+        }
+        if (!hwnd || !IsWindow(hwnd)) {
+            return InjectionOutcome::NotAttempted;
+        }
+        HWND rootWnd = GetAncestor(hwnd, GA_ROOT);
+        HWND fgWnd = GetForegroundWindow();
+        if (!rootWnd || rootWnd != fgWnd) {
+            return InjectionOutcome::NotAttempted;
+        }
+    }
+    // 7. Ensure no prior InjectionAttempt or terminal frame exists in v2 WAL for this commit_event_id.
+    {
+        receipt_journal_v2::Snapshot snap;
+        if (!receipt_journal_v2::LoadSnapshot(snap, false)) {
+            return InjectionOutcome::NotAttempted;
+        }
+        auto evIt = snap.events.find(cb->commit_event_id);
+        if (evIt != snap.events.end() &&
+            (evIt->second.has_injection_attempt || evIt->second.has_resolved || evIt->second.has_service_ack)) {
+            return InjectionOutcome::NotAttempted;
+        }
+    }
+
+    std::vector<INPUT> inputs = BuildUnicodeInputs(cb->commit_text);
+    if (inputs.empty()) {
+        return InjectionOutcome::NotAttempted;
+    }
+
+    // 8. Persist InjectionAttempt BEFORE calling SendInput so crash recovery never re-injects.
+    receipt_journal_v2::Entry injEntry{};
+    injEntry.owner_id = cb->owner_id;
+    injEntry.session_id = cb->session_id;
+    injEntry.context_id = cb->context_id;
+    injEntry.context_epoch = cb->context_epoch;
+    injEntry.input_generation = cb->server_commit_generation;
+    injEntry.edit_request_id = cb->edit_request_id;
+    injEntry.commit_event_id = cb->commit_event_id;
+    injEntry.channel = 1; // 1 = SendInput
+    injEntry.text_len = static_cast<uint32_t>(cb->commit_text.size());
+    injEntry.text_digest = receipt_journal_v2::TextDigest(cb->commit_text);
+    injEntry.disposition = static_cast<uint32_t>(IpcCommitDisposition::None);
+    if (!receipt_journal_v2::AppendInjectionAttempt(injEntry)) {
+        return InjectionOutcome::NotAttempted;
+    }
+    cb->injection_attempted = true;
+
+    // 9. Re-check target and fence immediately before calling SendInput.
+    if (m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
+        cb->revoked ||
+        GetContextEpoch(cb->context_id) != cb->context_epoch ||
+        GetContextInputGeneration(cb->context_id) != cb->input_generation) {
+        return InjectionOutcome::NotAttempted;
+    }
+
+    UINT cInputs = static_cast<UINT>(inputs.size());
+    UINT sent = m_sendInputOverride
+        ? m_sendInputOverride(cInputs, inputs.data(), sizeof(INPUT))
+        : SendInput(cInputs, inputs.data(), sizeof(INPUT));
+
+    if (sent == 0) {
+        return InjectionOutcome::NotDispatched;
+    }
+    if (sent == cInputs) {
+        return InjectionOutcome::DispatchedUnverified;
+    }
+    return InjectionOutcome::Unknown;
 }
 
 bool CTextInputProcessor::IsContextQuarantined(uint64_t contextId) const {
@@ -2063,6 +2214,9 @@ bool CTextInputProcessor::ProcessKeyInternal(
             controlBlock->commit_text = resp.commit_text;
             controlBlock->target_context = pic;
             controlBlock->has_commit = (resp.has_commit != 0);
+            controlBlock->was_compositionless =
+                (GetContextState(contextId) == CompositionState::CompositionlessComposing) &&
+                (GetComposition(pic) == nullptr);
 
             if (resp.has_commit && resp.commit_event_id != 0) {
                 if (m_ipcClient.IsStage7Capable()) {

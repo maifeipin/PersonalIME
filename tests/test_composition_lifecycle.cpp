@@ -411,6 +411,7 @@ public:
     bool m_deferAsyncSession = false;
     bool m_failStartComposition = false;
     bool m_failGetSelection = false;
+    bool m_failInsertAtSelection = false;
     bool m_failAdviseSink = false;
     bool m_inOwnWriteSession = false;
     bool m_fireOnEndEditAfterDoEditSession = false;
@@ -455,6 +456,10 @@ public:
             AddRef();
             return S_OK;
         } else if (IsEqualIID(riid, IID_ITfInsertAtSelection)) {
+            if (m_failInsertAtSelection) {
+                *ppvObj = nullptr;
+                return E_NOINTERFACE;
+            }
             *ppvObj = static_cast<ITfInsertAtSelection*>(this);
             AddRef();
             return S_OK;
@@ -3175,6 +3180,201 @@ int TestStage71cRequestFenceAndWalRecovery() {
     return 0;
 }
 
+// Test 22: Stage 7.1d - Optional Unicode SendInput Compatibility Channel
+int TestStage71dUnicodeInjectionChannel() {
+    std::wcout << L"[TEST 22] Testing Stage 7.1d Optional Unicode SendInput Compatibility Channel..." << std::endl;
+
+    auto cleanupWals = []() {
+        std::error_code ec;
+        std::filesystem::remove(receipt_journal_v2::Path(), ec);
+        std::filesystem::remove(receipt_journal::Directory() / L"PersonalIME_receipts.wal", ec);
+    };
+    cleanupWals();
+
+    // 1. UTF-16 Surrogate Pair INPUT construction (e.g. 'A' + U+1F600 = 3 code units -> 6 INPUT events)
+    {
+        std::wstring text = L"A\U0001F600";
+        CHECK_EQUAL(text.size(), size_t(3), L"UTF-16 string has 3 code units (1 BMP + 1 surrogate pair)");
+        auto inputs = CTextInputProcessor::BuildUnicodeInputs(text);
+        CHECK_EQUAL(inputs.size(), size_t(6), L"3 UTF-16 code units produce 6 INPUT events (down+up each)");
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            CHECK_EQUAL(inputs[i].type, static_cast<DWORD>(INPUT_KEYBOARD), L"INPUT_KEYBOARD");
+            CHECK_EQUAL(inputs[i].ki.wVk, static_cast<WORD>(0), L"wVk must be 0 for KEYEVENTF_UNICODE");
+            CHECK_TRUE((inputs[i].ki.dwFlags & KEYEVENTF_UNICODE) != 0, L"KEYEVENTF_UNICODE set");
+        }
+        CHECK_EQUAL(inputs[0].ki.wScan, static_cast<WORD>(L'A'), L"Code unit 0 down");
+        CHECK_EQUAL(inputs[1].ki.wScan, static_cast<WORD>(L'A'), L"Code unit 0 up");
+        CHECK_TRUE((inputs[1].ki.dwFlags & KEYEVENTF_KEYUP) != 0, L"Up event has KEYEVENTF_KEYUP");
+        CHECK_EQUAL(inputs[2].ki.wScan, static_cast<WORD>(text[1]), L"High surrogate preserved");
+        CHECK_EQUAL(inputs[4].ki.wScan, static_cast<WORD>(text[2]), L"Low surrogate preserved");
+    }
+
+    const std::wstring testPipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_T22_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(testPipeName);
+    server.m_advertiseStage7.store(true);
+    CHECK_TRUE(server.Start(3), L"Stage 7.1d mock server must start");
+    IpcClient::SetPipeNameForTest(testPipeName.c_str());
+
+    // 2. Default OFF: SendInput is NOT called even when compositionless commit fails Unmodified
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7");
+        CHECK_TRUE(!tip.IsUnicodeInjectionEnabled(), L"UnicodeInjectionEnabled defaults to false");
+
+        int sendCalls = 0;
+        tip.SetWindowForegroundBypassForTest(true);
+        tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
+            ++sendCalls;
+            return cInputs;
+        });
+
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_failGetSelection = true;
+        ctx.m_failInsertAtSelection = true;
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Entered CompositionlessComposing");
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Unmodified commit not eaten");
+        CHECK_EQUAL(sendCalls, 0, L"SendInput MUST NOT be called when UnicodeInjectionEnabled is false");
+        tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 3. Enabled + Stage 7 + Compositionless Unmodified:
+    //    (a) Window check fails when no HWND (without bypass) -> NotAttempted
+    //    (b) V2_INJ _commit fails -> NotAttempted (SendInput not called)
+    //    (c) Full send (sent == cInputs) -> V2_INJ + DispatchedUnverified + V2_ACK, NO learning, NO candidate restore
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7");
+        tip.SetUnicodeInjectionEnabled(true);
+
+        int sendCalls = 0;
+        UINT lastCInputs = 0;
+        tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
+            ++sendCalls;
+            lastCInputs = cInputs;
+            return cInputs;
+        });
+
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_failGetSelection = true;
+        ctx.m_failInsertAtSelection = true;
+        BOOL eaten = FALSE;
+
+        // (a) Without window bypass, headless MockContext has no HWND -> NotAttempted
+        tip.SetWindowForegroundBypassForTest(false);
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Entered CompositionlessComposing");
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(sendCalls, 0, L"No HWND -> SendInput NotAttempted");
+
+        // (b) With window bypass, but V2_INJ _commit fails -> SendInput NotAttempted
+        tip.SetWindowForegroundBypassForTest(true);
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Re-entered CompositionlessComposing");
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async commit queued (V2_PRE succeeded)");
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        ctx.m_forceSyncBlocked = false;
+        ctx.m_deferAsyncSession = false;
+        ctx.ExecuteDeferredSession();
+        CHECK_EQUAL(sendCalls, 0, L"V2_INJ persistence failure -> SendInput NotAttempted");
+
+        // (c) Full send (sent == cInputs) -> DispatchedUnverified, zero learning, candidates not restored
+        int learnedBefore = server.m_learnedCount.load();
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Re-entered CompositionlessComposing");
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(sendCalls, 1, L"SendInput called exactly once");
+        CHECK_EQUAL(lastCInputs, 2u, L"1 BMP char '工' -> 2 INPUT events");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"DispatchedUnverified MUST NOT trigger learning");
+        CHECK_EQUAL(IsWindowVisible(tip.GetCandidateWindowForTest().GetHwnd()) != FALSE, false,
+                    L"DispatchedUnverified MUST NOT restore candidates");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::None,
+                   L"Context returns to None after DispatchedUnverified");
+
+        receipt_journal_v2::Snapshot snap;
+        CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot");
+        bool foundDispatched = false;
+        for (const auto& kv : snap.events) {
+            if (kv.second.has_injection_attempt &&
+                kv.second.acked_disposition == static_cast<uint32_t>(IpcCommitDisposition::DispatchedUnverified)) {
+                foundDispatched = true;
+            }
+        }
+        CHECK_TRUE(foundDispatched, L"v2 WAL recorded V2_INJ -> V2_RES(DispatchedUnverified) -> V2_ACK");
+        tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 4. SendInput returns 0 (NotDispatched) -> CancelRestore; Partial send (0 < sent < cInputs) -> UnknownPending + Quarantined
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7");
+        tip.SetUnicodeInjectionEnabled(true);
+        tip.SetWindowForegroundBypassForTest(true);
+
+        int sendMode = 0; // 0 = return 0, 1 = return 1 (partial)
+        int sendCalls = 0;
+        tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
+            ++sendCalls;
+            return (sendMode == 0) ? 0u : (cInputs > 1 ? 1u : 0u);
+        });
+
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_failGetSelection = true;
+        ctx.m_failInsertAtSelection = true;
+        BOOL eaten = FALSE;
+
+        // NotDispatched (sent == 0) -> CancelRestore
+        sendMode = 0;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Compositionless 'A'");
+        int cancelBefore = server.m_commitCancelCount.load();
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(sendCalls, 1, L"SendInput called once for NotDispatched");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"NotDispatched fell back to CancelRestore");
+
+        // Partial send (0 < sent < cInputs) -> UnknownPending (V2_UNK) + Quarantined, NO retry, NO rollback
+        sendMode = 1;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Compositionless 'A'");
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(sendCalls, 2, L"SendInput called once for partial send (no retry/remainder)");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::Quarantined,
+                   L"Partial SendInput transitions context to Quarantined");
+
+        receipt_journal_v2::Snapshot snap;
+        CHECK_TRUE(receipt_journal_v2::LoadSnapshot(snap, false), L"LoadSnapshot");
+        bool foundPartialUnknown = false;
+        for (const auto& kv : snap.events) {
+            if (kv.second.has_injection_attempt && kv.second.has_unknown_pending && !kv.second.has_resolved) {
+                foundPartialUnknown = true;
+            }
+        }
+        CHECK_TRUE(foundPartialUnknown, L"Partial SendInput recorded V2_INJ + V2_UNK without V2_RES");
+        tip.Deactivate();
+    }
+
+    cleanupWals();
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Stage 7.1d Optional Unicode SendInput Compatibility Channel verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -3199,6 +3399,7 @@ int main() {
     if (TestStage71bCompositionlessAndDisplayAttributes() != 0) return 1;
     if (TestStage71bReviewFixes() != 0) return 1;
     if (TestStage71cRequestFenceAndWalRecovery() != 0) return 1;
+    if (TestStage71dUnicodeInjectionChannel() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

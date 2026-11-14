@@ -81,6 +81,8 @@ struct EditRequestControlBlock {
     bool wal_acked = false;
     bool unknown_pending = false;
     bool observation_timed_out = false;
+    bool was_compositionless = false;
+    bool injection_attempted = false;
     EditSessionResult outcome = EditSessionResult::Unmodified;
     HRESULT hr = S_OK;
     std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
@@ -381,6 +383,14 @@ public:
     static bool IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId);
     std::shared_ptr<EditRequestControlBlock> GetRequestControlBlockForTest(uint64_t editRequestId) const;
 
+    // Stage 7.1d: Optional Unicode SendInput compatibility channel (default OFF)
+    void SetUnicodeInjectionEnabled(bool enabled) { m_unicodeInjectionEnabled = enabled; }
+    bool IsUnicodeInjectionEnabled() const { return m_unicodeInjectionEnabled; }
+    using SendInputOverrideFunc = std::function<UINT(UINT, LPINPUT, int)>;
+    void SetSendInputOverrideForTest(SendInputOverrideFunc fn) { m_sendInputOverride = std::move(fn); }
+    void SetWindowForegroundBypassForTest(bool bypass) { m_bypassWindowCheckForTest = bypass; }
+    static std::vector<INPUT> BuildUnicodeInputs(const std::wstring& text);
+
     // Retained unconfirmed commits for bounded recovery
     enum class UnconfirmedAction {
         Success,
@@ -496,6 +506,14 @@ private:
 
     std::map<uint64_t, std::shared_ptr<EditRequestControlBlock>> m_activeRequestBlocks;
     uint64_t m_nextEditRequestId = 0;
+
+    bool m_unicodeInjectionEnabled = false;
+    bool m_bypassWindowCheckForTest = false;
+    SendInputOverrideFunc m_sendInputOverride;
+    InjectionOutcome TryUnicodeInjectionFallback(
+        const PendingEditSession& pending,
+        const std::shared_ptr<EditRequestControlBlock>& cb,
+        ITfContext* pContext);
 
     struct TextEditSinkBinding {
         Microsoft::WRL::ComPtr<ITfContext> context;
