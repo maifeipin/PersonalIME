@@ -1,15 +1,222 @@
 #include "candidate_window.h"
 #include "globals.h"
+#include <algorithm>
+#include <atomic>
 
 static const wchar_t* CANDIDATE_WND_CLASS = L"PersonalIME_CandidateWnd";
 static LONG s_cClassRef = 0;
+static std::atomic<int> s_appsUseLightThemeOverride{-1};
 
 LONG CCandidateWindow::GetClassRefCount() {
     return InterlockedCompareExchange(&s_cClassRef, 0, 0);
 }
 
+void CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(int val) {
+    s_appsUseLightThemeOverride.store(val, std::memory_order_release);
+}
+
+bool CCandidateWindow::QuerySystemAppsUseLightTheme() {
+    int ov = s_appsUseLightThemeOverride.load(std::memory_order_acquire);
+    if (ov == 0) return false;
+    if (ov == 1) return true;
+
+    DWORD value = 1; // Explicit Light fallback on read failure
+    DWORD size = sizeof(value);
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0,
+            KEY_QUERY_VALUE,
+            &hKey) == ERROR_SUCCESS) {
+        DWORD type = 0;
+        if (RegQueryValueExW(hKey, L"AppsUseLightTheme", nullptr, &type, reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS &&
+            type == REG_DWORD) {
+            RegCloseKey(hKey);
+            return value != 0;
+        }
+        RegCloseKey(hKey);
+    }
+    return true;
+}
+
+CandidateThemePalette CCandidateWindow::BuildPalette(ThemeMode effectiveTheme) {
+    CandidateThemePalette p{};
+    if (effectiveTheme == ThemeMode::Dark) {
+        p.bgColor = RGB(32, 32, 32);
+        p.borderColor = RGB(60, 60, 60);
+        p.dividerColor = RGB(55, 55, 55);
+        p.headerTextColor = RGB(156, 163, 175);
+        p.headerMatchColor = RGB(56, 189, 248);
+        p.candidateTextColor = RGB(243, 244, 246);
+        p.reverseLookupColor = RGB(156, 163, 175);
+        p.selectedPillBg = RGB(55, 55, 55);
+        p.hoverPillBg = RGB(48, 48, 48);
+        p.pressedPillBg = RGB(68, 68, 68);
+        p.accentBarColor = RGB(251, 146, 60);
+        p.arrowBtnEnabled = RGB(220, 220, 220);
+        p.arrowBtnDisabled = RGB(80, 80, 80);
+        p.btnHoverColor = RGB(56, 189, 248);
+    } else {
+        p.bgColor = RGB(255, 255, 255);
+        p.borderColor = RGB(226, 232, 240);
+        p.dividerColor = RGB(226, 232, 240);
+        p.headerTextColor = RGB(100, 116, 139);
+        p.headerMatchColor = RGB(14, 116, 144);
+        p.candidateTextColor = RGB(30, 41, 59);
+        p.reverseLookupColor = RGB(100, 116, 139);
+        p.selectedPillBg = RGB(241, 245, 249);
+        p.hoverPillBg = RGB(248, 250, 252);
+        p.pressedPillBg = RGB(226, 232, 240);
+        p.accentBarColor = RGB(249, 115, 22);
+        p.arrowBtnEnabled = RGB(71, 85, 105);
+        p.arrowBtnDisabled = RGB(203, 213, 225);
+        p.btnHoverColor = RGB(14, 116, 144);
+    }
+    return p;
+}
+
+void CCandidateWindow::SetThemeMode(ThemeMode mode) {
+    m_themeMode = mode;
+    RefreshTheme(true);
+}
+
+void CCandidateWindow::RefreshTheme(bool invalidate) {
+    ThemeMode eff = ThemeMode::Light;
+    if (m_themeMode == ThemeMode::Dark) {
+        eff = ThemeMode::Dark;
+    } else if (m_themeMode == ThemeMode::Light) {
+        eff = ThemeMode::Light;
+    } else {
+        eff = QuerySystemAppsUseLightTheme() ? ThemeMode::Light : ThemeMode::Dark;
+    }
+    m_effectiveTheme = eff;
+    m_palette = BuildPalette(eff);
+
+    if (m_hWnd && IsWindow(m_hWnd)) {
+        HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+        if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
+        if (hDwm) {
+            using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+            auto pDwmSet = reinterpret_cast<DwmSetWindowAttributeFn>(
+                GetProcAddress(hDwm, "DwmSetWindowAttribute"));
+            if (pDwmSet) {
+                constexpr DWORD kDwmwaUseImmersiveDarkMode = 20;
+                BOOL darkMode = (m_effectiveTheme == ThemeMode::Dark) ? TRUE : FALSE;
+                pDwmSet(m_hWnd, kDwmwaUseImmersiveDarkMode, &darkMode, sizeof(darkMode));
+            }
+        }
+        if (invalidate) {
+            InvalidateRect(m_hWnd, nullptr, TRUE);
+        }
+    }
+}
+
+UINT CCandidateWindow::QueryDpiForPoint(POINT pt) const {
+    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    if (hMon) {
+        HMODULE hShcore = GetModuleHandleW(L"shcore.dll");
+        if (!hShcore) hShcore = LoadLibraryW(L"shcore.dll");
+        if (hShcore) {
+            using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+            auto pGetDpiForMonitor = reinterpret_cast<GetDpiForMonitorFn>(
+                GetProcAddress(hShcore, "GetDpiForMonitor"));
+            if (pGetDpiForMonitor) {
+                UINT dpiX = 96, dpiY = 96;
+                if (SUCCEEDED(pGetDpiForMonitor(hMon, 0 /* MDT_EFFECTIVE_DPI */, &dpiX, &dpiY)) && dpiX >= 72) {
+                    return dpiX;
+                }
+            }
+        }
+    }
+    if (m_hWnd && IsWindow(m_hWnd)) {
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32) {
+            using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+            auto pGetDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+                GetProcAddress(hUser32, "GetDpiForWindow"));
+            if (pGetDpiForWindow) {
+                UINT dpi = pGetDpiForWindow(m_hWnd);
+                if (dpi >= 72) return dpi;
+            }
+        }
+    }
+    HDC screenDc = GetDC(nullptr);
+    UINT fallbackDpi = 96;
+    if (screenDc) {
+        int px = GetDeviceCaps(screenDc, LOGPIXELSX);
+        if (px >= 72) fallbackDpi = static_cast<UINT>(px);
+        ReleaseDC(nullptr, screenDc);
+    }
+    return fallbackDpi;
+}
+
+void CCandidateWindow::RebuildFontsForDpi(UINT dpi) {
+    if (dpi < 72) dpi = 96;
+    if (m_fontDpi == dpi && m_hFont && m_hBoldFont && m_hSubFont) {
+        return;
+    }
+    if (m_hFont) { DeleteObject(m_hFont); m_hFont = nullptr; }
+    if (m_hBoldFont) { DeleteObject(m_hBoldFont); m_hBoldFont = nullptr; }
+    if (m_hSubFont) { DeleteObject(m_hSubFont); m_hSubFont = nullptr; }
+
+    int mainPx = -MulDiv(16, static_cast<int>(dpi), 96);
+    int subPx = -MulDiv(12, static_cast<int>(dpi), 96);
+    m_hFont = CreateFontW(
+        mainPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        L"Microsoft YaHei UI"
+    );
+    m_hBoldFont = CreateFontW(
+        mainPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        L"Microsoft YaHei UI"
+    );
+    m_hSubFont = CreateFontW(
+        subPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        L"Segoe UI"
+    );
+    m_fontDpi = dpi;
+}
+
+void CCandidateWindow::ApplyWindowRounding(int width, int height) {
+    if (!m_hWnd || !IsWindow(m_hWnd)) {
+        m_usingNativeRounding = false;
+        return;
+    }
+    // Remove any previous custom region before attempting native Win11 DWM rounded corners
+    SetWindowRgn(m_hWnd, nullptr, FALSE);
+    m_usingNativeRounding = false;
+
+    HMODULE hDwm = GetModuleHandleW(L"dwmapi.dll");
+    if (!hDwm) hDwm = LoadLibraryW(L"dwmapi.dll");
+    if (hDwm) {
+        using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+        auto pDwmSet = reinterpret_cast<DwmSetWindowAttributeFn>(
+            GetProcAddress(hDwm, "DwmSetWindowAttribute"));
+        if (pDwmSet) {
+            constexpr DWORD kDwmwaWindowCornerPreference = 33;
+            constexpr DWORD kDwmwcpRound = 2;
+            DWORD pref = kDwmwcpRound;
+            if (SUCCEEDED(pDwmSet(m_hWnd, kDwmwaWindowCornerPreference, &pref, sizeof(pref)))) {
+                m_usingNativeRounding = true;
+                return;
+            }
+        }
+    }
+
+    int radius = ScaleDip(8);
+    HRGN hRgn = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+    SetWindowRgn(m_hWnd, hRgn, TRUE);
+}
+
 CCandidateWindow::CCandidateWindow() {
     InitDefaultPlugins();
+    RefreshTheme(false);
 }
 
 void CCandidateWindow::InitDefaultPlugins() {
@@ -84,24 +291,9 @@ bool CCandidateWindow::EnsureWindow() {
     );
 
     if (m_hWnd) {
-        m_hFont = CreateFontW(
-            -16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-            L"Microsoft YaHei UI"
-        );
-        m_hBoldFont = CreateFontW(
-            -16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-            L"Microsoft YaHei UI"
-        );
-        m_hSubFont = CreateFontW(
-            -12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-            L"Segoe UI"
-        );
+        m_dpi = QueryDpiForPoint(m_lastShowPt);
+        RebuildFontsForDpi(m_dpi);
+        RefreshTheme(false);
     } else {
         // Window creation failed, release class ref
         if (m_hasRegisteredClassRef) {
@@ -331,6 +523,10 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
 
     m_snapshot = snapshot;
     m_lastShowPt = pt;
+    m_dpi = QueryDpiForPoint(pt);
+    RebuildFontsForDpi(m_dpi);
+    RefreshTheme(false);
+
     m_candidates = snapshot.candidates;
     int initSel = snapshot.initial_selected_index;
     if (initSel < 0) initSel = 0;
@@ -340,7 +536,6 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     m_selectedIndex = initSel;
     UpdatePreviewTextFromSelection();
     m_isHeaderVisible = showHeader;
-    m_headerHeight = showHeader ? 22 : 0;
     m_hoveredIndex = -1;
     m_isHoveringPrevBtn = false;
     m_isHoveringNextBtn = false;
@@ -350,6 +545,14 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     }
     m_candidateRects.clear();
     ResetAllPressedStates();
+
+    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(hMon, &mi);
+    int workWidth = static_cast<int>(mi.rcWork.right - mi.rcWork.left);
+    if (workWidth <= 0) workWidth = ScaleDip(800);
+    int maxWindowWidth = (std::min)(workWidth, ScaleDip(760));
 
     // Calculate dimensions using bold font so switching selection never shifts candidate layout
     HDC hdc = GetDC(m_hWnd);
@@ -362,10 +565,14 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
         SelectObject(hdc, m_hSubFont ? m_hSubFont : m_hFont);
         RECT rcHdr = { 0, 0, 0, 0 };
         DrawTextW(hdc, headerText.c_str(), static_cast<int>(headerText.length()), &rcHdr, DT_CALCRECT | DT_SINGLELINE);
-        headerMinWidth = (rcHdr.right - rcHdr.left) + 20;
+        int hdrTextH = static_cast<int>(rcHdr.bottom - rcHdr.top);
+        m_headerHeight = (std::max)(ScaleDip(22), hdrTextH + ScaleDip(6));
+        headerMinWidth = static_cast<int>(rcHdr.right - rcHdr.left) + ScaleDip(20);
+    } else {
+        m_headerHeight = 0;
     }
 
-    int maxHeight = 24;
+    int maxHeight = ScaleDip(22);
     std::vector<int> candWidths(m_candidates.size(), 0);
 
     for (size_t i = 0; i < m_candidates.size(); ++i) {
@@ -380,17 +587,17 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
             SelectObject(hdc, m_hSubFont ? m_hSubFont : m_hFont);
             RECT rcHint = { 0, 0, 0, 0 };
             DrawTextW(hdc, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_CALCRECT | DT_SINGLELINE);
-            candWidths[i] = (rcMain.right - rcMain.left) + 2 + (rcHint.right - rcHint.left);
+            candWidths[i] = static_cast<int>(rcMain.right - rcMain.left) + ScaleDip(2) + static_cast<int>(rcHint.right - rcHint.left);
             if (rcMain.bottom - rcMain.top > maxHeight) {
-                maxHeight = rcMain.bottom - rcMain.top;
+                maxHeight = static_cast<int>(rcMain.bottom - rcMain.top);
             }
         } else {
             SelectObject(hdc, hMeasureFont);
             RECT rcText = { 0, 0, 0, 0 };
             DrawTextW(hdc, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_CALCRECT | DT_SINGLELINE);
-            candWidths[i] = (rcText.right - rcText.left);
+            candWidths[i] = static_cast<int>(rcText.right - rcText.left);
             if (rcText.bottom - rcText.top > maxHeight) {
-                maxHeight = rcText.bottom - rcText.top;
+                maxHeight = static_cast<int>(rcText.bottom - rcText.top);
             }
         }
     }
@@ -403,46 +610,72 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
     int totalHeight = 0;
 
     if (!m_candidates.empty()) {
-        int candRowHeight = maxHeight + 14;
-        if (candRowHeight < 34) candRowHeight = 34;
+        int candRowHeight = (std::max)(ScaleDip(32), maxHeight + ScaleDip(12));
         totalHeight = rowTop + candRowHeight;
 
-        int curX = 8;
+        const int pageBtnW = ScaleDip(20);
+        const int mgrBtnW = ScaleDip(30);
+        const int pluginBtnW = ScaleDip(28);
+        int pagingTotalWidth = pageBtnW * 2;
+        int pluginTotalWidth = static_cast<int>(m_plugins.size()) * pluginBtnW;
+        int controlsTotalWidth = pagingTotalWidth + mgrBtnW + pluginTotalWidth;
+
+        int padLeft = ScaleDip(8);
+        int candGap = ScaleDip(16);
+        int curX = padLeft;
+        for (size_t i = 0; i < m_candidates.size(); ++i) {
+            curX += candWidths[i] + candGap;
+        }
+        int contentWidth = curX + ScaleDip(4) + controlsTotalWidth;
+        totalWidth = (std::max)(contentWidth, headerMinWidth);
+        if (totalWidth > maxWindowWidth) {
+            totalWidth = maxWindowWidth;
+        }
+        int minRequiredWidth = controlsTotalWidth + ScaleDip(48);
+        if (totalWidth < minRequiredWidth && minRequiredWidth <= workWidth) {
+            totalWidth = minRequiredWidth;
+        }
+
+        // Fit candidate pills cleanly within available width before controls
+        int availCandRight = totalWidth - controlsTotalWidth - ScaleDip(4);
+        int pillPadL = ScaleDip(4);
+        int pillPadR = ScaleDip(6);
+        int pillPadV = ScaleDip(4);
+        curX = padLeft;
         m_candidateRects.resize(m_candidates.size());
         for (size_t i = 0; i < m_candidates.size(); ++i) {
-            int candW = candWidths[i];
-            m_candidateRects[i] = { curX - 4, rowTop + 4, curX + candW + 6, totalHeight - 4 };
-            curX += candW + 16;
-        }
-        totalWidth = curX + 4;
-
-        // Reserve space for Paging buttons (20px each), Manager button (30px) and Plugin buttons (28px each)
-        constexpr int PAGE_BTN_WIDTH = 20;
-        constexpr int MGR_BTN_WIDTH = 30;
-        constexpr int PLUGIN_BTN_WIDTH = 28;
-        int pagingTotalWidth = PAGE_BTN_WIDTH * 2;
-        int pluginTotalWidth = static_cast<int>(m_plugins.size()) * PLUGIN_BTN_WIDTH;
-        totalWidth += pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth;
-        if (totalWidth < headerMinWidth) {
-            totalWidth = headerMinWidth;
+            int pillLeft = curX - pillPadL;
+            int pillRight = curX + candWidths[i] + pillPadR;
+            if (pillRight > availCandRight) {
+                pillRight = (std::max)(pillLeft + ScaleDip(20), availCandRight);
+            }
+            if (pillLeft >= availCandRight) {
+                m_candidateRects[i] = { 0, 0, 0, 0 }; // Clamped out of view
+            } else {
+                m_candidateRects[i] = { pillLeft, rowTop + pillPadV, pillRight, totalHeight - pillPadV };
+            }
+            curX += candWidths[i] + candGap;
         }
 
         // Immediately establish button rectangles so geometry checks and mouse hits succeed before WM_PAINT
-        int controlsStartX = totalWidth - (pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth);
-        m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + PAGE_BTN_WIDTH, totalHeight - 1 };
-        m_rcNextBtn = { controlsStartX + PAGE_BTN_WIDTH, rowTop + 1, controlsStartX + pagingTotalWidth, totalHeight - 1 };
+        int controlsStartX = totalWidth - controlsTotalWidth;
+        m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + pageBtnW, totalHeight - 1 };
+        m_rcNextBtn = { controlsStartX + pageBtnW, rowTop + 1, controlsStartX + pagingTotalWidth, totalHeight - 1 };
 
         int btnStartX = controlsStartX + pagingTotalWidth;
-        m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + MGR_BTN_WIDTH, totalHeight - 1 };
-        int pX = btnStartX + MGR_BTN_WIDTH;
+        m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, totalHeight - 1 };
+        int pX = btnStartX + mgrBtnW;
         for (size_t i = 0; i < m_plugins.size(); ++i) {
-            m_plugins[i].rcBtn = { pX, rowTop + 1, pX + PLUGIN_BTN_WIDTH, totalHeight - 1 };
-            pX += PLUGIN_BTN_WIDTH;
+            m_plugins[i].rcBtn = { pX, rowTop + 1, pX + pluginBtnW, totalHeight - 1 };
+            pX += pluginBtnW;
         }
     } else {
         // Header-only mode when raw_input is non-empty but no candidates match
-        totalWidth = (headerMinWidth > 96) ? headerMinWidth : 96;
-        totalHeight = m_headerHeight + 6;
+        totalWidth = (std::max)(headerMinWidth, ScaleDip(96));
+        if (totalWidth > maxWindowWidth) {
+            totalWidth = maxWindowWidth;
+        }
+        totalHeight = m_headerHeight + ScaleDip(6);
         m_rcPrevBtn = { 0, 0, 0, 0 };
         m_rcNextBtn = { 0, 0, 0, 0 };
         m_rcMgrBtn = { 0, 0, 0, 0 };
@@ -457,11 +690,6 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
         m_rcHeader = { 0, 0, 0, 0 };
     }
 
-    HMONITOR hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(hMon, &mi);
-
     int x = pt.x;
     int y = pt.y;
 
@@ -469,14 +697,14 @@ void CCandidateWindow::Show(const CandidateDisplaySnapshot& snapshot, POINT pt) 
         x = mi.rcWork.right - totalWidth;
     }
     if (y + totalHeight > mi.rcWork.bottom) {
-        y = pt.y - totalHeight - 20;
+        y = pt.y - totalHeight - ScaleDip(20);
     }
     if (x < mi.rcWork.left) x = mi.rcWork.left;
     if (y < mi.rcWork.top) y = mi.rcWork.top;
+    if (x + totalWidth > mi.rcWork.right) x = (std::max)(static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.right) - totalWidth);
+    if (y + totalHeight > mi.rcWork.bottom) y = (std::max)(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom) - totalHeight);
 
-    // Apply smooth rounded window region
-    HRGN hRgn = CreateRoundRectRgn(0, 0, totalWidth + 1, totalHeight + 1, 8, 8);
-    SetWindowRgn(m_hWnd, hRgn, TRUE);
+    ApplyWindowRounding(totalWidth, totalHeight);
 
     SetWindowPos(
         m_hWnd,
@@ -500,6 +728,28 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
     if (uMsg == WM_MOUSEACTIVATE) {
         // Crucial: do NOT activate candidate window on mouse click, preserving host input focus!
         return MA_NOACTIVATE;
+    }
+
+    if ((uMsg == WM_SETTINGCHANGE || uMsg == WM_THEMECHANGED) && pThis) {
+        if (uMsg == WM_THEMECHANGED || lParam == 0 ||
+            wcscmp(reinterpret_cast<LPCWSTR>(lParam), L"ImmersiveColorSet") == 0) {
+            pThis->RefreshTheme(true);
+        }
+        return 0;
+    }
+
+    if (uMsg == 0x02E0 /* WM_DPICHANGED */ && pThis) {
+        UINT newDpi = HIWORD(wParam);
+        if (newDpi >= 72) {
+            pThis->m_dpi = newDpi;
+            pThis->RebuildFontsForDpi(newDpi);
+            if ((!pThis->m_candidates.empty() || pThis->m_isHeaderVisible) && IsWindowVisible(hWnd)) {
+                CandidateDisplaySnapshot snap = pThis->m_snapshot;
+                snap.initial_selected_index = pThis->m_selectedIndex;
+                pThis->Show(snap, pThis->m_lastShowPt);
+            }
+        }
+        return 0;
     }
 
     if (uMsg == WM_SETCURSOR && pThis) {
@@ -831,18 +1081,30 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, clientRc.right, clientRc.bottom);
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-        // Crisp pure white background
-        HBRUSH hBg = CreateSolidBrush(RGB(255, 255, 255));
+        const CandidateThemePalette& pal = pThis->m_palette;
+
+        // Background
+        HBRUSH hBg = CreateSolidBrush(pal.bgColor);
         FillRect(memDC, &clientRc, hBg);
         DeleteObject(hBg);
 
-        // Subtle, elegant rounded border
-        HPEN hBorderPen = CreatePen(PS_SOLID, 1, RGB(218, 222, 229));
-        HPEN hOldPen = (HPEN)SelectObject(memDC, hBorderPen);
-        SelectObject(memDC, GetStockObject(NULL_BRUSH));
-        RoundRect(memDC, clientRc.left, clientRc.top, clientRc.right, clientRc.bottom, 8, 8);
-        SelectObject(memDC, hOldPen);
-        DeleteObject(hBorderPen);
+        // Subtle rounded border when using GDI fallback or light hairline
+        if (!pThis->m_usingNativeRounding) {
+            int rad = pThis->ScaleDip(8);
+            HPEN hBorderPen = CreatePen(PS_SOLID, 1, pal.borderColor);
+            HPEN hOldPen = (HPEN)SelectObject(memDC, hBorderPen);
+            SelectObject(memDC, GetStockObject(NULL_BRUSH));
+            RoundRect(memDC, clientRc.left, clientRc.top, clientRc.right, clientRc.bottom, rad, rad);
+            SelectObject(memDC, hOldPen);
+            DeleteObject(hBorderPen);
+        } else {
+            HPEN hBorderPen = CreatePen(PS_SOLID, 1, pal.borderColor);
+            HPEN hOldPen = (HPEN)SelectObject(memDC, hBorderPen);
+            SelectObject(memDC, GetStockObject(NULL_BRUSH));
+            Rectangle(memDC, clientRc.left, clientRc.top, clientRc.right, clientRc.bottom);
+            SelectObject(memDC, hOldPen);
+            DeleteObject(hBorderPen);
+        }
 
         SetBkMode(memDC, TRANSPARENT);
 
@@ -858,24 +1120,27 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             DrawTextW(memDC, codePart.c_str(), static_cast<int>(codePart.length()), &rcCodeCalc, DT_CALCRECT | DT_SINGLELINE);
             int headerTextH = rcCodeCalc.bottom - rcCodeCalc.top;
             int headerTextY = (pThis->m_headerHeight - headerTextH) / 2;
+            int padX = pThis->ScaleDip(8);
 
-            RECT rcCode = { 8, headerTextY, clientRc.right - 8, pThis->m_headerHeight };
-            SetTextColor(memDC, RGB(100, 116, 139)); // preedit_code_color (#64748B)
-            DrawTextW(memDC, codePart.c_str(), static_cast<int>(codePart.length()), &rcCode, DT_SINGLELINE);
+            RECT rcCode = { padX, headerTextY, clientRc.right - padX, pThis->m_headerHeight };
+            SetTextColor(memDC, pal.headerTextColor);
+            DrawTextW(memDC, codePart.c_str(), static_cast<int>(codePart.length()), &rcCode, DT_SINGLELINE | DT_END_ELLIPSIS);
 
             if (!pThis->m_snapshot.preview_text.empty()) {
                 std::wstring previewPart = L" [" + pThis->m_snapshot.preview_text + L"]";
-                int previewX = 8 + (rcCodeCalc.right - rcCodeCalc.left);
-                RECT rcPreview = { previewX, headerTextY, clientRc.right - 8, pThis->m_headerHeight };
-                SetTextColor(memDC, RGB(14, 116, 144)); // preedit_preview_color (#0E7490)
-                DrawTextW(memDC, previewPart.c_str(), static_cast<int>(previewPart.length()), &rcPreview, DT_SINGLELINE);
+                int previewX = padX + (rcCodeCalc.right - rcCodeCalc.left);
+                if (previewX < clientRc.right - padX) {
+                    RECT rcPreview = { previewX, headerTextY, clientRc.right - padX, pThis->m_headerHeight };
+                    SetTextColor(memDC, pal.headerMatchColor);
+                    DrawTextW(memDC, previewPart.c_str(), static_cast<int>(previewPart.length()), &rcPreview, DT_SINGLELINE | DT_END_ELLIPSIS);
+                }
             }
 
             if (!pThis->m_candidates.empty()) {
-                HPEN hDivPen = CreatePen(PS_SOLID, 1, RGB(230, 233, 238));
+                HPEN hDivPen = CreatePen(PS_SOLID, 1, pal.dividerColor);
                 HPEN hOldDivPen = (HPEN)SelectObject(memDC, hDivPen);
-                MoveToEx(memDC, clientRc.left + 6, pThis->m_headerHeight - 1, nullptr);
-                LineTo(memDC, clientRc.right - 6, pThis->m_headerHeight - 1);
+                MoveToEx(memDC, clientRc.left + pThis->ScaleDip(6), pThis->m_headerHeight - 1, nullptr);
+                LineTo(memDC, clientRc.right - pThis->ScaleDip(6), pThis->m_headerHeight - 1);
                 SelectObject(memDC, hOldDivPen);
                 DeleteObject(hDivPen);
             }
@@ -883,8 +1148,12 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
 
         int rowTop = pThis->m_headerHeight;
         int centerY = rowTop + (clientRc.bottom - rowTop) / 2;
+        int pillRadius = pThis->ScaleDip(6);
 
         for (size_t i = 0; i < pThis->m_candidates.size(); ++i) {
+            if (i >= pThis->m_candidateRects.size() || IsRectEmpty(&pThis->m_candidateRects[i])) {
+                continue;
+            }
             const auto& cand = pThis->m_candidates[i];
             bool isSelected = (static_cast<int>(i) == pThis->m_selectedIndex);
             bool isHovered = (static_cast<int>(i) == pThis->m_hoveredIndex);
@@ -896,241 +1165,147 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
             int candH = rcCalc.bottom - rcCalc.top;
             int textY = centerY - (candH / 2);
 
-            RECT rcPill = (i < pThis->m_candidateRects.size())
-                ? pThis->m_candidateRects[i]
-                : RECT{ 5, rowTop + 4, 60, clientRc.bottom - 4 };
-            int curX = rcPill.left + 4;
+            RECT rcPill = pThis->m_candidateRects[i];
+            int curX = rcPill.left + pThis->ScaleDip(6);
 
             if (isSelected) {
-                // Selected candidate: modern soft-blue accent pill
-                HBRUSH hPillBrush = CreateSolidBrush(RGB(240, 246, 255));
-                HPEN hPillPen = CreatePen(PS_SOLID, 1, RGB(190, 220, 255));
+                HBRUSH hPillBrush = CreateSolidBrush(pal.selectedPillBg);
+                HPEN hPillPen = CreatePen(PS_SOLID, 1, pal.selectedPillBg);
                 HPEN hOldPillPen = (HPEN)SelectObject(memDC, hPillPen);
                 HBRUSH hOldPillBrush = (HBRUSH)SelectObject(memDC, hPillBrush);
-                RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, 6, 6);
+                RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, pillRadius, pillRadius);
                 SelectObject(memDC, hOldPillPen);
                 SelectObject(memDC, hOldPillBrush);
                 DeleteObject(hPillPen);
                 DeleteObject(hPillBrush);
 
-                size_t bracketPos = cand.find(L'[');
-                if (bracketPos != std::wstring::npos) {
-                    std::wstring mainPart = cand.substr(0, bracketPos);
-                    std::wstring hintPart = cand.substr(bracketPos);
+                // Warm orange vertical accent bar on the left of the selected pill
+                int barW = (std::max)(2, pThis->ScaleDip(3));
+                int barPadV = pThis->ScaleDip(4);
+                RECT rcAccent = { rcPill.left + 1, rcPill.top + barPadV, rcPill.left + 1 + barW, rcPill.bottom - barPadV };
+                HBRUSH hAccent = CreateSolidBrush(pal.accentBarColor);
+                FillRect(memDC, &rcAccent, hAccent);
+                DeleteObject(hAccent);
+            } else if (isHovered) {
+                HBRUSH hHoverBrush = CreateSolidBrush(pal.hoverPillBg);
+                HPEN hHoverPen = CreatePen(PS_SOLID, 1, pal.hoverPillBg);
+                HPEN hOldHoverPen = (HPEN)SelectObject(memDC, hHoverPen);
+                HBRUSH hOldHoverBrush = (HBRUSH)SelectObject(memDC, hHoverBrush);
+                RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, pillRadius, pillRadius);
+                SelectObject(memDC, hOldHoverPen);
+                SelectObject(memDC, hOldHoverBrush);
+                DeleteObject(hHoverPen);
+                DeleteObject(hHoverBrush);
+            }
 
-                    RECT rcMain = { curX, textY, clientRc.right, clientRc.bottom };
-                    SetTextColor(memDC, RGB(0, 102, 204));
-                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_SINGLELINE);
+            size_t bracketPos = cand.find(L'[');
+            if (bracketPos != std::wstring::npos) {
+                std::wstring mainPart = cand.substr(0, bracketPos);
+                std::wstring hintPart = cand.substr(bracketPos);
 
-                    RECT rcMainCalc = { 0, 0, 0, 0 };
-                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMainCalc, DT_CALCRECT | DT_SINGLELINE);
+                RECT rcMain = { curX, textY, rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
+                SetTextColor(memDC, pal.candidateTextColor);
+                DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_SINGLELINE | DT_END_ELLIPSIS);
 
+                RECT rcMainCalc = { 0, 0, 0, 0 };
+                DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMainCalc, DT_CALCRECT | DT_SINGLELINE);
+
+                int hintX = curX + (rcMainCalc.right - rcMainCalc.left) + pThis->ScaleDip(2);
+                if (hintX < rcPill.right - pThis->ScaleDip(2)) {
                     SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
-                    RECT rcHint = { curX + (rcMainCalc.right - rcMainCalc.left) + 2, textY + 2, clientRc.right, clientRc.bottom };
-                    SetTextColor(memDC, RGB(100, 130, 165));
-                    DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE);
+                    RECT rcHint = { hintX, textY + pThis->ScaleDip(2), rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
+                    SetTextColor(memDC, pal.reverseLookupColor);
+                    DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE | DT_END_ELLIPSIS);
                     SelectObject(memDC, hItemFont);
-                } else {
-                    SetTextColor(memDC, RGB(0, 102, 204));
-                    RECT rcText = { curX, textY, clientRc.right, clientRc.bottom };
-                    DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE);
                 }
             } else {
-                if (isHovered) {
-                    HBRUSH hHoverBrush = CreateSolidBrush(RGB(245, 247, 250));
-                    HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(220, 226, 235));
-                    HPEN hOldHoverPen = (HPEN)SelectObject(memDC, hHoverPen);
-                    HBRUSH hOldHoverBrush = (HBRUSH)SelectObject(memDC, hHoverBrush);
-                    RoundRect(memDC, rcPill.left, rcPill.top, rcPill.right, rcPill.bottom, 6, 6);
-                    SelectObject(memDC, hOldHoverPen);
-                    SelectObject(memDC, hOldHoverBrush);
-                    DeleteObject(hHoverPen);
-                    DeleteObject(hHoverBrush);
-                }
-
-                size_t bracketPos = cand.find(L'[');
-                if (bracketPos != std::wstring::npos) {
-                    std::wstring mainPart = cand.substr(0, bracketPos);
-                    std::wstring hintPart = cand.substr(bracketPos);
-
-                    RECT rcMain = { curX, textY, clientRc.right, clientRc.bottom };
-                    SetTextColor(memDC, RGB(40, 45, 53));
-                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMain, DT_SINGLELINE);
-
-                    RECT rcMainCalc = { 0, 0, 0, 0 };
-                    DrawTextW(memDC, mainPart.c_str(), static_cast<int>(mainPart.length()), &rcMainCalc, DT_CALCRECT | DT_SINGLELINE);
-
-                    SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
-                    RECT rcHint = { curX + (rcMainCalc.right - rcMainCalc.left) + 2, textY + 2, clientRc.right, clientRc.bottom };
-                    SetTextColor(memDC, RGB(156, 163, 175));
-                    DrawTextW(memDC, hintPart.c_str(), static_cast<int>(hintPart.length()), &rcHint, DT_SINGLELINE);
-                    SelectObject(memDC, pThis->m_hFont);
-                } else {
-                    SetTextColor(memDC, RGB(40, 45, 53));
-                    RECT rcText = { curX, textY, clientRc.right, clientRc.bottom };
-                    DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE);
-                }
+                SetTextColor(memDC, pal.candidateTextColor);
+                RECT rcText = { curX, textY, rcPill.right - pThis->ScaleDip(2), clientRc.bottom };
+                DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
             }
         }
 
         if (!pThis->m_candidates.empty()) {
-            // --- Paging & Action Button Layout & Rendering ---
-            constexpr int PAGE_BTN_WIDTH = 20;
-            constexpr int MGR_BTN_WIDTH = 30;
-            constexpr int PLUGIN_BTN_WIDTH = 28;
-            int pagingTotalWidth = PAGE_BTN_WIDTH * 2;
-            int pluginTotalWidth = static_cast<int>(pThis->m_plugins.size()) * PLUGIN_BTN_WIDTH;
-            int controlsStartX = clientRc.right - (pagingTotalWidth + MGR_BTN_WIDTH + pluginTotalWidth);
+            const int pageBtnW = pThis->ScaleDip(20);
+            const int mgrBtnW = pThis->ScaleDip(30);
+            const int pluginBtnW = pThis->ScaleDip(28);
+            int pagingTotalWidth = pageBtnW * 2;
+            int pluginTotalWidth = static_cast<int>(pThis->m_plugins.size()) * pluginBtnW;
+            int controlsStartX = clientRc.right - (pagingTotalWidth + mgrBtnW + pluginTotalWidth);
 
-            pThis->m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + PAGE_BTN_WIDTH, clientRc.bottom - 1 };
-            pThis->m_rcNextBtn = { controlsStartX + PAGE_BTN_WIDTH, rowTop + 1, controlsStartX + pagingTotalWidth, clientRc.bottom - 1 };
+            pThis->m_rcPrevBtn = { controlsStartX, rowTop + 1, controlsStartX + pageBtnW, clientRc.bottom - 1 };
+            pThis->m_rcNextBtn = { controlsStartX + pageBtnW, rowTop + 1, controlsStartX + pagingTotalWidth, clientRc.bottom - 1 };
             int btnStartX = controlsStartX + pagingTotalWidth;
 
-            pThis->m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + MGR_BTN_WIDTH, clientRc.bottom - 1 };
+            pThis->m_rcMgrBtn = { btnStartX, rowTop + 1, btnStartX + mgrBtnW, clientRc.bottom - 1 };
 
-            // Subtle vertical separator line before Paging buttons
-            HPEN hSepPen = CreatePen(PS_SOLID, 1, RGB(230, 233, 238));
+            HPEN hSepPen = CreatePen(PS_SOLID, 1, pal.dividerColor);
             HPEN hOldPen2 = (HPEN)SelectObject(memDC, hSepPen);
-            MoveToEx(memDC, pThis->m_rcPrevBtn.left, rowTop + 7, nullptr);
-            LineTo(memDC, pThis->m_rcPrevBtn.left, clientRc.bottom - 7);
+            MoveToEx(memDC, pThis->m_rcPrevBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
+            LineTo(memDC, pThis->m_rcPrevBtn.left, clientRc.bottom - pThis->ScaleDip(7));
 
-            // --- Render Prev Button (◀) ---
+            auto drawBtnBg = [&](const RECT& rc, bool pressed, bool hovered, int rad) {
+                if (!pressed && !hovered) return;
+                COLORREF bg = pressed ? pal.pressedPillBg : pal.hoverPillBg;
+                HBRUSH hB = CreateSolidBrush(bg);
+                HPEN hP = CreatePen(PS_SOLID, 1, bg);
+                HPEN hOP = (HPEN)SelectObject(memDC, hP);
+                HBRUSH hOB = (HBRUSH)SelectObject(memDC, hB);
+                RoundRect(memDC, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
+                SelectObject(memDC, hOP);
+                SelectObject(memDC, hOB);
+                DeleteObject(hP);
+                DeleteObject(hB);
+            };
+
             bool prevEnabled = pThis->IsPrevButtonEnabled();
             RECT prevInner = { pThis->m_rcPrevBtn.left + 2, rowTop + 4, pThis->m_rcPrevBtn.right - 2, clientRc.bottom - 4 };
             if (prevEnabled) {
-                if (pThis->m_isPressedPrevBtn) {
-                    HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-                    HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
-                    RoundRect(memDC, prevInner.left, prevInner.top, prevInner.right, prevInner.bottom, 4, 4);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hPressPen);
-                    DeleteObject(hPressBg);
-                } else if (pThis->m_isHoveringPrevBtn) {
-                    HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
-                    HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
-                    RoundRect(memDC, prevInner.left, prevInner.top, prevInner.right, prevInner.bottom, 4, 4);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hHoverPen);
-                    DeleteObject(hHoverBg);
-                }
+                drawBtnBg(prevInner, pThis->m_isPressedPrevBtn, pThis->m_isHoveringPrevBtn, pThis->ScaleDip(4));
             }
             SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
-            COLORREF prevColor = !prevEnabled ? RGB(205, 210, 218)
-                                 : (pThis->m_isHoveringPrevBtn ? RGB(0, 102, 204) : RGB(120, 126, 136));
+            COLORREF prevColor = !prevEnabled ? pal.arrowBtnDisabled
+                                 : (pThis->m_isHoveringPrevBtn ? pal.btnHoverColor : pal.arrowBtnEnabled);
             SetTextColor(memDC, prevColor);
             const wchar_t* prevIcon = L"\x25C0";
             DrawTextW(memDC, prevIcon, 1, &prevInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            // --- Render Next Button (▶) ---
             bool nextEnabled = pThis->IsNextButtonEnabled();
             RECT nextInner = { pThis->m_rcNextBtn.left + 2, rowTop + 4, pThis->m_rcNextBtn.right - 2, clientRc.bottom - 4 };
             if (nextEnabled) {
-                if (pThis->m_isPressedNextBtn) {
-                    HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-                    HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
-                    RoundRect(memDC, nextInner.left, nextInner.top, nextInner.right, nextInner.bottom, 4, 4);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hPressPen);
-                    DeleteObject(hPressBg);
-                } else if (pThis->m_isHoveringNextBtn) {
-                    HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
-                    HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
-                    RoundRect(memDC, nextInner.left, nextInner.top, nextInner.right, nextInner.bottom, 4, 4);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hHoverPen);
-                    DeleteObject(hHoverBg);
-                }
+                drawBtnBg(nextInner, pThis->m_isPressedNextBtn, pThis->m_isHoveringNextBtn, pThis->ScaleDip(4));
             }
-            COLORREF nextColor = !nextEnabled ? RGB(205, 210, 218)
-                                 : (pThis->m_isHoveringNextBtn ? RGB(0, 102, 204) : RGB(120, 126, 136));
+            COLORREF nextColor = !nextEnabled ? pal.arrowBtnDisabled
+                                 : (pThis->m_isHoveringNextBtn ? pal.btnHoverColor : pal.arrowBtnEnabled);
             SetTextColor(memDC, nextColor);
             const wchar_t* nextIcon = L"\x25B6";
             DrawTextW(memDC, nextIcon, 1, &nextInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            // Subtle vertical separator line before Manager button
-            MoveToEx(memDC, pThis->m_rcMgrBtn.left, rowTop + 7, nullptr);
-            LineTo(memDC, pThis->m_rcMgrBtn.left, clientRc.bottom - 7);
+            MoveToEx(memDC, pThis->m_rcMgrBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
+            LineTo(memDC, pThis->m_rcMgrBtn.left, clientRc.bottom - pThis->ScaleDip(7));
 
-            // Button background
             RECT btnInner = { pThis->m_rcMgrBtn.left + 2, rowTop + 4, pThis->m_rcMgrBtn.right - 2, clientRc.bottom - 4 };
-            if (pThis->m_isPressedMgrBtn) {
-                HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-                HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
-                HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
-                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
-                RoundRect(memDC, btnInner.left, btnInner.top, btnInner.right, btnInner.bottom, 6, 6);
-                SelectObject(memDC, hOld);
-                SelectObject(memDC, hOldB);
-                DeleteObject(hPressPen);
-                DeleteObject(hPressBg);
-            } else if (pThis->m_isHoveringMgrBtn) {
-                HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
-                HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
-                HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
-                HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
-                RoundRect(memDC, btnInner.left, btnInner.top, btnInner.right, btnInner.bottom, 6, 6);
-                SelectObject(memDC, hOld);
-                SelectObject(memDC, hOldB);
-                DeleteObject(hHoverPen);
-                DeleteObject(hHoverBg);
-            }
+            drawBtnBg(btnInner, pThis->m_isPressedMgrBtn, pThis->m_isHoveringMgrBtn, pillRadius);
 
-            // Button icon: gear symbol ⚙ (U+2699)
             SelectObject(memDC, pThis->m_hFont);
-            SetTextColor(memDC, pThis->m_isHoveringMgrBtn ? RGB(0, 102, 204) : RGB(140, 146, 156));
+            SetTextColor(memDC, pThis->m_isHoveringMgrBtn ? pal.btnHoverColor : pal.arrowBtnEnabled);
             const wchar_t* btnIcon = L"\x2699";
             DrawTextW(memDC, btnIcon, 1, &btnInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            // --- Render Plugin Buttons ---
-            int pLeft = btnStartX + MGR_BTN_WIDTH;
+            int pLeft = btnStartX + mgrBtnW;
             for (size_t i = 0; i < pThis->m_plugins.size(); ++i) {
                 auto& p = pThis->m_plugins[i];
-                p.rcBtn = { pLeft, rowTop + 1, pLeft + PLUGIN_BTN_WIDTH, clientRc.bottom - 1 };
+                p.rcBtn = { pLeft, rowTop + 1, pLeft + pluginBtnW, clientRc.bottom - 1 };
 
-                // Separator line
-                MoveToEx(memDC, p.rcBtn.left, rowTop + 7, nullptr);
-                LineTo(memDC, p.rcBtn.left, clientRc.bottom - 7);
+                MoveToEx(memDC, p.rcBtn.left, rowTop + pThis->ScaleDip(7), nullptr);
+                LineTo(memDC, p.rcBtn.left, clientRc.bottom - pThis->ScaleDip(7));
 
-                // Background with independent rounded highlight
                 RECT pInner = { p.rcBtn.left + 2, rowTop + 4, p.rcBtn.right - 2, clientRc.bottom - 4 };
-                if (p.isPressed) {
-                    HBRUSH hPressBg = CreateSolidBrush(RGB(226, 234, 246));
-                    HPEN hPressPen = CreatePen(PS_SOLID, 1, RGB(180, 210, 245));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hPressPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hPressBg);
-                    RoundRect(memDC, pInner.left, pInner.top, pInner.right, pInner.bottom, 6, 6);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hPressPen);
-                    DeleteObject(hPressBg);
-                } else if (p.isHovered) {
-                    HBRUSH hHoverBg = CreateSolidBrush(RGB(240, 246, 255));
-                    HPEN hHoverPen = CreatePen(PS_SOLID, 1, RGB(200, 225, 255));
-                    HPEN hOld = (HPEN)SelectObject(memDC, hHoverPen);
-                    HBRUSH hOldB = (HBRUSH)SelectObject(memDC, hHoverBg);
-                    RoundRect(memDC, pInner.left, pInner.top, pInner.right, pInner.bottom, 6, 6);
-                    SelectObject(memDC, hOld);
-                    SelectObject(memDC, hOldB);
-                    DeleteObject(hHoverPen);
-                    DeleteObject(hHoverBg);
-                }
+                drawBtnBg(pInner, p.isPressed, p.isHovered, pillRadius);
 
-                // Draw plugin icon (Emoji or symbol) with independent hover text color
-                SetTextColor(memDC, p.isHovered ? RGB(0, 102, 204) : RGB(140, 146, 156));
+                SetTextColor(memDC, p.isHovered ? pal.btnHoverColor : pal.arrowBtnEnabled);
                 DrawTextW(memDC, p.icon.c_str(), static_cast<int>(p.icon.length()), &pInner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                pLeft += PLUGIN_BTN_WIDTH;
+                pLeft += pluginBtnW;
             }
 
             SelectObject(memDC, hOldPen2);

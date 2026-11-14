@@ -465,6 +465,88 @@ int main() {
     }
     std::wcout << L"[PASS] Verified: Stage 7.1b Preedit Header modes, pure preview text sync, empty-candidate header & generation/epoch press guards." << std::endl;
 
+    // 7. Stage 7.2: Light/Dark Auto Theming, WM_SETTINGCHANGE live refresh, WorkArea clamping & Paint
+    {
+        CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(1);
+        CCandidateWindow wnd;
+        CHECK_EQ(wnd.GetThemeMode() == ThemeMode::FollowSystem, true, L"Default ThemeMode is FollowSystem");
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Light, true, L"Effective theme is Light when AppsUseLightTheme=1");
+        CHECK_EQ(wnd.GetPalette().bgColor, RGB(255, 255, 255), L"Light BgColor token");
+        CHECK_EQ(wnd.GetPalette().accentBarColor, RGB(249, 115, 22), L"Light AccentBarColor token");
+
+        CandidateDisplaySnapshot snap{};
+        snap.session_id = 1;
+        snap.context_id = 100;
+        snap.candidate_version = 1;
+        snap.page_index = 0;
+        snap.page_count = 2;
+        snap.raw_input = L"dajia";
+        snap.query_code = L"da'jia";
+        snap.candidates = { L"1. 大家", L"2. 大 [da]" };
+        snap.candidate_core_texts = { L"大家", L"大" };
+
+        wnd.Show(snap, { 120, 120 });
+        HWND hWnd = wnd.GetHwnd();
+        CHECK_EQ(hWnd != nullptr, true, L"Window created");
+
+        // System switches to Dark while visible -> WM_SETTINGCHANGE refreshes immediately
+        CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(0);
+        SendMessageW(hWnd, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"));
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Dark, true, L"WM_SETTINGCHANGE switches effective theme to Dark");
+        CHECK_EQ(wnd.GetPalette().bgColor, RGB(32, 32, 32), L"Dark BgColor token");
+        CHECK_EQ(wnd.GetPalette().selectedPillBg, RGB(55, 55, 55), L"Dark SelectedPillBg token");
+        CHECK_EQ(wnd.GetPalette().accentBarColor, RGB(251, 146, 60), L"Dark AccentBarColor token");
+
+        // Trigger WM_PAINT in Dark theme
+        SendMessageW(hWnd, WM_PAINT, 0, 0);
+
+        // Hide -> system switches back to Light while hidden -> Show() re-verifies effective theme
+        wnd.Hide();
+        CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(1);
+        wnd.Show(snap, { 120, 120 });
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Light, true, L"Show() re-evaluates theme missed while hidden");
+
+        // Force Dark / Force Light overrides FollowSystem
+        wnd.SetThemeMode(ThemeMode::Dark);
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Dark, true, L"Forced Dark overrides system Light");
+        wnd.SetThemeMode(ThemeMode::Light);
+        CHECK_EQ(wnd.GetEffectiveTheme() == ThemeMode::Light, true, L"Forced Light overrides system");
+
+        // Long query_code + long candidates + near bottom-right corner -> clamped strictly within monitor work area
+        HMONITOR hMon = MonitorFromPoint({ 120, 120 }, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(hMon, &mi);
+
+        CandidateDisplaySnapshot longSnap = snap;
+        longSnap.query_code = std::wstring(180, L'a');
+        longSnap.candidates = {
+            L"1. " + std::wstring(80, L'中'),
+            L"2. " + std::wstring(80, L'文'),
+            L"3. " + std::wstring(80, L'测')
+        };
+        POINT edgePt = { mi.rcWork.right - 10, mi.rcWork.bottom - 10 };
+        wnd.Show(longSnap, edgePt);
+
+        RECT wndRc{};
+        GetWindowRect(hWnd, &wndRc);
+        CHECK_EQ(wndRc.left >= mi.rcWork.left, true, L"Window left within monitor work area");
+        CHECK_EQ(wndRc.top >= mi.rcWork.top, true, L"Window top within monitor work area");
+        CHECK_EQ(wndRc.right <= mi.rcWork.right, true, L"Window right clamped within monitor work area");
+        CHECK_EQ(wndRc.bottom <= mi.rcWork.bottom, true, L"Window bottom clamped within monitor work area");
+
+        // Controls remain inside window client bounds
+        RECT clientRc{};
+        GetClientRect(hWnd, &clientRc);
+        CHECK_EQ(wnd.GetNextButtonRect().right <= clientRc.right, true, L"Paging buttons stay inside clamped window");
+        CHECK_EQ(wnd.GetManagerButtonRect().right <= clientRc.right, true, L"Manager button stays inside clamped window");
+
+        CCandidateWindow::SetSystemAppsUseLightThemeOverrideForTest(-1);
+        wnd.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+    }
+    std::wcout << L"[PASS] Verified: Stage 7.2 Light/Dark auto theming, WM_SETTINGCHANGE refresh, DPI layout & WorkArea clamping." << std::endl;
+
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
 }

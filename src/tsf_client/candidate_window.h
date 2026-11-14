@@ -35,6 +35,23 @@ enum class ThemeMode {
     Dark         = 2  // Force Dark palette
 };
 
+struct CandidateThemePalette {
+    COLORREF bgColor = RGB(255, 255, 255);
+    COLORREF borderColor = RGB(226, 232, 240);
+    COLORREF dividerColor = RGB(226, 232, 240);
+    COLORREF headerTextColor = RGB(100, 116, 139);
+    COLORREF headerMatchColor = RGB(14, 116, 144);
+    COLORREF candidateTextColor = RGB(30, 41, 59);
+    COLORREF reverseLookupColor = RGB(100, 116, 139);
+    COLORREF selectedPillBg = RGB(241, 245, 249);
+    COLORREF hoverPillBg = RGB(248, 250, 252);
+    COLORREF pressedPillBg = RGB(226, 232, 240);
+    COLORREF accentBarColor = RGB(249, 115, 22);
+    COLORREF arrowBtnEnabled = RGB(71, 85, 105);
+    COLORREF arrowBtnDisabled = RGB(203, 213, 225);
+    COLORREF btnHoverColor = RGB(14, 116, 144);
+};
+
 struct CandidateDisplaySnapshot {
     uint64_t session_id = 0;
     uint64_t context_id = 0;
@@ -117,6 +134,19 @@ public:
     bool IsPressedPrevButton() const { return m_isPressedPrevBtn; }
     bool IsPressedNextButton() const { return m_isPressedNextBtn; }
 
+    // Stage 7.2: Theme, DPI, layout & rounding helpers
+    void SetThemeMode(ThemeMode mode);
+    ThemeMode GetThemeMode() const { return m_themeMode; }
+    ThemeMode GetEffectiveTheme() const { return m_effectiveTheme; }
+    const CandidateThemePalette& GetPalette() const { return m_palette; }
+    void RefreshTheme(bool invalidate = true);
+    static void SetSystemAppsUseLightThemeOverrideForTest(int val); // -1 = registry, 0 = dark, 1 = light
+    static bool QuerySystemAppsUseLightTheme();
+    static CandidateThemePalette BuildPalette(ThemeMode effectiveTheme);
+    UINT GetCurrentDpi() const { return m_dpi; }
+    int ScaleDip(int dip) const { return MulDiv(dip, static_cast<int>(m_dpi), 96); }
+    bool IsUsingNativeRoundedCorners() const { return m_usingNativeRounding; }
+
     HWND GetHwnd() const { return m_hWnd; }
 
     static LONG GetClassRefCount();
@@ -124,13 +154,22 @@ public:
 private:
     bool EnsureWindow();
     void InitDefaultPlugins();
+    void RebuildFontsForDpi(UINT dpi);
+    UINT QueryDpiForPoint(POINT pt) const;
+    void ApplyWindowRounding(int width, int height);
     static LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
     HWND m_hWnd = nullptr;
+    UINT m_dpi = 96;
+    UINT m_fontDpi = 0;
     HFONT m_hFont = nullptr;
     HFONT m_hBoldFont = nullptr;
     HFONT m_hSubFont = nullptr;
     bool m_hasRegisteredClassRef = false;
+    ThemeMode m_themeMode = ThemeMode::FollowSystem;
+    ThemeMode m_effectiveTheme = ThemeMode::Light;
+    CandidateThemePalette m_palette{};
+    bool m_usingNativeRounding = false;
     CandidateDisplaySnapshot m_snapshot;
     POINT m_lastShowPt{0, 0};
     std::vector<std::wstring> m_candidates;
