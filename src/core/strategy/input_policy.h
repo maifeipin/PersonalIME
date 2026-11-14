@@ -70,6 +70,14 @@ struct InputPolicy {
         std::string timing = "always"; // "always" or "composition"
     } reverse_lookup;
 
+    // 7. Stage 7 UI & Host Compatibility Settings
+    std::string theme_mode = "follow_system"; // "follow_system", "light", "dark"
+    std::string preedit_display_mode = "always"; // "always", "compositionless_only", "disabled"
+    struct UnicodeInjectionConfig {
+        bool enabled = false;
+        std::vector<std::string> allowed_hosts;
+    } unicode_injection;
+
     // Helpers
     bool IsMethodEnabled(InputScheme scheme) const {
         for (const auto& m : method_configs) {

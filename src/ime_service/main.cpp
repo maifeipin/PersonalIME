@@ -13,6 +13,7 @@
 #include "../common/ime_guids.h"
 #include "../common/ipc_protocol.h"
 #include "../common/plugin_ipc_codec.h"
+#include "../common/stage7_settings_codec.h"
 #include "../core/engine/ime_engine.h"
 #include "../core/strategy/input_coordinator.h"
 #include "../core/types.h"
@@ -164,6 +165,13 @@ static uint32_t ComputeModeFlags(const ContextState& st) {
         uint32_t pluginRev = g_engine.GetPluginRepo()->GetRevision();
         flags |= IPC_STATUS_HAS_PLUGINS_REV;
         flags |= (pluginRev & 0xFFu) << IPC_PLUGINS_REV_SHIFT;
+    }
+    if (g_engine.GetCoordinator()) {
+        auto pol = g_engine.GetCoordinator()->GetPolicySnapshot();
+        if (pol) {
+            flags |= IPC_STATUS_HAS_POLICY_REV;
+            flags |= (pol->revision & 0x7u) << IPC_POLICY_REV_SHIFT;
+        }
     }
     return flags;
 }
@@ -1154,6 +1162,15 @@ void HandleClient(HANDLE hPipe) {
                 std::vector<ime::PluginRecord> plugins;
                 if (g_engine.GetPluginRepo()->GetAllPlugins(plugins, true)) {
                     ime::EncodePluginsToIpcResponse(plugins, g_engine.GetPluginRepo()->GetRevision(), resp);
+                }
+            }
+        }
+        else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
+            resp.status_flags = ComputeModeFlags(state);
+            if (g_engine.GetCoordinator()) {
+                auto pol = g_engine.GetCoordinator()->GetPolicySnapshot();
+                if (pol) {
+                    ime::EncodeStage7SettingsToIpcResponse(*pol, resp);
                 }
             }
         }

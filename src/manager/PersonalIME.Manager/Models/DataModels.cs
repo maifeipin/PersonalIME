@@ -180,6 +180,15 @@ public class InputPolicyConfig
     [JsonPropertyName("reverse_lookup")]
     public ReverseLookupConfig ReverseLookup { get; set; } = new();
 
+    [JsonPropertyName("theme_mode")]
+    public string ThemeMode { get; set; } = "follow_system";
+
+    [JsonPropertyName("preedit_display_mode")]
+    public string PreeditDisplayMode { get; set; } = "always";
+
+    [JsonPropertyName("unicode_injection")]
+    public UnicodeInjectionConfig UnicodeInjection { get; set; } = new();
+
     [JsonPropertyName("input_method_order")]
     public List<string> MethodPriorities { get; set; } = [
         InputSchemes.Wubi86,
@@ -241,6 +250,15 @@ public class ReverseLookupConfig
 
     [JsonPropertyName("timing")]
     public string Timing { get; set; } = "always";
+}
+
+public class UnicodeInjectionConfig
+{
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = false;
+
+    [JsonPropertyName("allowed_hosts")]
+    public List<string> AllowedHosts { get; set; } = [];
 }
 
 public class ReverseLookupResultItem

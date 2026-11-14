@@ -495,6 +495,19 @@ bool IpcClient::GetPlugins(uint64_t sessionId, uint64_t contextId, std::vector<C
     return true;
 }
 
+bool IpcClient::GetStage7Settings(uint64_t sessionId, uint64_t contextId, ime::Stage7SettingsPayload& outSettings) {
+    IpcKeyRequest req{};
+    req.msg_type = static_cast<uint32_t>(IpcMsgType::GetStage7Settings);
+    req.session_id = sessionId;
+    req.context_id = contextId;
+    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+    IpcKeyResponse resp{};
+    if (!SendRequest(req, resp, 30) || resp.handled != 1) {
+        return false;
+    }
+    return ime::DecodeStage7SettingsFromIpcResponse(resp, outSettings);
+}
+
 bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs) {
     DrainOrphanQueue();
 

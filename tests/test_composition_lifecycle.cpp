@@ -3654,6 +3654,49 @@ int TestStage71dUnicodeInjectionChannel() {
     return 0;
 }
 
+static int TestStage74SettingsCodecAndHostGating() {
+    std::wcout << L"[TEST] Stage 7.4 Settings Codec & Per-Host Unicode Injection Gating..." << std::endl;
+
+    ime::InputPolicy pol;
+    pol.revision = 42;
+    pol.theme_mode = "dark";
+    pol.preedit_display_mode = "compositionless_only";
+    pol.unicode_injection.enabled = true;
+    pol.unicode_injection.allowed_hosts = {"SearchApp.exe", "SearchHost.exe"};
+
+    IpcKeyResponse resp{};
+    ime::EncodeStage7SettingsToIpcResponse(pol, resp);
+    CHECK_EQUAL(resp.handled, 1u, L"Encoded Stage7 settings handled=1");
+    CHECK_EQUAL(resp.has_commit, 0u, L"Encoded Stage7 settings has_commit=0");
+
+    ime::Stage7SettingsPayload decoded;
+    CHECK_TRUE(ime::DecodeStage7SettingsFromIpcResponse(resp, decoded), L"DecodeStage7SettingsFromIpcResponse succeeds");
+    CHECK_EQUAL(decoded.revision, 42u, L"Decoded revision == 42");
+    CHECK_TRUE(decoded.theme_mode == "dark", L"Decoded theme_mode == dark");
+    CHECK_TRUE(decoded.preedit_display_mode == "compositionless_only", L"Decoded preedit_display_mode == compositionless_only");
+    CHECK_TRUE(decoded.unicode_injection_enabled, L"Decoded unicode_injection_enabled == true");
+    CHECK_EQUAL(decoded.unicode_allowed_hosts.size(), static_cast<size_t>(2), L"Decoded 2 allowed hosts");
+    CHECK_TRUE(decoded.unicode_allowed_hosts[0] == L"searchapp.exe", L"Normalized host 0 lowercase");
+
+    CTextInputProcessor tip;
+    tip.ApplyStage7Settings(decoded);
+
+    tip.SetHostProcessNameOverrideForTest(L"SEARCHHOST.EXE");
+    CHECK_TRUE(tip.IsUnicodeInjectionAllowedForHost(), L"Case-insensitive host match allowed");
+
+    tip.SetHostProcessNameOverrideForTest(L"notepad.exe");
+    CHECK_TRUE(!tip.IsUnicodeInjectionAllowedForHost(), L"Non-allowlisted host blocked");
+
+    // Empty allowlist under policy filter must block even if enabled=true
+    decoded.unicode_allowed_hosts.clear();
+    tip.ApplyStage7Settings(decoded);
+    tip.SetHostProcessNameOverrideForTest(L"SearchApp.exe");
+    CHECK_TRUE(!tip.IsUnicodeInjectionAllowedForHost(), L"Empty allowlist with policy filter blocks injection");
+
+    std::wcout << L"[PASS] Stage 7.4 Settings Codec & Per-Host Unicode Injection Gating verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -3679,6 +3722,7 @@ int main() {
     if (TestStage71bReviewFixes() != 0) return 1;
     if (TestStage71cRequestFenceAndWalRecovery() != 0) return 1;
     if (TestStage71dUnicodeInjectionChannel() != 0) return 1;
+    if (TestStage74SettingsCodecAndHostGating() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;

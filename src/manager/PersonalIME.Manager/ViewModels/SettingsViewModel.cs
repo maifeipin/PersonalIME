@@ -27,6 +27,11 @@ public class SettingsViewModel : ViewModelBase
     private string _reverseLookupShuangpinLayout = ShuangpinLayouts.Natural;
     private string _reverseLookupTiming = "always";
 
+    private string _themeMode = "follow_system";
+    private string _preeditDisplayMode = "always";
+    private bool _unicodeInjectionEnabled = false;
+    private string _unicodeAllowedHostsText = string.Empty;
+
     private bool _isLoading;
     public bool IsLoaded { get; private set; }
 
@@ -43,6 +48,18 @@ public class SettingsViewModel : ViewModelBase
     ];
 
     public string[] AvailableLayouts { get; } = ShuangpinLayouts.All;
+
+    public KeyValuePair<string, string>[] AvailableThemeModes { get; } = [
+        new("follow_system", "跟随系统 (Win11 浅色/深色)"),
+        new("light", "始终浅色 (Light)"),
+        new("dark", "始终深色 (Dark)")
+    ];
+
+    public KeyValuePair<string, string>[] AvailablePreeditDisplayModes { get; } = [
+        new("always", "始终显示 Preedit Header"),
+        new("compositionless_only", "仅无组合宿主显示"),
+        new("disabled", "隐藏 Preedit Header")
+    ];
 
     public bool MixedInputEnabled
     {
@@ -152,6 +169,30 @@ public class SettingsViewModel : ViewModelBase
         set => SetProperty(ref _reverseLookupEnabled, value);
     }
 
+    public string ThemeMode
+    {
+        get => _themeMode;
+        set => SetProperty(ref _themeMode, value);
+    }
+
+    public string PreeditDisplayMode
+    {
+        get => _preeditDisplayMode;
+        set => SetProperty(ref _preeditDisplayMode, value);
+    }
+
+    public bool UnicodeInjectionEnabled
+    {
+        get => _unicodeInjectionEnabled;
+        set => SetProperty(ref _unicodeInjectionEnabled, value);
+    }
+
+    public string UnicodeAllowedHostsText
+    {
+        get => _unicodeAllowedHostsText;
+        set => SetProperty(ref _unicodeAllowedHostsText, value);
+    }
+
     public string ReverseLookupTargetMethod
     {
         get => _reverseLookupTargetMethod;
@@ -247,6 +288,29 @@ public class SettingsViewModel : ViewModelBase
                 ReverseLookupTargetMethod = policy.ReverseLookup.TargetMethod ?? InputSchemes.Wubi86;
                 ReverseLookupShuangpinLayout = ShuangpinLayouts.Canonicalize(policy.ReverseLookup.ShuangpinLayout);
                 ReverseLookupTiming = policy.ReverseLookup.Timing ?? "always";
+            }
+
+            ThemeMode = policy.ThemeMode switch
+            {
+                "light" or "dark" or "follow_system" => policy.ThemeMode,
+                _ => "follow_system"
+            };
+            PreeditDisplayMode = policy.PreeditDisplayMode switch
+            {
+                "always" or "compositionless_only" or "disabled" => policy.PreeditDisplayMode,
+                _ => "always"
+            };
+            if (policy.UnicodeInjection != null)
+            {
+                UnicodeInjectionEnabled = policy.UnicodeInjection.Enabled;
+                UnicodeAllowedHostsText = policy.UnicodeInjection.AllowedHosts != null
+                    ? string.Join(", ", policy.UnicodeInjection.AllowedHosts.Where(h => !string.IsNullOrWhiteSpace(h)))
+                    : string.Empty;
+            }
+            else
+            {
+                UnicodeInjectionEnabled = false;
+                UnicodeAllowedHostsText = string.Empty;
             }
 
             if (policy.MethodPriorities != null && policy.MethodPriorities.Count > 0)
@@ -381,6 +445,13 @@ public class SettingsViewModel : ViewModelBase
                     ShuangpinLayout = ShuangpinLayouts.Canonicalize(ReverseLookupShuangpinLayout),
                     Timing = ReverseLookupTiming
                 },
+                ThemeMode = ThemeMode,
+                PreeditDisplayMode = PreeditDisplayMode,
+                UnicodeInjection = new UnicodeInjectionConfig
+                {
+                    Enabled = UnicodeInjectionEnabled,
+                    AllowedHosts = ParseAllowedHosts(UnicodeAllowedHostsText)
+                },
                 MethodPriorities = MethodPriorities.Select(m => m.Scheme).ToList(),
                 EnabledInputMethods = MethodPriorities.Where(m => m.IsEnabled).Select(m => m.Scheme).ToList(),
                 InputMethods = MethodPriorities.Select(m => new InputMethodConfigItem
@@ -423,6 +494,19 @@ public class SettingsViewModel : ViewModelBase
         {
             IsLoading = false;
         }
+    }
+
+    private static List<string> ParseAllowedHosts(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return [];
+        }
+        return text
+            .Split([',', ';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(h => !string.IsNullOrWhiteSpace(h) && !h.Contains('|'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 }
 

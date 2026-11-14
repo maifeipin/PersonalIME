@@ -17,6 +17,7 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
 
             <!-- Header & Revision -->
@@ -206,8 +207,45 @@
                 </StackPanel>
             </Border>
 
-            <!-- Card 5: Reserved Features (Directive 8) -->
-            <Border Grid.Row="5" Background="#F1F3F5" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="8" Padding="16" Margin="0,0,0,16">
+            <!-- Card 5: 外观与宿主兼容性设置 (Stage 7) -->
+            <Border Grid.Row="5" Background="White" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="8" Padding="16" Margin="0,0,0,16">
+                <StackPanel>
+                    <TextBlock Text="候选窗外观与宿主兼容性设置 (Stage 7)" FontSize="14" FontWeight="Bold" Margin="0,0,0,8"/>
+                    <TextBlock Text="配置候选窗明暗主题、Preedit Header 编码栏展示时机，以及针对无组合提交宿主的可选 Unicode 注入白名单（默认关闭）。" Foreground="#666666" FontSize="12" Margin="0,0,0,12"/>
+
+                    <Grid Margin="0,0,0,12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="160"/>
+                            <ColumnDefinition Width="230"/>
+                            <ColumnDefinition Width="40"/>
+                            <ColumnDefinition Width="160"/>
+                            <ColumnDefinition Width="220"/>
+                        </Grid.ColumnDefinitions>
+
+                        <TextBlock Grid.Column="0" Text="候选窗主题模式: " VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <ComboBox Grid.Column="1" ItemsSource="{Binding AvailableThemeModes}" SelectedValuePath="Key" DisplayMemberPath="Value" SelectedValue="{Binding ThemeMode}" Height="28"/>
+
+                        <TextBlock Grid.Column="3" Text="Preedit Header 模式: " VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <ComboBox Grid.Column="4" ItemsSource="{Binding AvailablePreeditDisplayModes}" SelectedValuePath="Key" DisplayMemberPath="Value" SelectedValue="{Binding PreeditDisplayMode}" Height="28"/>
+                    </Grid>
+
+                    <CheckBox Content="启用无组合宿主 Unicode 兼容注入通道 (默认关闭，仅对下方白名单进程生效)" IsChecked="{Binding UnicodeInjectionEnabled}" FontWeight="SemiBold" Margin="0,0,0,8"/>
+                    <Grid IsEnabled="{Binding UnicodeInjectionEnabled}">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="160"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="允许注入的宿主进程: " VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <StackPanel Grid.Column="1">
+                            <TextBox Text="{Binding UnicodeAllowedHostsText, UpdateSourceTrigger=PropertyChanged}" Height="28" VerticalContentAlignment="Center" Padding="6,0"/>
+                            <TextBlock Text="使用逗号或分号分隔进程名，例如: SearchApp.exe, SearchHost.exe" Foreground="#868E96" FontSize="11" Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <!-- Card 6: Reserved Features (Directive 8) -->
+            <Border Grid.Row="6" Background="#F1F3F5" BorderBrush="#D0D7DE" BorderThickness="1" CornerRadius="8" Padding="16" Margin="0,0,0,16">
                 <StackPanel>
                     <TextBlock Text="高级扩展功能（保留预留项，当前版本未激活）" FontSize="14" FontWeight="Bold" Foreground="#495057" Margin="0,0,0,8"/>
                     <TextBlock Text="注：以下功能严格遵循规范预留，本轮暂不启用或展示为已生效能力。" Foreground="#868E96" FontSize="12" Margin="0,0,0,12"/>
@@ -230,7 +268,7 @@
             </Border>
 
             <!-- Bottom Actions -->
-            <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right">
+            <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button Content="重新加载" Command="{Binding LoadPolicyCommand}" Padding="16,8" Margin="0,0,12,0"/>
                 <Button Content="保存配置 (并发保护)" Command="{Binding SavePolicyCommand}" Background="#0066CC" Foreground="White" FontWeight="Bold" Padding="20,8"/>
             </StackPanel>

@@ -90,6 +90,86 @@ bool CTextInputProcessor::TrySyncPluginsFromServer(uint64_t contextId, uint32_t 
     return true;
 }
 
+void CTextInputProcessor::SetUnicodeInjectionAllowedHosts(const std::vector<std::wstring>& hosts, bool filterActive) {
+    m_unicodeHostFilterActive = filterActive;
+    m_unicodeAllowedHosts.clear();
+    m_unicodeAllowedHosts.reserve(hosts.size());
+    for (const auto& h : hosts) {
+        std::wstring norm = ime::NormalizeProcessNameLower(h);
+        if (!norm.empty()) {
+            m_unicodeAllowedHosts.push_back(std::move(norm));
+        }
+    }
+}
+
+void CTextInputProcessor::SetHostProcessNameOverrideForTest(const std::wstring& name) {
+    m_hostProcessNameOverride = ime::NormalizeProcessNameLower(name);
+}
+
+bool CTextInputProcessor::IsUnicodeInjectionAllowedForHost() const {
+    if (!m_unicodeInjectionEnabled) {
+        return false;
+    }
+    if (!m_unicodeHostFilterActive) {
+        return true;
+    }
+    if (m_unicodeAllowedHosts.empty()) {
+        return false;
+    }
+    std::wstring currentHost = m_hostProcessNameOverride;
+    if (currentHost.empty()) {
+        wchar_t exePath[MAX_PATH]{};
+        DWORD len = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            return false;
+        }
+        std::filesystem::path p(exePath);
+        currentHost = ime::NormalizeProcessNameLower(p.filename().wstring());
+    }
+    for (const auto& allowed : m_unicodeAllowedHosts) {
+        if (currentHost == allowed) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CTextInputProcessor::ApplyStage7Settings(const ime::Stage7SettingsPayload& settings) {
+    if (settings.theme_mode == "light") {
+        m_candidateWindow.SetThemeMode(ThemeMode::Light);
+    } else if (settings.theme_mode == "dark") {
+        m_candidateWindow.SetThemeMode(ThemeMode::Dark);
+    } else {
+        m_candidateWindow.SetThemeMode(ThemeMode::FollowSystem);
+    }
+
+    if (settings.preedit_display_mode == "compositionless_only") {
+        m_candidateWindow.SetPreeditDisplayMode(PreeditDisplayMode::CompositionlessOnly);
+    } else if (settings.preedit_display_mode == "disabled") {
+        m_candidateWindow.SetPreeditDisplayMode(PreeditDisplayMode::Disabled);
+    } else {
+        m_candidateWindow.SetPreeditDisplayMode(PreeditDisplayMode::Always);
+    }
+
+    m_unicodeInjectionEnabled = settings.unicode_injection_enabled;
+    SetUnicodeInjectionAllowedHosts(settings.unicode_allowed_hosts, true);
+    m_hasSyncedStage7Settings = true;
+    m_syncedPolicyFullRevision = settings.revision;
+    m_syncedPolicyRevTag = settings.revision & 0x7u;
+}
+
+bool CTextInputProcessor::TrySyncStage7SettingsFromServer(uint64_t contextId, uint32_t advRevTag, bool force) {
+    if (!force && m_hasSyncedStage7Settings && advRevTag == m_syncedPolicyRevTag) {
+        return true;
+    }
+    ime::Stage7SettingsPayload settings;
+    if (!m_ipcClient.GetStage7Settings(m_sessionId, contextId, settings)) {
+        return false;
+    }
+    ApplyStage7Settings(settings);
+    return true;
+}
+
 void CTextInputProcessor::OpenManagerFromTray() {
     // Grant permission for the manager to be brought to the foreground
     AllowSetForegroundWindow(ASFW_ANY);
@@ -898,7 +978,7 @@ bool CTextInputProcessor::IsUnicodeInjectionEligiblePrecheck(
     const std::shared_ptr<EditRequestControlBlock>& cb,
     ITfContext* pContext) const
 {
-    if (!m_unicodeInjectionEnabled || !m_ipcClient.IsStage7Capable()) {
+    if (!IsUnicodeInjectionAllowedForHost() || !m_ipcClient.IsStage7Capable()) {
         return false;
     }
     if (!cb || !cb->was_compositionless || cb->commit_text.empty() || cb->commit_event_id == 0) {
@@ -945,8 +1025,8 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
     if (IsInEditSession()) {
         return InjectionOutcome::NotAttempted;
     }
-    // 1. Default OFF; requires explicit opt-in and Stage 7 capable server.
-    if (!m_unicodeInjectionEnabled || !m_ipcClient.IsStage7Capable()) {
+    // 1. Default OFF; requires explicit opt-in (and host allowlist match when policy-configured) and Stage 7 capable server.
+    if (!IsUnicodeInjectionAllowedForHost() || !m_ipcClient.IsStage7Capable()) {
         return InjectionOutcome::NotAttempted;
     }
     // 2. Only eligible for unmodified, non-RecoveryBlocked, pure compositionless rounds.
@@ -1715,6 +1795,9 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     }
 
     m_ipcClient.NegotiateStage7Capability(m_sessionId);
+    if (m_ipcClient.IsStage7Capable()) {
+        TrySyncStage7SettingsFromServer(0, 0, true);
+    }
     RecoverReceiptsFromWal();
 
     return S_OK;
@@ -2407,6 +2490,12 @@ bool CTextInputProcessor::ProcessKeyInternal(
     if (sentOk) {
         if (!resp.handled) {
             return false;
+        }
+        if ((resp.status_flags & IPC_STATUS_HAS_POLICY_REV) != 0) {
+            uint32_t advPolicyRevTag = (resp.status_flags & IPC_POLICY_REV_MASK) >> IPC_POLICY_REV_SHIFT;
+            if (!m_hasSyncedStage7Settings || advPolicyRevTag != m_syncedPolicyRevTag) {
+                TrySyncStage7SettingsFromServer(contextId, advPolicyRevTag, false);
+            }
         }
         uint64_t currentInputGen = AdvanceContextInputGeneration(contextId);
         uint64_t currentEpoch = EnsureContextEpoch(contextId);

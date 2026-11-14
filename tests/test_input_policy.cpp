@@ -1874,6 +1874,66 @@ void TestSentenceReceiptImmutabilityAndConcurrency(InputCoordinator& coordinator
     std::cout << "  [PASS] Test 24 Sentence Receipt Immutability, Normalization & Concurrency verified!" << std::endl;
 }
 
+static void TestStage7PolicyJsonRoundtripAndValidation() {
+    std::cout << "[TEST] Testing Stage 7 Policy JSON Roundtrip & Validation..." << std::endl;
+
+    InputPolicy def;
+    AssertCondition(def.theme_mode == "follow_system", "Default theme_mode is follow_system");
+    AssertCondition(def.preedit_display_mode == "always", "Default preedit_display_mode is always");
+    AssertCondition(!def.unicode_injection.enabled, "Default unicode_injection.enabled is false");
+    AssertCondition(def.unicode_injection.allowed_hosts.empty(), "Default unicode_injection.allowed_hosts is empty");
+
+    // Roundtrip with custom Stage 7 settings
+    InputPolicy custom;
+    custom.revision = 7;
+    custom.theme_mode = "dark";
+    custom.preedit_display_mode = "compositionless_only";
+    custom.unicode_injection.enabled = true;
+    custom.unicode_injection.allowed_hosts = {"SearchApp.exe", "SearchHost.exe"};
+
+    auto j = InputPolicyToJson(custom);
+    InputPolicy parsed;
+    std::string err;
+    AssertCondition(InputPolicyFromJson(j, parsed, &err), "InputPolicyFromJson succeeds for Stage 7 settings: " + err);
+    AssertCondition(parsed.theme_mode == "dark", "Parsed theme_mode == dark");
+    AssertCondition(parsed.preedit_display_mode == "compositionless_only", "Parsed preedit_display_mode == compositionless_only");
+    AssertCondition(parsed.unicode_injection.enabled == true, "Parsed unicode_injection.enabled == true");
+    AssertCondition(parsed.unicode_injection.allowed_hosts.size() == 2 &&
+                    parsed.unicode_injection.allowed_hosts[0] == "SearchApp.exe" &&
+                    parsed.unicode_injection.allowed_hosts[1] == "SearchHost.exe",
+                    "Parsed allowed_hosts matches");
+
+    // Backward-compatible legacy JSON without Stage 7 fields keeps defaults
+    auto jLegacy = j;
+    jLegacy.erase("theme_mode");
+    jLegacy.erase("preedit_display_mode");
+    jLegacy.erase("unicode_injection");
+    InputPolicy parsedLegacy;
+    AssertCondition(InputPolicyFromJson(jLegacy, parsedLegacy, &err), "Legacy JSON without Stage 7 fields parses cleanly");
+    AssertCondition(parsedLegacy.theme_mode == "follow_system" &&
+                    parsedLegacy.preedit_display_mode == "always" &&
+                    !parsedLegacy.unicode_injection.enabled &&
+                    parsedLegacy.unicode_injection.allowed_hosts.empty(),
+                    "Legacy JSON defaults preserved");
+
+    // Invalid theme_mode rejected
+    auto jBadTheme = j;
+    jBadTheme["theme_mode"] = "neon";
+    AssertCondition(!InputPolicyFromJson(jBadTheme, parsed, &err), "Invalid theme_mode rejected");
+
+    // Invalid preedit_display_mode rejected
+    auto jBadPreedit = j;
+    jBadPreedit["preedit_display_mode"] = "sometimes";
+    AssertCondition(!InputPolicyFromJson(jBadPreedit, parsed, &err), "Invalid preedit_display_mode rejected");
+
+    // Invalid host entry (empty / delimiter) rejected
+    auto jBadHost = j;
+    jBadHost["unicode_injection"]["allowed_hosts"] = {"SearchApp.exe", ""};
+    AssertCondition(!InputPolicyFromJson(jBadHost, parsed, &err), "Empty host in allowed_hosts rejected");
+
+    std::cout << "  [PASS] Stage 7 Policy JSON Roundtrip & Validation verified!" << std::endl;
+}
+
 // Main Test Runner
 // -----------------------------------------------------------------------------
 int main() {
@@ -1929,6 +1989,7 @@ int main() {
     TestDynamicSmartMacroExpansion(coordinator, repo);
     TestContinuousSentenceAndAutoPhraseLearning(coordinator, repo);
     TestSentenceReceiptImmutabilityAndConcurrency(coordinator, repo, db, clock);
+    TestStage7PolicyJsonRoundtripAndValidation();
 
     db.Close();
     std::filesystem::remove(testDb);

@@ -259,5 +259,54 @@ public class SettingsViewModelTests
         Assert.AreEqual("composition", savedConfig.ReverseLookup.Timing);
         Assert.AreEqual(BannerType.Success, banner.Type);
     }
+
+    [TestMethod]
+    public async Task TestStage7SettingsLoadAndSaveRoundtrip()
+    {
+        var mock = new MockAdminClient();
+        var banner = new NotificationBanner();
+
+        mock.OnGetPolicy = (ct) => Task.FromResult(new InputPolicyConfig
+        {
+            Revision = 12,
+            ThemeMode = "dark",
+            PreeditDisplayMode = "compositionless_only",
+            UnicodeInjection = new UnicodeInjectionConfig
+            {
+                Enabled = true,
+                AllowedHosts = ["SearchApp.exe", "SearchHost.exe"]
+            }
+        });
+
+        InputPolicyConfig? savedConfig = null;
+        mock.OnSavePolicy = (cfg, expRev, ct) =>
+        {
+            savedConfig = cfg;
+            return Task.FromResult(expRev + 1);
+        };
+
+        var vm = new SettingsViewModel(mock, banner);
+        await vm.LoadPolicyAsync();
+
+        Assert.AreEqual("dark", vm.ThemeMode);
+        Assert.AreEqual("compositionless_only", vm.PreeditDisplayMode);
+        Assert.IsTrue(vm.UnicodeInjectionEnabled);
+        Assert.AreEqual("SearchApp.exe, SearchHost.exe", vm.UnicodeAllowedHostsText);
+
+        vm.ThemeMode = "light";
+        vm.PreeditDisplayMode = "disabled";
+        vm.UnicodeInjectionEnabled = false;
+        vm.UnicodeAllowedHostsText = "SearchApp.exe; notepad.exe, SearchApp.exe";
+
+        await vm.SavePolicyAsync();
+
+        Assert.IsNotNull(savedConfig);
+        Assert.AreEqual("light", savedConfig.ThemeMode);
+        Assert.AreEqual("disabled", savedConfig.PreeditDisplayMode);
+        Assert.IsFalse(savedConfig.UnicodeInjection.Enabled);
+        CollectionAssert.AreEqual(
+            new[] { "SearchApp.exe", "notepad.exe" },
+            savedConfig.UnicodeInjection.AllowedHosts);
+    }
 }
 

@@ -110,6 +110,31 @@ inline bool ValidateInputPolicy(const InputPolicy& p, std::string* errorOut = nu
         return false;
     }
 
+    if (p.theme_mode != "follow_system" && p.theme_mode != "light" && p.theme_mode != "dark") {
+        if (errorOut) *errorOut = "theme_mode must be 'follow_system', 'light', or 'dark'";
+        return false;
+    }
+
+    if (p.preedit_display_mode != "always" &&
+        p.preedit_display_mode != "compositionless_only" &&
+        p.preedit_display_mode != "disabled") {
+        if (errorOut) *errorOut = "preedit_display_mode must be 'always', 'compositionless_only', or 'disabled'";
+        return false;
+    }
+
+    for (const auto& host : p.unicode_injection.allowed_hosts) {
+        if (host.empty()) {
+            if (errorOut) *errorOut = "unicode_injection.allowed_hosts cannot contain empty host names";
+            return false;
+        }
+        for (unsigned char ch : host) {
+            if (ch < 0x20 || ch == '|' || ch == ';') {
+                if (errorOut) *errorOut = "unicode_injection.allowed_hosts contains invalid characters";
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -166,6 +191,13 @@ inline nlohmann::json InputPolicyToJson(const InputPolicy& policy) {
         {"target_method", InputSchemeToString(policy.reverse_lookup.target_method)},
         {"shuangpin_layout", ShuangpinLayoutToString(policy.reverse_lookup.shuangpin_layout)},
         {"timing", policy.reverse_lookup.timing}
+    };
+
+    j["theme_mode"] = policy.theme_mode;
+    j["preedit_display_mode"] = policy.preedit_display_mode;
+    j["unicode_injection"] = {
+        {"enabled", policy.unicode_injection.enabled},
+        {"allowed_hosts", policy.unicode_injection.allowed_hosts}
     };
 
     return j;
@@ -557,6 +589,51 @@ inline bool InputPolicyFromJson(const nlohmann::json& j, InputPolicy& policy, st
                     return false;
                 }
                 p.reverse_lookup.timing = tm;
+            }
+        }
+
+        if (j.contains("theme_mode")) {
+            if (!j["theme_mode"].is_string()) {
+                if (errorOut) *errorOut = "Field 'theme_mode' must be a string";
+                return false;
+            }
+            p.theme_mode = j["theme_mode"].get<std::string>();
+        }
+
+        if (j.contains("preedit_display_mode")) {
+            if (!j["preedit_display_mode"].is_string()) {
+                if (errorOut) *errorOut = "Field 'preedit_display_mode' must be a string";
+                return false;
+            }
+            p.preedit_display_mode = j["preedit_display_mode"].get<std::string>();
+        }
+
+        if (j.contains("unicode_injection")) {
+            const auto& ui = j["unicode_injection"];
+            if (!ui.is_object()) {
+                if (errorOut) *errorOut = "Field 'unicode_injection' must be an object";
+                return false;
+            }
+            if (ui.contains("enabled")) {
+                if (!ui["enabled"].is_boolean()) {
+                    if (errorOut) *errorOut = "Field 'unicode_injection.enabled' must be a boolean";
+                    return false;
+                }
+                p.unicode_injection.enabled = ui["enabled"].get<bool>();
+            }
+            if (ui.contains("allowed_hosts")) {
+                if (!ui["allowed_hosts"].is_array()) {
+                    if (errorOut) *errorOut = "Field 'unicode_injection.allowed_hosts' must be an array";
+                    return false;
+                }
+                p.unicode_injection.allowed_hosts.clear();
+                for (const auto& item : ui["allowed_hosts"]) {
+                    if (!item.is_string()) {
+                        if (errorOut) *errorOut = "Each item in 'unicode_injection.allowed_hosts' must be a string";
+                        return false;
+                    }
+                    p.unicode_injection.allowed_hosts.push_back(item.get<std::string>());
+                }
             }
         }
 

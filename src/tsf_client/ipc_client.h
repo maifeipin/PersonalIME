@@ -3,6 +3,7 @@
 #include <memory>
 #include <atomic>
 #include "../common/ipc_protocol.h"
+#include "../common/stage7_settings_codec.h"
 #include "../core/types.h"
 #include "candidate_window.h"
 
@@ -40,6 +41,7 @@ public:
     bool ExecutePlugin(uint64_t sessionId, uint64_t contextId, uint32_t pluginId, uint32_t* outExecStatus = nullptr);
     bool GetPlugins(uint64_t sessionId, uint64_t contextId, std::vector<CandidatePluginItem>& outPlugins,
                     bool* outTruncated = nullptr, uint32_t* outRevision = nullptr);
+    bool GetStage7Settings(uint64_t sessionId, uint64_t contextId, ime::Stage7SettingsPayload& outSettings);
     void Disconnect();
 
     struct AsyncIoOperation {

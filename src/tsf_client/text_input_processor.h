@@ -390,6 +390,11 @@ public:
     // Stage 7.1d: Optional Unicode SendInput compatibility channel (default OFF)
     void SetUnicodeInjectionEnabled(bool enabled) { m_unicodeInjectionEnabled = enabled; }
     bool IsUnicodeInjectionEnabled() const { return m_unicodeInjectionEnabled; }
+    void SetUnicodeInjectionAllowedHosts(const std::vector<std::wstring>& hosts, bool filterActive = true);
+    void SetHostProcessNameOverrideForTest(const std::wstring& name);
+    bool IsUnicodeInjectionAllowedForHost() const;
+    void ApplyStage7Settings(const ime::Stage7SettingsPayload& settings);
+    bool TrySyncStage7SettingsFromServer(uint64_t contextId, uint32_t advRevTag, bool force = false);
     using SendInputOverrideFunc = std::function<UINT(UINT, LPINPUT, int)>;
     using TargetReverifyHookForTest = std::function<bool()>;
     void SetSendInputOverrideForTest(SendInputOverrideFunc fn) { m_sendInputOverride = std::move(fn); }
@@ -459,6 +464,9 @@ private:
     PluginQueryOverrideFunc m_pluginQueryOverride;
     PluginExecuteOverrideFunc m_pluginExecuteOverride;
     bool m_hasSyncedPlugins = false;
+    bool m_hasSyncedStage7Settings = false;
+    uint32_t m_syncedPolicyRevTag = 0;
+    uint32_t m_syncedPolicyFullRevision = 0;
     uint32_t m_syncedPluginsRevTag = 0;
     uint32_t m_syncedPluginsFullRevision = 0;
     bool m_lastPluginsTruncated = false;
@@ -516,6 +524,9 @@ private:
     uint64_t m_nextEditRequestId = 0;
 
     bool m_unicodeInjectionEnabled = false;
+    bool m_unicodeHostFilterActive = false;
+    std::vector<std::wstring> m_unicodeAllowedHosts;
+    std::wstring m_hostProcessNameOverride;
     bool m_bypassWindowCheckForTest = false;
     SendInputOverrideFunc m_sendInputOverride;
     TargetReverifyHookForTest m_targetReverifyHookForTest;

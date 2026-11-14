@@ -26,7 +26,8 @@ enum class IpcMsgType : uint32_t {
     ExecutePlugin     = 16, // Execute a registered plugin by ID (Stage 5 Extension)
     GetPlugins        = 17, // Fetch active plugins list (Stage 5 Extension)
     CommitTerminal    = 18, // Stage 7: Versioned idempotent commit finalization
-    QueryCommitStatus = 19  // Stage 7: Query persisted final disposition for commit_event_id
+    QueryCommitStatus = 19, // Stage 7: Query persisted final disposition for commit_event_id
+    GetStage7Settings = 20  // Stage 7.4: Fetch theme_mode, preedit_display_mode, and per-host unicode_injection
 };
 
 // Stage 7: Terminal commit disposition for idempotent finalization & WAL v2 recovery
@@ -96,8 +97,13 @@ enum IpcModeFlags : uint32_t {
     IPC_STATUS_STAGE7_CAPABLE  = 1 << 8,  // 1 = Server supports Stage 7 protocol (CommitTerminal / QueryCommitStatus / QueryCode)
     IPC_STATUS_CONFLICT_ERROR  = 1 << 9,  // 1 = CommitTerminal rejected due to mutually exclusive disposition conflict
     IPC_STATUS_HAS_QUERY_CODE  = 1 << 10, // 1 = When has_commit==0, commit_text carries segmented query_code for Preedit Header
-    IPC_STATUS_HAS_CAND_CORES  = 1 << 11  // 1 = Each candidates[i] carries (1 + core_len) wchar_t immediately after the label's NUL
+    IPC_STATUS_HAS_CAND_CORES  = 1 << 11, // 1 = Each candidates[i] carries (1 + core_len) wchar_t immediately after the label's NUL
+    IPC_STATUS_HAS_POLICY_REV  = 1 << 12  // 1 = status_flags bits 13..15 carry 3-bit policy revision tag
 };
+
+// Policy revision tag encoding in status_flags (bits 13..15)
+constexpr uint32_t IPC_POLICY_REV_SHIFT = 13;
+constexpr uint32_t IPC_POLICY_REV_MASK  = 0x0000E000;
 
 // Scheme encoding in status_flags (bits 16..23)
 constexpr uint32_t IPC_SCHEME_SHIFT = 16;
