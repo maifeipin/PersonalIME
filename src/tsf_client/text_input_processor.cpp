@@ -940,7 +940,11 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
     entry.disposition = static_cast<uint32_t>(disp);
     entry.hr = static_cast<int32_t>(hrFinal);
 
-    auto buildPendingReceipt = [&](bool resolvedInWal, bool ackedFromServer, IpcCommitDisposition ackedDisp) {
+    auto buildPendingReceipt = [&](bool resolvedInWal,
+                                   bool ackedFromServer,
+                                   IpcCommitDisposition ackedDisp,
+                                   bool serviceAckedInWal,
+                                   bool toggledEnglish) {
         PendingV2Receipt r{};
         r.owner_id = cb->owner_id;
         r.session_id = cb->session_id;
@@ -957,13 +961,16 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
         r.hr = entry.hr;
         r.has_resolved_in_wal = resolvedInWal;
         r.has_acked_from_server = ackedFromServer;
+        r.has_service_acked_in_wal = serviceAckedInWal;
+        r.toggle_chinese_after_commit = cb->toggle_chinese_after_commit;
+        r.has_toggled_english = toggledEnglish;
         return r;
     };
 
     if (!receipt_journal_v2::AppendResolved(entry)) {
         RecordWalFault(cb->commit_event_id, WalFaultStage::Resolved);
         SetContextState(contextId, CompositionState::Quarantined);
-        EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None));
+        EnqueuePendingV2Receipt(buildPendingReceipt(false, false, IpcCommitDisposition::None, false, false));
         return false;
     }
     cb->wal_resolved = true;
@@ -986,7 +993,16 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
         SetContextState(contextId, CompositionState::Quarantined);
         return false;
     }
+    bool toggledOk = !cb->toggle_chinese_after_commit;
     if (ok) {
+        if (cb->toggle_chinese_after_commit) {
+            toggledOk = TryCompletePostCommitEnglishToggle(
+                cb->session_id,
+                cb->context_id,
+                cb->owner_id,
+                cb->context_epoch,
+                finalDisp);
+        }
         entry.disposition = static_cast<uint32_t>(finalDisp);
         if (receipt_journal_v2::AppendServiceAck(entry)) {
             cb->wal_acked = true;
@@ -995,18 +1011,45 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
             RecordWalFault(cb->commit_event_id, WalFaultStage::ServiceAck);
         }
     }
-    if (!cb->wal_acked) {
-        EnqueuePendingV2Receipt(buildPendingReceipt(true, ok, ok ? finalDisp : IpcCommitDisposition::None));
-    }
-    if (ok && cb->toggle_chinese_after_commit &&
-        (finalDisp == IpcCommitDisposition::ConfirmedWritten ||
-         finalDisp == IpcCommitDisposition::DispatchedUnverified)) {
-        m_ipcClient.SetMode(cb->session_id, cb->context_id, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE);
-        if (m_pLangBarButton) {
-            m_pLangBarButton->UpdateStatus();
-        }
+    if (!cb->wal_acked || (cb->toggle_chinese_after_commit && !toggledOk)) {
+        EnqueuePendingV2Receipt(buildPendingReceipt(
+            true,
+            ok,
+            ok ? finalDisp : IpcCommitDisposition::None,
+            cb->wal_acked,
+            toggledOk));
     }
     return ok;
+}
+
+bool CTextInputProcessor::TryCompletePostCommitEnglishToggle(
+    uint64_t sessionId,
+    uint64_t contextId,
+    uint64_t ownerId,
+    uint32_t contextEpoch,
+    IpcCommitDisposition finalDisp)
+{
+    if (finalDisp != IpcCommitDisposition::ConfirmedWritten &&
+        finalDisp != IpcCommitDisposition::DispatchedUnverified) {
+        return true;
+    }
+    // Verify original TIP & context epoch ownership before mutating mode
+    if (ownerId != 0 && m_ownerInstanceId != 0 && ownerId != m_ownerInstanceId) {
+        return true;
+    }
+    if (contextEpoch != 0) {
+        auto epIt = m_contextEpochs.find(contextId);
+        if (epIt == m_contextEpochs.end() || epIt->second != contextEpoch) {
+            return true;
+        }
+    }
+    if (!m_ipcClient.SetMode(sessionId, contextId, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE)) {
+        return false;
+    }
+    if (m_pLangBarButton) {
+        m_pLangBarButton->UpdateStatus();
+    }
+    return true;
 }
 
 bool CTextInputProcessor::IsUnicodeInjectionEligiblePrecheck(
@@ -2322,28 +2365,43 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
         }
 
         if (it->has_acked_from_server) {
-            receipt_journal_v2::Entry ackEntry{};
-            ackEntry.owner_id = it->owner_id;
-            ackEntry.session_id = it->session_id;
-            ackEntry.context_id = it->context_id;
-            ackEntry.context_epoch = it->context_epoch;
-            ackEntry.input_generation = it->input_generation;
-            ackEntry.edit_request_id = it->edit_request_id;
-            ackEntry.commit_event_id = it->commit_event_id;
-            ackEntry.channel = it->channel;
-            ackEntry.text_len = it->text_len;
-            ackEntry.text_digest = it->text_digest;
-            ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
-            ackEntry.hr = it->hr;
-            if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
-                ClearAllWalFaultsForEvent(it->commit_event_id);
+            if (it->toggle_chinese_after_commit && !it->has_toggled_english) {
+                it->has_toggled_english = TryCompletePostCommitEnglishToggle(
+                    it->session_id,
+                    it->context_id,
+                    it->owner_id,
+                    it->context_epoch,
+                    it->acked_disp);
+            }
+            if (!it->has_service_acked_in_wal) {
+                receipt_journal_v2::Entry ackEntry{};
+                ackEntry.owner_id = it->owner_id;
+                ackEntry.session_id = it->session_id;
+                ackEntry.context_id = it->context_id;
+                ackEntry.context_epoch = it->context_epoch;
+                ackEntry.input_generation = it->input_generation;
+                ackEntry.edit_request_id = it->edit_request_id;
+                ackEntry.commit_event_id = it->commit_event_id;
+                ackEntry.channel = it->channel;
+                ackEntry.text_len = it->text_len;
+                ackEntry.text_digest = it->text_digest;
+                ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
+                ackEntry.hr = it->hr;
+                if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
+                    it->has_service_acked_in_wal = true;
+                    ClearAllWalFaultsForEvent(it->commit_event_id);
+                    auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
+                    if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
+                        cbIt->second->wal_acked = true;
+                    }
+                }
+            }
+            if (it->has_service_acked_in_wal &&
+                (!it->toggle_chinese_after_commit || it->has_toggled_english)) {
                 uint64_t ctxId = it->context_id;
                 auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
-                if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {
-                    cbIt->second->wal_acked = true;
-                    if (!cbIt->second->unknown_pending) {
-                        m_activeRequestBlocks.erase(cbIt);
-                    }
+                if (cbIt != m_activeRequestBlocks.end() && cbIt->second && !cbIt->second->unknown_pending) {
+                    m_activeRequestBlocks.erase(cbIt);
                 }
                 it = m_pendingV2Receipts.erase(it);
                 RetireContextIfNoPotentialWriter(ctxId);

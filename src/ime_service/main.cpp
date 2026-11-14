@@ -512,6 +512,15 @@ void HandleClient(HANDLE hPipe) {
                                 pc.context_id,
                                 pc.policy_snapshot
                             );
+                        } else if (pc.entry_id.rfind("raw_", 0) == 0 || pc.entry_id.rfind("macro_", 0) == 0) {
+                            ok = g_engine.GetRepo() && g_engine.GetRepo()->RecordTransientCommitEvent(
+                                std::to_string(req.event_id),
+                                pc.session_id,
+                                pc.context_id,
+                                pc.scheme,
+                                pc.query_code,
+                                pc.entry_id
+                            );
                         } else {
                             ok = g_engine.CommitCandidate(
                                 std::to_string(req.event_id),
@@ -828,6 +837,15 @@ void HandleClient(HANDLE hPipe) {
                                 req.context_id,
                                 pc.policy_snapshot
                             );
+                        } else if (pc.entry_id.rfind("raw_", 0) == 0 || pc.entry_id.rfind("macro_", 0) == 0) {
+                            commitOk = g_engine.GetRepo()->RecordTransientCommitEvent(
+                                std::to_string(req.event_id),
+                                req.session_id,
+                                req.context_id,
+                                pc.scheme,
+                                pc.query_code,
+                                pc.entry_id
+                            );
                         } else {
                             commitOk = g_engine.CommitCandidate(
                                 std::to_string(req.event_id),
@@ -901,6 +919,7 @@ void HandleClient(HANDLE hPipe) {
 
                     if (outFinalDisp == static_cast<int>(IpcCommitDisposition::CancelRestore)) {
                         state.composition = pc.composition_before_commit;
+                        state.current_query_code = pc.query_code;
                         state.current_page = pc.page_before_commit;
                         PopulateCandidates(state, resp);
                         state.AdvanceGeneration();
@@ -1311,22 +1330,87 @@ void HandleClient(HANDLE hPipe) {
             else if ((vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) &&
                      (req.mode_arg & IPC_KEYDOWN_SHIFT_TAP) != 0) {
                 if (state.is_chinese && !state.composition.empty()) {
-                    // First confirm raw composition commit; client will toggle to English after commit settles
-                    SafeCopyCommitText(resp, state.composition);
-                    resp.commit_event_id = NextEventId();
-                    state.AdvanceGeneration();
-                    resp.candidate_version = state.input_generation;
-                    state.composition.clear();
-                    state.prev_composition.clear();
-                    state.current_query_code.clear();
-                    state.current_page = 0;
-                    state.has_paged = false;
-                    state.cached_coord_query = {};
-                    resp.status_flags = ComputeModeFlags(state);
-                    resp.has_composition = 1;
-                    resp.composition[0] = L'\0';
-                    resp.candidate_count = 0;
-                    resp.handled = 1;
+                    // First confirm raw composition commit via durable pending transaction (no learning);
+                    // client will toggle to English after commit settles.
+                    uint64_t evId = NextEventId();
+                    std::string rawCode = !state.current_query_code.empty()
+                        ? state.current_query_code
+                        : ime::WideToUtf8(state.composition);
+                    ime::Candidate rawCand;
+                    rawCand.scheme = state.scheme;
+                    rawCand.entry_id = "raw_shift_commit";
+                    rawCand.text = state.composition;
+                    rawCand.raw_code = rawCode;
+
+                    uint64_t nextGen = state.input_generation + 1;
+                    uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
+                    bool stage7Req = (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
+                    uint64_t ownerId = stage7Req ? reqOwnerId : (reqOwnerId != 0 ? reqOwnerId : req.session_id);
+                    bool saved = (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
+                                 g_engine.SavePendingCommit(
+                                     std::to_string(evId),
+                                     req.session_id,
+                                     req.context_id,
+                                     rawCand.scheme,
+                                     rawCode,
+                                     rawCand.entry_id,
+                                     rawCand.text,
+                                     false,
+                                     "",
+                                     "",
+                                     "",
+                                     req.context_epoch,
+                                     nextGen,
+                                     ownerId
+                                 );
+
+                    if (!saved) {
+                        resp.handled = 0;
+                        resp.has_commit = 0;
+                        resp.commit_event_id = 0;
+                        resp.commit_text[0] = L'\0';
+                        resp.commit_length = 0;
+                    } else {
+                        state.AdvanceGeneration();
+                        ServerPendingCommit pc;
+                        pc.event_id = evId;
+                        pc.session_id = req.session_id;
+                        pc.context_id = req.context_id;
+                        pc.connection_epoch = state.connection_epoch;
+                        pc.generation = state.input_generation;
+                        pc.context_epoch = req.context_epoch;
+                        pc.owner_instance_id = ownerId;
+                        pc.candidate = rawCand;
+                        pc.scheme = rawCand.scheme;
+                        pc.query_code = rawCode;
+                        pc.entry_id = rawCand.entry_id;
+                        pc.text = rawCand.text;
+                        pc.policy_snapshot = nullptr;
+                        pc.composition_before_commit = state.composition;
+                        pc.page_before_commit = state.current_page;
+                        pc.state = CommitState::Pending;
+                        pc.created_at = g_engine.GetClock() ? g_engine.GetClock()->Now() : 0;
+                        {
+                            std::lock_guard<std::mutex> lock(g_pendingMutex);
+                            g_pendingCommits[evId] = pc;
+                        }
+
+                        SafeCopyCommitText(resp, state.composition);
+                        resp.commit_event_id = evId;
+                        resp.candidate_version = static_cast<uint32_t>(pc.generation);
+                        state.composition.clear();
+                        state.prev_composition.clear();
+                        state.current_query_code.clear();
+                        state.current_page = 0;
+                        state.has_paged = false;
+                        state.cached_coord_query = {};
+                        state.policy_snapshot = nullptr;
+                        resp.status_flags = ComputeModeFlags(state);
+                        resp.has_composition = 1;
+                        resp.composition[0] = L'\0';
+                        resp.candidate_count = 0;
+                        resp.handled = 1;
+                    }
                 } else {
                     state.is_chinese = !state.is_chinese;
                     ResetContextCompositionAndState(state);
@@ -1780,9 +1864,7 @@ void HandleClient(HANDLE hPipe) {
         uint32_t preservedStageFlags = resp.status_flags & (
             IPC_STATUS_STAGE7_CAPABLE |
             IPC_STATUS_CONFLICT_ERROR |
-            IPC_STATUS_HAS_QUERY_CODE |
-            IPC_STATUS_TRUNCATED |
-            IPC_STATUS_ERROR
+            IPC_STATUS_HAS_QUERY_CODE
         );
         resp.status_flags = ComputeModeFlags(state) | preservedStageFlags;
         if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||

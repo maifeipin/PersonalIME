@@ -384,6 +384,7 @@ public:
     void ClearWalBarrierFaultForTest() { m_walFaultedEvents.clear(); }
     bool IsWalBarrierFaulted() const { return !m_walFaultedEvents.empty(); }
     size_t GetPendingV2ReceiptCountForTest() const { return m_pendingV2Receipts.size(); }
+    void DrainPendingV2ReceiptsForTest() { DrainPendingV2Receipts(true); }
     bool HasPendingObservationRequests() const;
     static bool IsOwnerInstanceAlive(uint64_t ownerId, uint64_t sessionId);
     std::shared_ptr<EditRequestControlBlock> GetRequestControlBlockForTest(uint64_t editRequestId) const;
@@ -509,6 +510,9 @@ private:
         int32_t hr = 0;
         bool has_resolved_in_wal = true;
         bool has_acked_from_server = false;
+        bool has_service_acked_in_wal = false;
+        bool toggle_chinese_after_commit = false;
+        bool has_toggled_english = false;
         int retry_count = 0;
         std::chrono::steady_clock::time_point next_retry{};
     };
@@ -548,6 +552,12 @@ private:
     };
     std::vector<PendingUnicodeInjection> m_pendingUnicodeInjections;
 
+    bool TryCompletePostCommitEnglishToggle(
+        uint64_t sessionId,
+        uint64_t contextId,
+        uint64_t ownerId,
+        uint32_t contextEpoch,
+        IpcCommitDisposition finalDisp);
     bool FinalizeStage7CommitForBlock(
         const std::shared_ptr<EditRequestControlBlock>& cb,
         IpcCommitDisposition disp,

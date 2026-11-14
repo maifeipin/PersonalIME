@@ -64,14 +64,31 @@ struct ServiceProcess {
     }
     bool Start(const std::string& dbPath, const std::string& dictDir, const std::string& pipeName = "", const std::string& adminPipeName = "") {
         std::wstring serviceExe = L"build\\Release\\ime-service.exe";
-        if (!std::filesystem::exists(serviceExe)) serviceExe = L"ime-service.exe";
+        if (const char* envExe = std::getenv("PERSONALIME_TEST_SERVICE_EXE")) {
+            if (*envExe) serviceExe = ime::Utf8ToWide(envExe);
+        } else if (!std::filesystem::exists(serviceExe)) {
+            serviceExe = L"ime-service.exe";
+        }
+
+        std::string effectivePipe = pipeName;
+        std::string effectiveAdminPipe = adminPipeName;
+        if (effectivePipe.empty()) {
+            if (const char* envPipe = std::getenv("PERSONALIME_TEST_PIPE")) {
+                if (*envPipe) {
+                    effectivePipe = envPipe;
+                    if (effectiveAdminPipe.empty()) {
+                        effectiveAdminPipe = effectivePipe + "_Admin";
+                    }
+                }
+            }
+        }
 
         std::wstring cmdLine = serviceExe + L" --db " + ime::Utf8ToWide(dbPath) + L" --dict " + ime::Utf8ToWide(dictDir);
-        if (!pipeName.empty()) {
-            cmdLine += L" --pipe " + ime::Utf8ToWide(pipeName);
+        if (!effectivePipe.empty()) {
+            cmdLine += L" --pipe " + ime::Utf8ToWide(effectivePipe);
         }
-        if (!adminPipeName.empty()) {
-            cmdLine += L" --admin-pipe " + ime::Utf8ToWide(adminPipeName);
+        if (!effectiveAdminPipe.empty()) {
+            cmdLine += L" --admin-pipe " + ime::Utf8ToWide(effectiveAdminPipe);
         }
         STARTUPINFOW si{};
         si.cb = sizeof(si);
@@ -109,7 +126,27 @@ int main(int argc, char* argv[]) {
 
     std::string testDb = "stage3_integration_test.db";
     std::string dictDir = "data/dictionaries";
-    bool stage71aOnly = (argc > 1 && std::string(argv[1]) == "--stage71a-only");
+    bool stage71aOnly = false;
+    std::string testPipeName;
+    if (const char* envPipe = std::getenv("PERSONALIME_TEST_PIPE")) {
+        if (*envPipe) testPipeName = envPipe;
+    }
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--stage71a-only") {
+            stage71aOnly = true;
+        } else if (arg == "--pipe" && i + 1 < argc) {
+            testPipeName = argv[++i];
+        }
+    }
+    std::wstring wideTestPipe;
+    if (!testPipeName.empty()) {
+        wideTestPipe = ime::Utf8ToWide(testPipeName);
+        if (wideTestPipe.rfind(L"\\\\.\\pipe\\", 0) != 0) {
+            wideTestPipe = L"\\\\.\\pipe\\" + wideTestPipe;
+        }
+        IpcClient::SetPipeNameForTest(wideTestPipe.c_str());
+    }
     if (!stage71aOnly) {
 
     // Clean up previous test database if present
@@ -140,7 +177,8 @@ int main(int argc, char* argv[]) {
     }
 
     ServiceProcess service;
-    CHECK_TRUE(service.Start(testDb, dictDir), L"Failed to start ime-service");
+    std::string testAdminPipeName = testPipeName.empty() ? "" : (testPipeName + "_Admin");
+    CHECK_TRUE(service.Start(testDb, dictDir, testPipeName, testAdminPipeName), L"Failed to start ime-service");
     std::wcout << L"[PASS] Connected to live ime-service!" << std::endl;
 
     IpcClient client;
@@ -720,7 +758,10 @@ int main(int argc, char* argv[]) {
         req.vk_code = VK_ESCAPE;
         client.SendRequest(req, resp, 80);
 
-        // 2b. CapsLock (VK_CAPITAL) passes through to OS; Shift-tap commits raw composition, and Ctrl+Space switches to English
+        // 2b. CapsLock (VK_CAPITAL) passes through to OS; Shift-tap commits raw composition via Stage 7 pending tx
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        req.context_epoch = 1;
+        SetIpcRequestOwnerInstanceId(req, 7001);
         req.modifiers = 0;
         req.vk_code = 'H'; client.SendRequest(req, resp, 80);
         req.vk_code = 'I'; client.SendRequest(req, resp, 80);
@@ -737,7 +778,8 @@ int main(int argc, char* argv[]) {
         CHECK_EQUAL(resp.handled, 0, L"VK_CAPITAL KeyDown must pass through (handled = 0)");
         CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"VK_CAPITAL must preserve Chinese mode");
 
-        // Shift-tap with active composition commits raw 'hi' first (keeping Chinese until client settles commit)
+        // Shift-tap with active composition -> CancelRestore restores 'hi' and keeps Chinese mode
+        int hiStatsBefore = QueryStatsCount(testDb, "hi");
         req.vk_code = VK_SHIFT;
         req.mode_arg = IPC_KEYDOWN_SHIFT_TAP;
         client.SendRequest(req, resp, 80);
@@ -749,8 +791,43 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition cleared after committing raw input");
         CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Chinese mode preserved until commit settles");
 
+        IpcCommitDisposition termDisp = IpcCommitDisposition::None;
+        bool termConflict = false;
+        IpcKeyResponse termResp{};
+        CHECK_TRUE(client.NotifyCommitTerminal(
+                       100, ctx, resp.commit_event_id,
+                       IpcCommitDisposition::CancelRestore,
+                       req.context_epoch, resp.candidate_version, 7001,
+                       termDisp, termConflict, &termResp),
+                   L"CommitTerminal(CancelRestore) for raw Shift commit must succeed");
+        CHECK_TRUE(!termConflict, L"CancelRestore must not conflict");
+        CHECK_EQUAL(static_cast<int>(termDisp), static_cast<int>(IpcCommitDisposition::CancelRestore),
+                    L"CancelRestore disposition confirmed");
+        CHECK_TRUE(wcscmp(termResp.composition, L"hi") == 0, L"CancelRestore restores raw composition 'hi'");
+
+        // Now Shift-tap again and settle with ConfirmedWritten (must NOT trigger learning stats)
+        req.vk_code = VK_SHIFT;
+        req.mode_arg = IPC_KEYDOWN_SHIFT_TAP;
+        client.SendRequest(req, resp, 80);
+        req.mode_arg = 0;
+        CHECK_EQUAL(resp.has_commit, 1, L"Second Shift-tap commits restored 'hi'");
+        CHECK_TRUE(resp.commit_event_id != 0, L"Second Shift-tap allocates commit_event_id");
+        CHECK_TRUE(client.NotifyCommitTerminal(
+                       100, ctx, resp.commit_event_id,
+                       IpcCommitDisposition::ConfirmedWritten,
+                       req.context_epoch, resp.candidate_version, 7001,
+                       termDisp, termConflict, &termResp),
+                   L"CommitTerminal(ConfirmedWritten) for raw Shift commit must succeed");
+        CHECK_TRUE(!termConflict, L"ConfirmedWritten must not conflict");
+        CHECK_EQUAL(static_cast<int>(termDisp), static_cast<int>(IpcCommitDisposition::ConfirmedWritten),
+                    L"ConfirmedWritten disposition confirmed");
+        CHECK_EQUAL(QueryStatsCount(testDb, "hi"), hiStatsBefore, L"Raw Shift commit must NOT trigger word-frequency learning");
+
         // Client settles commit via SetMode -> English mode
-        CHECK_TRUE(client.SetMode(sessionId, ctxId, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE), L"SetMode to English succeeds");
+        CHECK_TRUE(client.SetMode(100, ctx, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE), L"SetMode to English succeeds");
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE4;
+        req.context_epoch = 0;
+        SetIpcRequestOwnerInstanceId(req, 0);
 
         // 2c. Verify English half-width passes through to Windows and English full-width respects Shift XOR CapsLock
         req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
@@ -764,7 +841,7 @@ int main(int argc, char* argv[]) {
         CHECK_EQUAL(resp.handled, 0, L"KeyDown for 'A' in English half-width mode must pass through");
 
         // English full-width: 4 combinations of (Shift, CapsLock)
-        CHECK_TRUE(client.SetMode(sessionId, ctxId, IPC_MODE_FULL_WIDTH, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
+        CHECK_TRUE(client.SetMode(100, ctx, IPC_MODE_FULL_WIDTH, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
                    L"SetMode to Full-width succeeds");
         req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
         req.vk_code = 'A';
@@ -785,7 +862,7 @@ int main(int argc, char* argv[]) {
         client.SendRequest(req, resp, 80);
         CHECK_TRUE(wcscmp(resp.commit_text, L"\uFF41") == 0, L"Full-width Shift=1 Caps=1 -> lowercase a");
         req.modifiers = 0;
-        CHECK_TRUE(client.SetMode(sessionId, ctxId, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
+        CHECK_TRUE(client.SetMode(100, ctx, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
                    L"Restore Half-width succeeds");
 
         // Shortcuts like Ctrl+C must NOT be handled (pass through to OS)

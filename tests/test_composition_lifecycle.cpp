@@ -3829,6 +3829,8 @@ static int TestShiftTapAndCapsLockDispatchChain() {
     int toggleCalls = 0;
     int setModeCalls = 0;
     bool lastSetModeChinese = true;
+    int failCommitTerminalCount = 0;
+    int failSetModeCount = 0;
     uint64_t nextEventId = 100;
 
     std::atomic<bool> stopServer{false};
@@ -3862,14 +3864,26 @@ static int TestShiftTapAndCapsLockDispatchChain() {
                     if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
                         resp.handled = 1;
                     } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::SetMode)) {
-                        ++setModeCalls;
-                        if (req.update_mask & IPC_UPDATE_CHINESE) {
-                            isChinese = (req.mode_arg & IPC_MODE_CHINESE) != 0;
-                            lastSetModeChinese = isChinese;
+                        if (failSetModeCount > 0) {
+                            --failSetModeCount;
+                            resp.handled = 0;
+                        } else {
+                            ++setModeCalls;
+                            if (req.update_mask & IPC_UPDATE_CHINESE) {
+                                isChinese = (req.mode_arg & IPC_MODE_CHINESE) != 0;
+                                lastSetModeChinese = isChinese;
+                            }
+                            resp.handled = 1;
                         }
-                        resp.handled = 1;
                     } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
-                        resp.handled = 1;
+                        if (failCommitTerminalCount > 0) {
+                            --failCommitTerminalCount;
+                            resp.handled = 0;
+                        } else {
+                            resp.commit_event_id = req.event_id;
+                            resp.commit_length = req.mode_arg;
+                            resp.handled = 1;
+                        }
                     } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::TestKeyDown)) {
                         if (req.vk_code == VK_CAPITAL) {
                             resp.handled = 0;
@@ -4001,14 +4015,16 @@ static int TestShiftTapAndCapsLockDispatchChain() {
     CHECK_TRUE(isChinese, L"CapsLock preserves Chinese mode");
 
     // 9. Active composition + commit FAILURE keeps composition and Chinese mode
-    ctx.m_failSetText = true;
+    ctx.m_forceSyncBlocked = true;
+    ctx.m_failAsyncRequest = true;
     int prevSetMode = setModeCalls;
     dispatchKeyDown(VK_LSHIFT, 0);
     dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
     CHECK_EQUAL(tuEaten, TRUE, L"Shift-tap with composition routes to OnKeyUp");
     CHECK_EQUAL(setModeCalls, prevSetMode, L"Failed commit must NOT call SetMode to switch to English");
     CHECK_TRUE(isChinese, L"Failed commit preserves Chinese mode");
-    ctx.m_failSetText = false;
+    ctx.m_failAsyncRequest = false;
+    ctx.m_forceSyncBlocked = false;
 
     // 10. Active composition + commit SUCCESS settles commit and switches to English
     {
@@ -4019,6 +4035,44 @@ static int TestShiftTapAndCapsLockDispatchChain() {
     dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
     CHECK_EQUAL(setModeCalls, prevSetMode + 1, L"Confirmed commit calls SetMode to switch to English");
     CHECK_TRUE(!isChinese && !lastSetModeChinese, L"Confirmed commit completes switch to English");
+
+    // 11. Transient CommitTerminal failure -> retry via DrainPendingV2Receipts completes switch to English
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        isChinese = true;
+        lastSetModeChinese = true;
+        comp = L"cd";
+        failCommitTerminalCount = 1;
+    }
+    prevSetMode = setModeCalls;
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(setModeCalls, prevSetMode, L"Mode must remain Chinese while CommitTerminal is pending retry");
+    CHECK_TRUE(isChinese, L"Still Chinese before CommitTerminal retry succeeds");
+    CHECK_TRUE(tip.GetPendingV2ReceiptCountForTest() >= 1, L"PendingV2Receipt queued for CommitTerminal retry");
+    tip.DrainPendingV2ReceiptsForTest();
+    CHECK_EQUAL(setModeCalls, prevSetMode + 1, L"Retry CommitTerminal success triggers SetMode to English");
+    CHECK_TRUE(!isChinese && !lastSetModeChinese, L"Mode switched to English after CommitTerminal retry");
+    CHECK_EQUAL(tip.GetPendingV2ReceiptCountForTest(), static_cast<size_t>(0), L"PendingV2Receipt drained after retry");
+
+    // 12. Transient SetMode failure -> PendingV2Receipt stays queued and completes switch to English on retry
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        isChinese = true;
+        lastSetModeChinese = true;
+        comp = L"ef";
+        failSetModeCount = 1;
+    }
+    prevSetMode = setModeCalls;
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(setModeCalls, prevSetMode, L"Initial SetMode failure does not increment setModeCalls");
+    CHECK_TRUE(isChinese, L"Mode remains Chinese when SetMode fails transiently");
+    CHECK_TRUE(tip.GetPendingV2ReceiptCountForTest() >= 1, L"PendingV2Receipt retained for SetMode retry");
+    tip.DrainPendingV2ReceiptsForTest();
+    CHECK_EQUAL(setModeCalls, prevSetMode + 1, L"Retry SetMode completes switch to English");
+    CHECK_TRUE(!isChinese && !lastSetModeChinese, L"Mode switched to English after SetMode retry");
+    CHECK_EQUAL(tip.GetPendingV2ReceiptCountForTest(), static_cast<size_t>(0), L"PendingV2Receipt drained after SetMode retry");
 
     tip.Deactivate();
     stopServer.store(true);

@@ -1339,9 +1339,9 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
                                        uint64_t sessionId,
                                        uint64_t contextId,
                                        std::shared_ptr<const InputPolicy> policySnapshot) {
-    if (candidate.entry_id.rfind("macro_", 0) == 0) {
-        // Dynamic smart macros expand transiently and do not require repository learning or stats,
-        // but MUST still finalize the WAL pending_commits / commit_events receipt!
+    if (candidate.entry_id.rfind("macro_", 0) == 0 || candidate.entry_id.rfind("raw_", 0) == 0) {
+        // Dynamic smart macros and raw composition commits expand transiently and do not require
+        // repository learning or stats, but MUST still finalize the WAL pending_commits / commit_events receipt!
         return m_repo.RecordTransientCommitEvent(eventId, sessionId, contextId,
                                                  candidate.scheme, candidate.raw_code, candidate.entry_id);
     }
