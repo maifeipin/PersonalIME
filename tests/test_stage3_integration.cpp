@@ -2184,15 +2184,41 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore applied");
         CHECK_TRUE(wcscmp(cancelResp.composition, L"yyyy") == 0, L"Composition restored to 'yyyy'");
 
-        // Simulate lost ACK and retry CancelRestore
-        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+        // Simulate lost ACK and retry CancelRestore: must succeed idempotently AND return restored composition
+        IpcKeyResponse cancelRetryResp{};
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, cancelEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict, &cancelRetryResp),
                    L"Idempotent CancelRestore retry succeeds");
         CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelRestore, L"CancelRestore retry preserves disposition without conflict");
+        CHECK_TRUE(wcscmp(cancelRetryResp.composition, L"yyyy") == 0, L"CancelRestore retry returns restored composition");
 
         // Clear restored composition
         keyReq.vk_code = VK_ESCAPE;
         keyReq.candidate_version = 0;
         CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Esc clears restored composition");
+
+        // 20.2b CancelRestore downgraded to CancelDiscard (when new input occurred), plus idempotent retry
+        for (char ch : { 'Y', 'Y', 'Y', 'Y' }) {
+            keyReq.vk_code = ch;
+            keyReq.candidate_version = 0;
+            CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'y' for downgraded CancelRestore");
+        }
+        keyReq.vk_code = '1';
+        keyReq.candidate_version = keyResp.candidate_version;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Select candidate 1 for downgraded CancelRestore");
+        uint64_t downgradeEvtId = keyResp.commit_event_id;
+        // Advance context generation by typing 'A' and Esc so CancelRestore must downgrade to CancelDiscard
+        keyReq.vk_code = 'A';
+        keyReq.candidate_version = 0;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Type 'a' to advance generation");
+        keyReq.vk_code = VK_ESCAPE;
+        CHECK_TRUE(client.SendRequest(keyReq, keyResp, 200), L"Esc clears 'a'");
+
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+                   L"Downgraded CancelRestore -> CancelDiscard succeeds");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelDiscard, L"Downgraded disposition is CancelDiscard");
+        CHECK_TRUE(client.NotifyCommitTerminal(sid, cid, downgradeEvtId, IpcCommitDisposition::CancelRestore, ctxEpoch, outDisp, outConflict),
+                   L"Retry of downgraded CancelRestore succeeds idempotently");
+        CHECK_TRUE(!outConflict && outDisp == IpcCommitDisposition::CancelDiscard, L"Retry of downgraded CancelRestore returns CancelDiscard without conflict");
 
         // 20.3 Restart fidelity: create pending commit with context_epoch=555, restart service, verify epoch check + finalization
         uint32_t restartEpoch = 555;

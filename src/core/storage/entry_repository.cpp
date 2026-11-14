@@ -689,9 +689,9 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
         uint64_t existingOwner = static_cast<uint64_t>(stmtCheck->ColumnInt64(6));
 
         if (existingSid != sessionId || existingCid != contextId ||
-            (expectedContextEpoch != 0 && existingEpoch != 0 && expectedContextEpoch != existingEpoch) ||
-            (expectedInputGeneration != 0 && existingGen != 0 && expectedInputGeneration != existingGen) ||
-            (expectedOwnerInstanceId != 0 && existingOwner != 0 && expectedOwnerInstanceId != existingOwner)) {
+            (expectedContextEpoch != 0 && expectedContextEpoch != existingEpoch) ||
+            (expectedInputGeneration != 0 && expectedInputGeneration != existingGen) ||
+            (expectedOwnerInstanceId != 0 && expectedOwnerInstanceId != existingOwner)) {
             outConflict = true;
             outFinalDisposition = existingDisp;
             tx.Rollback();
@@ -699,7 +699,9 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
         }
         if (existingDisp != 0) {
             outFinalDisposition = existingDisp;
-            if (existingDisp == requestedDisposition) {
+            // Idempotent if exact match, or if client retried CancelRestore (2) on an event downgraded to CancelDiscard (3)
+            if (existingDisp == requestedDisposition ||
+                (requestedDisposition == 2 && existingDisp == 3)) {
                 return tx.Commit();
             }
             outConflict = true;
@@ -748,9 +750,9 @@ bool EntryRepository::FinalizeTerminalCommitEvent(const std::string& eventId, ui
     ownerId = static_cast<uint64_t>(stmtPend->ColumnInt64(4));
 
     if (pSid != sessionId || pCid != contextId ||
-        (expectedContextEpoch != 0 && ctxEpoch != 0 && expectedContextEpoch != ctxEpoch) ||
-        (expectedInputGeneration != 0 && inputGen != 0 && expectedInputGeneration != inputGen) ||
-        (expectedOwnerInstanceId != 0 && ownerId != 0 && expectedOwnerInstanceId != ownerId)) {
+        (expectedContextEpoch != 0 && expectedContextEpoch != ctxEpoch) ||
+        (expectedInputGeneration != 0 && expectedInputGeneration != inputGen) ||
+        (expectedOwnerInstanceId != 0 && expectedOwnerInstanceId != ownerId)) {
         outConflict = true;
         tx.Rollback();
         return false;

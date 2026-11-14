@@ -97,6 +97,7 @@ struct CompletedCommitInfo {
     CommitState state = CommitState::Recorded;
     int final_disposition = 0;
     uint64_t context_epoch = 0;
+    uint64_t input_generation = 0;
     uint64_t owner_instance_id = 0;
 };
 
@@ -681,6 +682,7 @@ void HandleClient(HANDLE hPipe) {
                                 : static_cast<int>(IpcCommitDisposition::CancelDiscard);
                         }
                         completedInfo.context_epoch = rec.context_epoch;
+                        completedInfo.input_generation = rec.input_generation;
                         completedInfo.owner_instance_id = rec.owner_instance_id;
                         g_completedEvents[req.event_id] = completedInfo;
                         if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {
@@ -692,20 +694,28 @@ void HandleClient(HANDLE hPipe) {
                 if (hasCompleted) {
                     bool ownerMatch = (completedInfo.session_id == req.session_id &&
                                        completedInfo.context_id == req.context_id &&
-                                       (completedInfo.owner_instance_id == 0 || completedInfo.owner_instance_id == expectedOwnerId) &&
-                                       (completedInfo.context_epoch == 0 || req.context_epoch == 0 || completedInfo.context_epoch == req.context_epoch));
+                                       (expectedOwnerId == 0 || completedInfo.owner_instance_id == expectedOwnerId) &&
+                                       (req.context_epoch == 0 || completedInfo.context_epoch == req.context_epoch) &&
+                                       (expectedInputGen == 0 || completedInfo.input_generation == expectedInputGen));
                     int existingDisp = completedInfo.final_disposition;
                     if (existingDisp == 0) {
                         existingDisp = (completedInfo.state == CommitState::Recorded)
                             ? static_cast<int>(IpcCommitDisposition::ConfirmedWritten)
                             : static_cast<int>(IpcCommitDisposition::CancelDiscard);
                     }
-                    if (!ownerMatch || existingDisp != static_cast<int>(reqDisp)) {
+                    bool dispCompatible = (existingDisp == static_cast<int>(reqDisp)) ||
+                                          (reqDisp == static_cast<uint32_t>(IpcCommitDisposition::CancelRestore) &&
+                                           existingDisp == static_cast<int>(IpcCommitDisposition::CancelDiscard));
+                    if (!ownerMatch || !dispCompatible) {
                         resp.handled = 0;
                         resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
                         resp.commit_event_id = req.event_id;
                         resp.commit_length = static_cast<uint32_t>(existingDisp);
                     } else {
+                        if (existingDisp == static_cast<int>(IpcCommitDisposition::CancelRestore) &&
+                            !state.composition.empty()) {
+                            PopulateCandidates(state, resp);
+                        }
                         resp.commit_event_id = req.event_id;
                         resp.commit_length = static_cast<uint32_t>(existingDisp);
                         resp.handled = 1;
@@ -727,9 +737,9 @@ void HandleClient(HANDLE hPipe) {
                 ServerPendingCommit pc = it->second;
                 if (pc.session_id != req.session_id ||
                     pc.context_id != req.context_id ||
-                    (pc.owner_instance_id != 0 && pc.owner_instance_id != expectedOwnerId) ||
-                    (pc.context_epoch != 0 && req.context_epoch != 0 && pc.context_epoch != req.context_epoch) ||
-                    (expectedInputGen != 0 && pc.generation != 0 && pc.generation != expectedInputGen)) {
+                    (expectedOwnerId != 0 && pc.owner_instance_id != expectedOwnerId) ||
+                    (req.context_epoch != 0 && pc.context_epoch != req.context_epoch) ||
+                    (expectedInputGen != 0 && pc.generation != expectedInputGen)) {
                     resp.handled = 0;
                     resp.status_flags |= IPC_STATUS_CONFLICT_ERROR;
                     WriteFile(hPipe, &resp, sizeof(resp), &bytesWritten, nullptr);
@@ -836,6 +846,7 @@ void HandleClient(HANDLE hPipe) {
                         cState,
                         outFinalDisp,
                         pc.context_epoch != 0 ? pc.context_epoch : req.context_epoch,
+                        pc.generation,
                         pc.owner_instance_id != 0 ? pc.owner_instance_id : expectedOwnerId
                     };
                     if (g_completedEvents.size() > MAX_COMPLETED_EVENTS) {

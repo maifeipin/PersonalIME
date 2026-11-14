@@ -887,6 +887,9 @@ static bool IsContextReadOnly(ITfContext* pic) {
 STDMETHODIMP CTextInputProcessor::OnSetFocus(BOOL fForeground) {
     m_hasFocus = (fForeground != FALSE);
     if (!fForeground) {
+        if (m_activeContextId != 0) {
+            AdvanceContextEpoch(m_activeContextId);
+        }
         m_candidateWindow.Hide();
         SuppressAllQueuedEditSessions(true);
         if (m_pCompositionContext) {
@@ -930,6 +933,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
     req.session_id = m_sessionId;
     req.context_id = reinterpret_cast<uint64_t>(pic);
+    req.context_epoch = static_cast<uint32_t>(EnsureContextEpoch(contextId));
     req.vk_code = static_cast<uint32_t>(wParam);
     req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
     req.modifiers = 0;
@@ -1137,8 +1141,12 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 }
             }
         }
+        if (m_activeContextId != 0) {
+            AdvanceContextEpoch(m_activeContextId);
+        }
         m_activeContextId = contextId;
     }
+    EnsureContextEpoch(contextId);
     m_hasFocus = true;
     m_isDeactivated = false;
 
@@ -1198,6 +1206,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
     req.session_id = m_sessionId;
     req.context_id = contextId;
+    req.context_epoch = static_cast<uint32_t>(EnsureContextEpoch(contextId));
     req.vk_code = static_cast<uint32_t>(wParam);
     req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
     req.modifiers = 0;
@@ -1228,6 +1237,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
         if (!resp.handled) {
             return false;
         }
+        AdvanceContextInputGeneration(contextId);
 
         if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
             m_latestServerCandidateVersions[contextId] = resp.candidate_version;
