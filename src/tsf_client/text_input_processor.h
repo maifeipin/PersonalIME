@@ -5,6 +5,7 @@
 #include <vector>
 #include <map>
 #include <chrono>
+#include <wrl/client.h>
 #include "candidate_window.h"
 #include "ipc_client.h"
 
@@ -52,7 +53,8 @@ enum class EditSessionResult {
 class CTextInputProcessor : 
     public ITfTextInputProcessorEx,
     public ITfKeyEventSink,
-    public ITfCompositionSink {
+    public ITfCompositionSink,
+    public ITfDisplayAttributeProvider {
 public:
     CTextInputProcessor();
     ~CTextInputProcessor();
@@ -78,17 +80,49 @@ public:
     // ITfCompositionSink
     STDMETHODIMP OnCompositionTerminated(TfEditCookie ecWrite, ITfComposition* pComposition) override;
 
+    // ITfDisplayAttributeProvider
+    STDMETHODIMP EnumDisplayAttributeInfo(IEnumTfDisplayAttributeInfo** ppEnum) override;
+    STDMETHODIMP GetDisplayAttributeInfo(REFGUID guid, ITfDisplayAttributeInfo** ppInfo) override;
+    TfGuidAtom GetDisplayAttributeAtom() const { return m_displayAttributeAtom; }
+    void SetDisplayAttributeAtomForTest(TfGuidAtom atom) { m_displayAttributeAtom = atom; }
+
     // Context-scoped composition helpers
     TfClientId GetClientId() const { return m_tfClientId; }
     ITfComposition* GetComposition(ITfContext* pContext) const {
         return (m_pCompositionContext == pContext) ? m_pComposition : nullptr;
     }
     CompositionState GetCompositionState(ITfContext* pContext) const {
-        return (m_pCompositionContext == pContext) ? m_compState : CompositionState::None;
+        if (m_pCompositionContext == pContext && m_compState != CompositionState::None) {
+            return m_compState;
+        }
+        return GetContextState(reinterpret_cast<uint64_t>(pContext));
     }
-    void SetCompositionState(CompositionState state) { m_compState = state; }
+    void SetCompositionState(CompositionState state) {
+        m_compState = state;
+        if (m_compositionContextId != 0) {
+            SetContextState(m_compositionContextId, state);
+        }
+    }
     void SetComposition(ITfComposition* pComp, ITfContext* pContext, CompositionState state = CompositionState::Composing);
     bool TerminateCompositionOnHost(ITfContext* pContextOverride = nullptr);
+
+    // Stage 7: Compositionless mode & lifecycle helpers
+    uint64_t EnsureContextEpoch(uint64_t contextId);
+    uint64_t GetContextEpoch(uint64_t contextId) const;
+    uint64_t AdvanceContextEpoch(uint64_t contextId);
+    uint64_t GetContextInputGeneration(uint64_t contextId) const;
+    uint64_t AdvanceContextInputGeneration(uint64_t contextId);
+    CompositionState GetContextState(uint64_t contextId) const;
+    void SetContextState(uint64_t contextId, CompositionState state);
+    CandidateWindowMode GetContextMode(uint64_t contextId) const;
+    void SetContextMode(uint64_t contextId, CandidateWindowMode mode);
+    void EnterCompositionlessMode(ITfContext* pContext);
+    void ExitCompositionlessMode(uint64_t contextId);
+    bool HasCompositionlessLease(uint64_t contextId, ITfContext* pContext) const;
+    void ResetCompositionlessContext(uint64_t contextId, bool advanceEpoch, bool resetServer);
+    void ResetAllCompositionlessContexts(bool resetServer);
+    bool ResolveAnchorPointForContext(ITfContext* pContext, TfEditCookie ec, ITfRange* pRange, bool hasValidEditCookie, POINT* outPt);
+    void CacheContextAnchorPoint(uint64_t contextId, uint64_t epoch, uint64_t viewId, POINT pt);
 
     enum class PendingTerminationStatus {
         PendingSync,
@@ -350,18 +384,20 @@ private:
 
     // Stage 7: Per-context ownership, lifecycle epochs, input generations & compositionless states
     uint64_t m_ownerInstanceId = 0;
+    TfGuidAtom m_displayAttributeAtom = TF_INVALID_GUIDATOM;
     std::map<uint64_t, uint64_t> m_contextEpochs;
     std::map<uint64_t, uint64_t> m_contextInputGenerations;
     std::map<uint64_t, CompositionState> m_contextStates;
     std::map<uint64_t, CandidateWindowMode> m_contextModes;
+    std::map<uint64_t, Microsoft::WRL::ComPtr<ITfContext>> m_compositionlessContextLeases;
 
-    uint64_t EnsureContextEpoch(uint64_t contextId);
-    uint64_t GetContextEpoch(uint64_t contextId) const;
-    uint64_t AdvanceContextEpoch(uint64_t contextId);
-    uint64_t GetContextInputGeneration(uint64_t contextId) const;
-    uint64_t AdvanceContextInputGeneration(uint64_t contextId);
-    CompositionState GetContextState(uint64_t contextId) const;
-    void SetContextState(uint64_t contextId, CompositionState state);
+    struct CachedAnchorPoint {
+        uint64_t contextEpoch = 0;
+        uint64_t viewId = 0;
+        POINT pt{0, 0};
+        bool valid = false;
+    };
+    std::map<uint64_t, CachedAnchorPoint> m_cachedAnchors;
 
     bool ProcessKeyInternal(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten,
                             bool hasExplicitVersion, uint32_t explicitCandidateVersion);

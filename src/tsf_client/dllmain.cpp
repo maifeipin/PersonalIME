@@ -151,6 +151,9 @@ STDAPI DllRegisterServer() {
     if (SUCCEEDED(hr)) {
         hr = pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, CLSID_PersonalIME);
     }
+    if (SUCCEEDED(hr)) {
+        hr = pCatMgr->RegisterCategory(CLSID_PersonalIME, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, CLSID_PersonalIME);
+    }
     pCatMgr->Release();
     if (FAILED(hr)) {
         if (SUCCEEDED(hrCo)) CoUninitialize();
@@ -172,6 +175,7 @@ STDAPI DllUnregisterServer() {
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIP_KEYBOARD, CLSID_PersonalIME);
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, CLSID_PersonalIME);
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT, CLSID_PersonalIME);
+        pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_DISPLAYATTRIBUTEPROVIDER, CLSID_PersonalIME);
         // Idempotently clean up historical input mode compartment category if registered by prior versions
         pCatMgr->UnregisterCategory(CLSID_PersonalIME, GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, CLSID_PersonalIME);
         pCatMgr->Release();

@@ -1,6 +1,7 @@
 #include "text_input_processor.h"
 #include "lang_bar_item.h"
 #include "edit_session.h"
+#include "display_attribute.h"
 #include "globals.h"
 #include "../common/ime_guids.h"
 #include <wrl/client.h>
@@ -27,11 +28,13 @@ CTextInputProcessor::CTextInputProcessor() {
     m_candidateWindow.SetOnOpenManager([this]() {
         // Cleanly terminate in-progress composition so host document has no stray underline
         TerminateCompositionOnHost();
+        ResetAllCompositionlessContexts(true);
         OpenManagerFromTray();
     });
 
     m_candidateWindow.SetOnExecutePlugin([this](const CandidatePluginItem& item) {
         TerminateCompositionOnHost();
+        ResetAllCompositionlessContexts(true);
         AllowSetForegroundWindow(ASFW_ANY);
         uint32_t execStatus = 0;
         bool ok = false;
@@ -147,6 +150,7 @@ CTextInputProcessor::~CTextInputProcessor() {
     StopDrainTimer();
     UninitKeyEventSink();
     SetComposition(nullptr, nullptr, CompositionState::None);
+    ResetAllCompositionlessContexts(false);
     m_pendingTerminations.clear();
 
     if (m_pLangBarButton) {
@@ -163,9 +167,13 @@ CTextInputProcessor::~CTextInputProcessor() {
 
 void CTextInputProcessor::SetComposition(ITfComposition* pComp, ITfContext* pContext, CompositionState state) {
     if (m_pComposition == pComp && m_pCompositionContext == pContext) {
-        m_compState = state;
+        m_compState = (pComp != nullptr) ? state : CompositionState::None;
+        if (m_compositionContextId != 0) {
+            SetContextState(m_compositionContextId, m_compState);
+        }
         return;
     }
+    uint64_t oldCtxId = m_compositionContextId;
     if (pComp) pComp->AddRef();
     if (pContext) pContext->AddRef();
 
@@ -180,6 +188,16 @@ void CTextInputProcessor::SetComposition(ITfComposition* pComp, ITfContext* pCon
     m_pCompositionContext = pContext;
     m_compositionContextId = reinterpret_cast<uint64_t>(pContext);
     m_compState = (pComp != nullptr) ? state : CompositionState::None;
+    if (oldCtxId != 0 && oldCtxId != m_compositionContextId &&
+        GetContextState(oldCtxId) != CompositionState::CompositionlessComposing &&
+        GetContextState(oldCtxId) != CompositionState::Quarantined) {
+        SetContextState(oldCtxId, CompositionState::None);
+    }
+    if (m_compositionContextId != 0) {
+        ExitCompositionlessMode(m_compositionContextId);
+        SetContextState(m_compositionContextId, m_compState);
+        SetContextMode(m_compositionContextId, CandidateWindowMode::StandardInline);
+    }
 }
 
 bool CTextInputProcessor::TerminateCompositionOnHost(ITfContext* pContextOverride) {
@@ -495,6 +513,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
     if (result == EditSessionResult::Success) {
         if (pending.terminateAfterEdit && !pending.hasCommit) {
             HideCandidateWindowIfOwnedBy(contextId);
+            ExitCompositionlessMode(contextId);
             applySnapshotState(0, 0, 0);
             m_ipcClient.ResetContext(m_sessionId, contextId);
             return;
@@ -508,6 +527,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
                 pending.displaySnapshot.page_count);
         } else if ((pending.hasComposition && pending.composition.empty()) || pending.hasCommit) {
             applySnapshotState(0, 0, 0);
+            ExitCompositionlessMode(contextId);
         }
 
         if (pending.hasCommit && pending.commitEventId != 0) {
@@ -518,10 +538,33 @@ void CTextInputProcessor::OnEditSessionCompleted(
         if (pending.terminateAfterEdit || pending.uiSuppressed) {
             HideCandidateWindowIfOwnedBy(contextId);
         }
+    } else if (result == EditSessionResult::UiOnlyHandled) {
+        if (pending.terminateAfterEdit && !pending.hasCommit) {
+            ResetCompositionlessContext(contextId, false, true);
+            return;
+        }
+
+        if (!pending.displaySnapshot.candidates.empty() ||
+            (pending.hasComposition && !pending.composition.empty())) {
+            applySnapshotState(
+                pending.displaySnapshot.candidate_version,
+                pending.displaySnapshot.page_index,
+                pending.displaySnapshot.page_count);
+        } else if ((pending.hasComposition && pending.composition.empty()) || pending.hasCommit) {
+            applySnapshotState(0, 0, 0);
+            ExitCompositionlessMode(contextId);
+        }
+
+        if (pending.terminateAfterEdit || pending.uiSuppressed) {
+            HideCandidateWindowIfOwnedBy(contextId);
+        }
     } else if (result == EditSessionResult::PartiallyModified) {
         HideCandidateWindowIfOwnedBy(contextId);
         if ((pending.hasComposition && pending.composition.empty()) || pending.hasCommit) {
             applySnapshotState(0, 0, 0);
+            if (GetContextState(contextId) == CompositionState::CompositionlessComposing) {
+                ExitCompositionlessMode(contextId);
+            }
         } else if (!pending.displaySnapshot.candidates.empty() ||
                    (pending.hasComposition && !pending.composition.empty())) {
             applySnapshotState(
@@ -534,6 +577,11 @@ void CTextInputProcessor::OnEditSessionCompleted(
             EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
             DrainUnconfirmedCommits(true);
         }
+    } else if (result == EditSessionResult::Indeterminate) {
+        HideCandidateWindowIfOwnedBy(contextId);
+        ExitCompositionlessMode(contextId);
+        SetContextState(contextId, CompositionState::Quarantined);
+        applySnapshotState(0, 0, 0);
     } else {
         // Unmodified or RecoveryBlocked: current key text was NOT applied to host!
         if (result == EditSessionResult::RecoveryBlocked) {
@@ -560,6 +608,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             }
             if (!durableClaim || !cancelOk) {
                 applySnapshotState(0, 0, 0);
+                ExitCompositionlessMode(contextId);
             } else {
                 if (cancelOrRollbackResp.candidate_count > 0 ||
                     (cancelOrRollbackResp.has_composition && cancelOrRollbackResp.composition[0] != L'\0')) {
@@ -569,6 +618,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
                         cancelOrRollbackResp.page_count);
                 } else {
                     applySnapshotState(0, 0, 0);
+                    ExitCompositionlessMode(contextId);
                 }
             }
         } else {
@@ -581,9 +631,11 @@ void CTextInputProcessor::OnEditSessionCompleted(
                         cancelOrRollbackResp.page_count);
                 } else {
                     applySnapshotState(0, 0, 0);
+                    ExitCompositionlessMode(contextId);
                 }
             } else {
                 applySnapshotState(0, 0, 0);
+                ExitCompositionlessMode(contextId);
             }
         }
 
@@ -592,6 +644,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             if (termOk && GetComposition(pending.pContext) == nullptr &&
                 GetPendingStatus(contextId) == PendingTerminationStatus::Succeeded) {
                 applySnapshotState(0, 0, 0);
+                ExitCompositionlessMode(contextId);
                 m_ipcClient.ResetContext(m_sessionId, contextId);
             }
         }
@@ -602,27 +655,49 @@ bool CTextInputProcessor::IsDisplayedSnapshotValid(
     const CandidateDisplaySnapshot& snap,
     ITfContext* expectedContext) const
 {
+    // 1. Global & session state
     if (m_isDeactivated || !m_hasFocus) return false;
     if (snap.session_id == 0 || snap.session_id != m_sessionId) return false;
     if (snap.context_id == 0 || snap.context_id != m_activeContextId || snap.pContext == nullptr) return false;
+    if (reinterpret_cast<uint64_t>(snap.pContext) != snap.context_id) return false;
     if (expectedContext != nullptr &&
         (snap.pContext != expectedContext || snap.context_id != reinterpret_cast<uint64_t>(expectedContext))) {
         return false;
     }
-    if (m_pCompositionContext != snap.pContext || m_pComposition == nullptr) return false;
+
+    // 2. Context not blocked or quarantined
+    if (HasPendingEditSession(snap.context_id)) return false;
+    if (GetPendingStatus(snap.context_id) != PendingTerminationStatus::Succeeded) return false;
+    CompositionState ctxState = GetCompositionState(snap.pContext);
+    if (ctxState == CompositionState::CommitPendingEnd || ctxState == CompositionState::Quarantined) {
+        return false;
+    }
+
+    // 3. Exact version, epoch, generation & page alignment
+    if (snap.candidate_version == 0 || snap.context_epoch == 0 || snap.input_generation == 0) return false;
     if (m_candidateWindow.GetCandidateCount() <= 0) return false;
 
     const auto& winSnap = m_candidateWindow.GetSnapshot();
     if (winSnap.session_id != snap.session_id ||
         winSnap.context_id != snap.context_id ||
+        winSnap.pContext != snap.pContext ||
+        winSnap.context_epoch != snap.context_epoch ||
+        winSnap.input_generation != snap.input_generation ||
         winSnap.candidate_version != snap.candidate_version ||
-        winSnap.page_index != snap.page_index) {
+        winSnap.page_index != snap.page_index ||
+        winSnap.mode != snap.mode) {
         return false;
     }
 
-    if (HasPendingEditSession(snap.context_id)) return false;
-    if (GetPendingStatus(snap.context_id) != PendingTerminationStatus::Succeeded) return false;
-    if (snap.candidate_version == 0) return false;
+    auto itEpoch = m_contextEpochs.find(snap.context_id);
+    if (itEpoch == m_contextEpochs.end() || itEpoch->second != snap.context_epoch) {
+        return false;
+    }
+
+    auto itGen = m_contextInputGenerations.find(snap.context_id);
+    if (itGen == m_contextInputGenerations.end() || itGen->second != snap.input_generation) {
+        return false;
+    }
 
     auto itVer = m_contextCandidateVersions.find(snap.context_id);
     if (itVer == m_contextCandidateVersions.end() || itVer->second != snap.candidate_version) {
@@ -630,12 +705,34 @@ bool CTextInputProcessor::IsDisplayedSnapshotValid(
     }
 
     auto itSrvVer = m_latestServerCandidateVersions.find(snap.context_id);
-    if (itSrvVer != m_latestServerCandidateVersions.end() && itSrvVer->second != snap.candidate_version) {
+    if (itSrvVer == m_latestServerCandidateVersions.end() || itSrvVer->second != snap.candidate_version) {
         return false;
     }
 
     auto itPage = m_contextPageIndices.find(snap.context_id);
-    if (itPage != m_contextPageIndices.end() && itPage->second != snap.page_index) {
+    if (itPage == m_contextPageIndices.end() || itPage->second != snap.page_index) {
+        return false;
+    }
+
+    // 4 & 5. Mode-specific state & COM strong reference lease
+    if (snap.mode == CandidateWindowMode::StandardInline) {
+        if (m_pCompositionContext != snap.pContext || m_pComposition == nullptr ||
+            m_compState != CompositionState::Composing) {
+            return false;
+        }
+    } else if (snap.mode == CandidateWindowMode::Compositionless) {
+        auto itState = m_contextStates.find(snap.context_id);
+        if (itState == m_contextStates.end() || itState->second != CompositionState::CompositionlessComposing) {
+            return false;
+        }
+        if ((m_pCompositionContext == snap.pContext && m_pComposition != nullptr) ||
+            GetPendingStatus(snap.context_id) != PendingTerminationStatus::Succeeded) {
+            return false;
+        }
+        if (!HasCompositionlessLease(snap.context_id, snap.pContext)) {
+            return false;
+        }
+    } else {
         return false;
     }
 
@@ -702,6 +799,8 @@ STDMETHODIMP CTextInputProcessor::QueryInterface(REFIID riid, void** ppvObj) {
         *ppvObj = static_cast<ITfKeyEventSink*>(this);
     } else if (IsEqualIID(riid, IID_ITfCompositionSink)) {
         *ppvObj = static_cast<ITfCompositionSink*>(this);
+    } else if (IsEqualIID(riid, IID_ITfDisplayAttributeProvider)) {
+        *ppvObj = static_cast<ITfDisplayAttributeProvider*>(this);
     }
 
     if (*ppvObj) {
@@ -710,6 +809,22 @@ STDMETHODIMP CTextInputProcessor::QueryInterface(REFIID riid, void** ppvObj) {
     }
 
     return E_NOINTERFACE;
+}
+
+STDMETHODIMP CTextInputProcessor::EnumDisplayAttributeInfo(IEnumTfDisplayAttributeInfo** ppEnum) {
+    if (!ppEnum) return E_POINTER;
+    *ppEnum = new CEnumDisplayAttributeInfo();
+    return S_OK;
+}
+
+STDMETHODIMP CTextInputProcessor::GetDisplayAttributeInfo(REFGUID guid, ITfDisplayAttributeInfo** ppInfo) {
+    if (!ppInfo) return E_POINTER;
+    *ppInfo = nullptr;
+    if (IsEqualGUID(guid, GUID_PersonalIME_DisplayAttributeInput)) {
+        *ppInfo = new CDisplayAttributeInfo();
+        return S_OK;
+    }
+    return E_INVALIDARG;
 }
 
 STDMETHODIMP_(ULONG) CTextInputProcessor::AddRef() {
@@ -734,6 +849,14 @@ STDMETHODIMP CTextInputProcessor::Activate(ITfThreadMgr* ptim, TfClientId tid) {
     if (!InitKeyEventSink()) {
         Deactivate();
         return E_FAIL;
+    }
+
+    // Register Display Attribute GUID to TfGuidAtom for inline composition underline rendering
+    ITfCategoryMgr* pCatMgr = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_ITfCategoryMgr, (void**)&pCatMgr)) && pCatMgr) {
+        pCatMgr->RegisterGUID(GUID_PersonalIME_DisplayAttributeInput, &m_displayAttributeAtom);
+        pCatMgr->Release();
     }
 
     LoadSpilloverCommitsFromFile();
@@ -774,6 +897,8 @@ STDMETHODIMP CTextInputProcessor::Deactivate() {
 
     m_candidateWindow.Hide();
     m_candidateWindow.Destroy();
+
+    ResetAllCompositionlessContexts(true);
 
     if (m_pCompositionContext) {
         uint64_t oldContextId = m_compositionContextId;
@@ -822,6 +947,7 @@ STDMETHODIMP CTextInputProcessor::Deactivate() {
     }
 
     m_tfClientId = TF_CLIENTID_NULL;
+    m_displayAttributeAtom = TF_INVALID_GUIDATOM;
     DrainUnconfirmedCommits(false);
     if (!m_unconfirmedCommits.empty()) {
         if (SpillUnconfirmedCommitsToFile(m_unconfirmedCommits)) {
@@ -894,6 +1020,7 @@ STDMETHODIMP CTextInputProcessor::OnSetFocus(BOOL fForeground) {
         }
         m_candidateWindow.Hide();
         SuppressAllQueuedEditSessions(true);
+        ResetAllCompositionlessContexts(true);
         if (m_pCompositionContext) {
             uint64_t oldContextId = m_compositionContextId;
             if (!HasQueuedEditSession(oldContextId)) {
@@ -1117,6 +1244,13 @@ bool CTextInputProcessor::ProcessKeyInternal(
         return false;
     }
 
+    // Do not overlap new keystrokes if context is Quarantined
+    if (GetCompositionState(pic) == CompositionState::Quarantined) {
+        *pfEaten = FALSE;
+        HideCandidateWindowIfOwnedBy(contextId);
+        return false;
+    }
+
     // If returning to a context with a pending/failed termination, retry finishing it before handling new input
     if (GetPendingStatus(contextId) != PendingTerminationStatus::Succeeded) {
         bool retryOk = TerminateCompositionOnHost(pic);
@@ -1134,6 +1268,11 @@ bool CTextInputProcessor::ProcessKeyInternal(
         if (m_activeContextId != 0) {
             SuppressQueuedEditSessionsForContext(m_activeContextId, true);
             HideCandidateWindowIfOwnedBy(m_activeContextId);
+            if (GetContextState(m_activeContextId) == CompositionState::CompositionlessComposing) {
+                ResetCompositionlessContext(m_activeContextId, true, true);
+            } else {
+                AdvanceContextEpoch(m_activeContextId);
+            }
         }
         if (m_pCompositionContext && m_pCompositionContext != pic) {
             uint64_t oldContextId = m_compositionContextId;
@@ -1143,9 +1282,6 @@ bool CTextInputProcessor::ProcessKeyInternal(
                     m_ipcClient.ResetContext(m_sessionId, oldContextId);
                 }
             }
-        }
-        if (m_activeContextId != 0) {
-            AdvanceContextEpoch(m_activeContextId);
         }
         m_activeContextId = contextId;
     }
@@ -1241,7 +1377,8 @@ bool CTextInputProcessor::ProcessKeyInternal(
         if (!resp.handled) {
             return false;
         }
-        AdvanceContextInputGeneration(contextId);
+        uint64_t currentInputGen = AdvanceContextInputGeneration(contextId);
+        uint64_t currentEpoch = EnsureContextEpoch(contextId);
 
         if (resp.candidate_count > 0 || (resp.has_composition && resp.composition[0] != L'\0')) {
             m_latestServerCandidateVersions[contextId] = resp.candidate_version;
@@ -1280,12 +1417,68 @@ bool CTextInputProcessor::ProcessKeyInternal(
             snap.session_id = m_sessionId;
             snap.context_id = contextId;
             snap.pContext = pic;
+            snap.input_generation = currentInputGen;
+            snap.context_epoch = currentEpoch;
             snap.candidate_version = resp.candidate_version;
             snap.page_index = resp.page_index;
             snap.page_count = resp.page_count;
             snap.candidates = cands;
             snap.initial_selected_index =
                 (selectLastOnPageUp && !cands.empty()) ? (static_cast<int>(cands.size()) - 1) : 0;
+            snap.mode = (GetContextState(contextId) == CompositionState::CompositionlessComposing)
+                        ? CandidateWindowMode::Compositionless
+                        : CandidateWindowMode::StandardInline;
+            snap.raw_input = resp.has_composition ? resp.composition : L"";
+            if (!resp.has_commit && (resp.status_flags & IPC_STATUS_HAS_QUERY_CODE) != 0 && resp.commit_text[0] != L'\0') {
+                snap.query_code = resp.commit_text;
+            }
+            if (!cands.empty() && snap.initial_selected_index >= 0 &&
+                snap.initial_selected_index < static_cast<int>(cands.size())) {
+                snap.preview_text = CCandidateWindow::ExtractCandidateCoreText(cands[snap.initial_selected_index]);
+            }
+
+            // Stage 7.1b: If context is already in CompositionlessComposing and this is not a commit,
+            // update UI directly (UiOnlyHandled) without requesting per-key TF_ES_READWRITE locks!
+            if (GetContextState(contextId) == CompositionState::CompositionlessComposing && !resp.has_commit) {
+                if ((resp.has_composition && resp.composition[0] != L'\0') || !cands.empty()) {
+                    EnterCompositionlessMode(pic);
+                    snap.mode = CandidateWindowMode::Compositionless;
+                    m_contextCandidateVersions[contextId] = resp.candidate_version;
+                    m_latestServerCandidateVersions[contextId] = resp.candidate_version;
+                    m_contextPageIndices[contextId] = resp.page_index;
+                    m_contextPageCounts[contextId] = resp.page_count;
+                    if (contextId == m_activeContextId) {
+                        m_currentPageIndex = resp.page_index;
+                        m_currentPageCount = resp.page_count;
+                    }
+                    POINT pt{};
+                    if (!m_isDeactivated && m_hasFocus && m_activeContextId == contextId &&
+                        m_candidateWindow.ShouldShowWindow(snap) &&
+                        ResolveAnchorPointForContext(pic, TF_INVALID_EDIT_COOKIE, nullptr, false, &pt)) {
+                        m_candidateWindow.Show(snap, pt);
+                    } else {
+                        HideCandidateWindowIfOwnedBy(contextId);
+                    }
+                    *pfEaten = TRUE;
+                    syncPluginsPostEditIfNeeded();
+                    return true;
+                } else {
+                    // Cleared compositionless preedit (Backspace to empty or Esc): return to Idle (UiOnlyHandled)
+                    HideCandidateWindowIfOwnedBy(contextId);
+                    ExitCompositionlessMode(contextId);
+                    m_contextCandidateVersions[contextId] = 0;
+                    m_latestServerCandidateVersions[contextId] = 0;
+                    m_contextPageIndices[contextId] = 0;
+                    m_contextPageCounts[contextId] = 0;
+                    if (contextId == m_activeContextId) {
+                        m_currentPageIndex = 0;
+                        m_currentPageCount = 0;
+                    }
+                    m_ipcClient.ResetContext(m_sessionId, contextId);
+                    *pfEaten = TRUE;
+                    return true;
+                }
+            }
 
             uint64_t editGen = ++m_editSessionGeneration;
             m_pendingEditSessions.emplace_back(
@@ -1337,9 +1530,14 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 }
                 EditSessionResult asyncResult = pSession->GetResult();
                 pSession->Release();
-                if (asyncResult == EditSessionResult::Success || asyncResult == EditSessionResult::PartiallyModified) {
+                if (asyncResult == EditSessionResult::Success ||
+                    asyncResult == EditSessionResult::UiOnlyHandled ||
+                    asyncResult == EditSessionResult::PartiallyModified ||
+                    asyncResult == EditSessionResult::Indeterminate) {
                     *pfEaten = TRUE;
-                    syncPluginsPostEditIfNeeded();
+                    if (asyncResult != EditSessionResult::Indeterminate) {
+                        syncPluginsPostEditIfNeeded();
+                    }
                     return true;
                 }
                 *pfEaten = FALSE;
@@ -1356,13 +1554,17 @@ bool CTextInputProcessor::ProcessKeyInternal(
             EditSessionResult result = pSession->GetResult();
             pSession->Release();
 
-            if (SUCCEEDED(hr) && SUCCEEDED(hrSession) && result == EditSessionResult::Success) {
+            if (SUCCEEDED(hr) && SUCCEEDED(hrSession) &&
+                (result == EditSessionResult::Success || result == EditSessionResult::UiOnlyHandled)) {
                 *pfEaten = TRUE;
                 syncPluginsPostEditIfNeeded();
                 return true;
             } else if (result == EditSessionResult::PartiallyModified) {
                 *pfEaten = TRUE;
                 syncPluginsPostEditIfNeeded();
+                return true;
+            } else if (result == EditSessionResult::Indeterminate) {
+                *pfEaten = TRUE;
                 return true;
             } else {
                 *pfEaten = FALSE;
@@ -1483,4 +1685,204 @@ void CTextInputProcessor::SetContextState(uint64_t contextId, CompositionState s
     } else {
         m_contextStates[contextId] = state;
     }
+}
+
+CandidateWindowMode CTextInputProcessor::GetContextMode(uint64_t contextId) const {
+    if (contextId == 0) return CandidateWindowMode::StandardInline;
+    auto it = m_contextModes.find(contextId);
+    return (it != m_contextModes.end()) ? it->second : CandidateWindowMode::StandardInline;
+}
+
+void CTextInputProcessor::SetContextMode(uint64_t contextId, CandidateWindowMode mode) {
+    if (contextId == 0) return;
+    if (mode == CandidateWindowMode::StandardInline) {
+        m_contextModes.erase(contextId);
+    } else {
+        m_contextModes[contextId] = mode;
+    }
+}
+
+void CTextInputProcessor::EnterCompositionlessMode(ITfContext* pContext) {
+    if (!pContext) return;
+    uint64_t contextId = reinterpret_cast<uint64_t>(pContext);
+    EnsureContextEpoch(contextId);
+    m_compositionlessContextLeases[contextId] = pContext;
+    SetContextState(contextId, CompositionState::CompositionlessComposing);
+    SetContextMode(contextId, CandidateWindowMode::Compositionless);
+}
+
+void CTextInputProcessor::ExitCompositionlessMode(uint64_t contextId) {
+    if (contextId == 0) return;
+    if (GetContextState(contextId) == CompositionState::CompositionlessComposing) {
+        SetContextState(contextId, CompositionState::None);
+    }
+    SetContextMode(contextId, CandidateWindowMode::StandardInline);
+    m_compositionlessContextLeases.erase(contextId);
+}
+
+bool CTextInputProcessor::HasCompositionlessLease(uint64_t contextId, ITfContext* pContext) const {
+    if (contextId == 0 || !pContext) return false;
+    auto it = m_compositionlessContextLeases.find(contextId);
+    return it != m_compositionlessContextLeases.end() && it->second.Get() == pContext;
+}
+
+void CTextInputProcessor::ResetCompositionlessContext(uint64_t contextId, bool advanceEpoch, bool resetServer) {
+    if (contextId == 0) return;
+    SuppressQueuedEditSessionsForContext(contextId, true);
+    HideCandidateWindowIfOwnedBy(contextId);
+    ExitCompositionlessMode(contextId);
+    m_cachedAnchors.erase(contextId);
+    m_contextCandidateVersions[contextId] = 0;
+    m_latestServerCandidateVersions[contextId] = 0;
+    m_contextPageIndices[contextId] = 0;
+    m_contextPageCounts[contextId] = 0;
+    if (contextId == m_activeContextId) {
+        m_currentPageIndex = 0;
+        m_currentPageCount = 0;
+    }
+    AdvanceContextInputGeneration(contextId);
+    if (advanceEpoch) {
+        AdvanceContextEpoch(contextId);
+    }
+    if (resetServer) {
+        m_ipcClient.ResetContext(m_sessionId, contextId);
+    }
+}
+
+void CTextInputProcessor::ResetAllCompositionlessContexts(bool resetServer) {
+    std::vector<uint64_t> ctxIds;
+    for (const auto& kv : m_compositionlessContextLeases) {
+        ctxIds.push_back(kv.first);
+    }
+    for (const auto& kv : m_contextStates) {
+        if (kv.second == CompositionState::CompositionlessComposing) {
+            if (std::find(ctxIds.begin(), ctxIds.end(), kv.first) == ctxIds.end()) {
+                ctxIds.push_back(kv.first);
+            }
+        }
+    }
+    for (uint64_t ctxId : ctxIds) {
+        ResetCompositionlessContext(ctxId, true, resetServer);
+    }
+}
+
+void CTextInputProcessor::CacheContextAnchorPoint(uint64_t contextId, uint64_t epoch, uint64_t viewId, POINT pt) {
+    if (contextId == 0 || epoch == 0) return;
+    CachedAnchorPoint cap{};
+    cap.contextEpoch = epoch;
+    cap.viewId = viewId;
+    cap.pt = pt;
+    cap.valid = true;
+    m_cachedAnchors[contextId] = cap;
+}
+
+bool CTextInputProcessor::ResolveAnchorPointForContext(
+    ITfContext* pContext,
+    TfEditCookie ec,
+    ITfRange* pRange,
+    bool hasValidEditCookie,
+    POINT* outPt)
+{
+    if (!pContext || !outPt) return false;
+    uint64_t contextId = reinterpret_cast<uint64_t>(pContext);
+    uint64_t epoch = EnsureContextEpoch(contextId);
+
+    ITfContextView* pView = nullptr;
+    HRESULT hrView = pContext->GetActiveView(&pView);
+    uint64_t viewId = reinterpret_cast<uint64_t>(pView);
+
+    // 1. If in a valid edit session, try GetTextExt on pRange or current selection range
+    if (hasValidEditCookie && SUCCEEDED(hrView) && pView) {
+        RECT rc{};
+        BOOL fClipped = FALSE;
+        bool gotExt = false;
+        if (pRange) {
+            if (SUCCEEDED(pView->GetTextExt(ec, pRange, &rc, &fClipped)) &&
+                rc.right >= rc.left && rc.bottom > rc.top) {
+                gotExt = true;
+            }
+        } else {
+            TF_SELECTION sel{};
+            ULONG cFetched = 0;
+            if (SUCCEEDED(pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &cFetched)) &&
+                cFetched > 0 && sel.range) {
+                if (SUCCEEDED(pView->GetTextExt(ec, sel.range, &rc, &fClipped)) &&
+                    rc.right >= rc.left && rc.bottom > rc.top) {
+                    gotExt = true;
+                }
+                sel.range->Release();
+            }
+        }
+        if (gotExt) {
+            POINT pt = { rc.left, rc.bottom + 2 };
+            CacheContextAnchorPoint(contextId, epoch, viewId, pt);
+            *outPt = pt;
+            pView->Release();
+            return true;
+        }
+    }
+
+    // 2. Fallback to cached anchor point for the same (context_id, context_epoch, view)
+    auto itCache = m_cachedAnchors.find(contextId);
+    if (itCache != m_cachedAnchors.end() &&
+        itCache->second.valid &&
+        itCache->second.contextEpoch == epoch &&
+        (viewId == 0 || itCache->second.viewId == 0 || itCache->second.viewId == viewId)) {
+        *outPt = itCache->second.pt;
+        if (pView) pView->Release();
+        return true;
+    }
+
+    // 3. Fallback to view HWND or same-process focus HWND rectangle clamped to monitor work area
+    HWND hWndView = nullptr;
+    if (pView) {
+        pView->GetWnd(&hWndView);
+    }
+    if (!hWndView || !IsWindow(hWndView) || !IsWindowVisible(hWndView)) {
+        HWND hFocus = GetFocus();
+        if (hFocus && IsWindow(hFocus) && IsWindowVisible(hFocus)) {
+            DWORD focusPid = 0;
+            GetWindowThreadProcessId(hFocus, &focusPid);
+            if (focusPid == GetCurrentProcessId()) {
+                hWndView = hFocus;
+            }
+        }
+    }
+    if (hWndView && IsWindow(hWndView) && IsWindowVisible(hWndView)) {
+        RECT rcWnd{};
+        if (GetWindowRect(hWndView, &rcWnd) && rcWnd.right > rcWnd.left && rcWnd.bottom > rcWnd.top) {
+            HMONITOR hMon = MonitorFromWindow(hWndView, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof(mi);
+            GetMonitorInfoW(hMon, &mi);
+            POINT pt = { rcWnd.left + 24, rcWnd.top + 48 };
+            if (pt.x < mi.rcWork.left) pt.x = mi.rcWork.left;
+            if (pt.x > mi.rcWork.right - 120) pt.x = mi.rcWork.right - 120;
+            if (pt.y < mi.rcWork.top) pt.y = mi.rcWork.top;
+            if (pt.y > mi.rcWork.bottom - 60) pt.y = mi.rcWork.bottom - 60;
+            CacheContextAnchorPoint(contextId, epoch, viewId, pt);
+            *outPt = pt;
+            if (pView) pView->Release();
+            return true;
+        }
+    }
+
+    if (pView) {
+        pView->Release();
+    }
+
+    // 4. Conservative default position within the active monitor's work area
+    POINT cursorPt{ 0, 0 };
+    GetCursorPos(&cursorPt);
+    HMONITOR hMon = MonitorFromPoint(cursorPt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(hMon, &mi) && mi.rcWork.right > mi.rcWork.left && mi.rcWork.bottom > mi.rcWork.top) {
+        POINT pt = { mi.rcWork.left + 80, mi.rcWork.bottom - 120 };
+        *outPt = pt;
+        return true;
+    }
+
+    *outPt = { 80, 80 };
+    return true;
 }

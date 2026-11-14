@@ -59,14 +59,25 @@ public:
     STDMETHODIMP DoEditSession(TfEditCookie ec) override {
         HRESULT hr = S_OK;
         if (m_pComp) {
-            // If not already committed, clear the in-progress composition string
-            if (!m_isCommittedText) {
-                ITfRange* pRange = nullptr;
-                hr = m_pComp->GetRange(&pRange);
-                if (SUCCEEDED(hr) && pRange) {
-                    hr = pRange->SetText(ec, 0, L"", 0);
-                    pRange->Release();
+            ITfRange* pRange = nullptr;
+            HRESULT hrRange = m_pComp->GetRange(&pRange);
+            if (SUCCEEDED(hrRange) && pRange) {
+                ITfContext* pCtx = nullptr;
+                if (SUCCEEDED(pRange->GetContext(&pCtx)) && pCtx) {
+                    ITfProperty* pProp = nullptr;
+                    if (SUCCEEDED(pCtx->GetProperty(GUID_PROP_ATTRIBUTE, &pProp)) && pProp) {
+                        pProp->Clear(ec, pRange);
+                        pProp->Release();
+                    }
+                    pCtx->Release();
                 }
+                // If not already committed, clear the in-progress composition string
+                if (!m_isCommittedText) {
+                    hr = pRange->SetText(ec, 0, L"", 0);
+                }
+                pRange->Release();
+            } else if (!m_isCommittedText) {
+                hr = hrRange;
             }
             if (SUCCEEDED(hr)) {
                 // If committed text, do NOT call SetText(L""), only call EndComposition to finalize
@@ -110,6 +121,18 @@ public:
             m_snapshot.context_id = m_contextId;
             m_snapshot.pContext = pContext;
             m_snapshot.candidates = candidates;
+            if (m_pTip) {
+                m_snapshot.session_id = m_pTip->GetSessionIdForTest();
+                m_snapshot.context_epoch = m_pTip->EnsureContextEpoch(m_contextId);
+                uint64_t curGen = m_pTip->GetContextInputGeneration(m_contextId);
+                m_snapshot.input_generation = (curGen != 0) ? curGen : m_pTip->AdvanceContextInputGeneration(m_contextId);
+            }
+            if (m_hasComp) {
+                m_snapshot.raw_input = m_compText;
+            }
+            if (!candidates.empty()) {
+                m_snapshot.preview_text = CCandidateWindow::ExtractCandidateCoreText(candidates[0]);
+            }
         }
         DllAddRef();
         if (m_pTip) m_pTip->AddRef();
@@ -184,12 +207,11 @@ public:
             }
         };
 
-        ITfContextComposition* pContextComp = nullptr;
-        HRESULT hr = m_pContext->QueryInterface(IID_ITfContextComposition, (void**)&pContextComp);
-        if (FAILED(hr)) {
+        if (m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined) {
+            hideOwnedWindow();
             m_result = EditSessionResult::Unmodified;
-            m_finalHr = hr;
-            return hr;
+            m_finalHr = E_FAIL;
+            return E_FAIL;
         }
 
         // P1-1 RECOVERY: If the previous composition was in CommitPendingEnd,
@@ -204,7 +226,6 @@ public:
                 } else {
                     // EndComposition failed again: DO NOT overwrite or touch the committed text!
                     // Report RecoveryBlocked so OnKeyDown does NOT eat the key and rolls back server for current key!
-                    pContextComp->Release();
                     m_result = EditSessionResult::RecoveryBlocked;
                     m_finalHr = hrEnd;
                     return hrEnd;
@@ -223,15 +244,15 @@ public:
             hideOwnedWindow();
             if (pComp) {
                 ITfRange* pRange = nullptr;
-                hr = pComp->GetRange(&pRange);
+                HRESULT hr = pComp->GetRange(&pRange);
                 if (SUCCEEDED(hr) && pRange) {
+                    ClearDisplayAttribute(ec, pRange);
                     hr = pRange->SetText(ec, 0, L"", 0);
                     pRange->Release();
                 }
                 if (SUCCEEDED(hr)) {
                     hr = pComp->EndComposition(ec);
                 }
-                pContextComp->Release();
                 if (SUCCEEDED(hr)) {
                     m_pTip->SetComposition(nullptr, nullptr, CompositionState::None);
                     m_result = EditSessionResult::Success;
@@ -243,7 +264,7 @@ public:
                     return hr;
                 }
             } else {
-                pContextComp->Release();
+                m_pTip->ExitCompositionlessMode(m_contextId);
                 m_result = EditSessionResult::Success;
                 m_finalHr = S_OK;
                 return S_OK;
@@ -255,19 +276,20 @@ public:
             hideOwnedWindow();
 
             if (pComp) {
+                // Stage 7.1b: When an inline composition exists on this context,
+                // commit MUST ONLY replace pComp->GetRange; NEVER fall back to GetSelection!
                 ITfRange* pRange = nullptr;
-                hr = pComp->GetRange(&pRange);
+                HRESULT hr = pComp->GetRange(&pRange);
                 if (FAILED(hr) || !pRange) {
-                    pContextComp->Release();
                     m_result = EditSessionResult::Unmodified;
                     m_finalHr = FAILED(hr) ? hr : E_FAIL;
                     return m_finalHr;
                 }
 
+                ClearDisplayAttribute(ec, pRange);
                 hr = pRange->SetText(ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()));
                 if (FAILED(hr)) {
                     pRange->Release();
-                    pContextComp->Release();
                     m_result = EditSessionResult::Unmodified;
                     m_finalHr = hr;
                     return hr; // Host text unmodified: safe to rollback server
@@ -286,7 +308,6 @@ public:
                 pRange->Release();
 
                 HRESULT hrEndComp = pComp->EndComposition(ec);
-                pContextComp->Release();
 
                 if (FAILED(hrEndComp) || FAILED(hrSelection)) {
                     m_result = EditSessionResult::PartiallyModified;
@@ -305,42 +326,79 @@ public:
                 m_finalHr = S_OK;
                 return S_OK;
             } else {
+                // Compositionless commit (or direct punctuation/English commit without active inline composition)
+                if (m_pTip->GetPendingStatus(m_contextId) != CTextInputProcessor::PendingTerminationStatus::Succeeded ||
+                    m_pTip->GetCompositionState(m_pContext) == CompositionState::CommitPendingEnd ||
+                    m_pTip->GetCompositionState(m_pContext) == CompositionState::Quarantined) {
+                    m_result = EditSessionResult::RecoveryBlocked;
+                    m_finalHr = E_FAIL;
+                    return E_FAIL;
+                }
+
                 TF_SELECTION sel{};
                 ULONG cFetched = 0;
-                hr = m_pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &cFetched);
-                if (FAILED(hr) || cFetched == 0) {
-                    pContextComp->Release();
-                    m_result = EditSessionResult::Unmodified;
-                    m_finalHr = FAILED(hr) ? hr : E_FAIL;
-                    return m_finalHr;
-                }
+                HRESULT hr = m_pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &cFetched);
+                if (SUCCEEDED(hr) && cFetched > 0 && sel.range) {
+                    hr = sel.range->SetText(ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()));
+                    if (SUCCEEDED(hr)) {
+                        HRESULT hrCollapse = sel.range->Collapse(ec, TF_ANCHOR_END);
+                        HRESULT hrSelection = S_OK;
+                        if (SUCCEEDED(hrCollapse)) {
+                            hrSelection = m_pContext->SetSelection(ec, 1, &sel);
+                        }
+                        sel.range->Release();
+                        m_pTip->ExitCompositionlessMode(m_contextId);
 
-                hr = sel.range->SetText(ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()));
-                if (FAILED(hr)) {
+                        if (FAILED(hrSelection)) {
+                            // Stage 7.1b: Compositionless commit wrote text, SetSelection failed ->
+                            // PartiallyModified, do NOT fabricate composition or set CommitPendingEnd!
+                            m_result = EditSessionResult::PartiallyModified;
+                            m_finalHr = hrSelection;
+                            return hrSelection;
+                        }
+
+                        m_result = EditSessionResult::Success;
+                        m_finalHr = S_OK;
+                        return S_OK;
+                    }
                     sel.range->Release();
-                    pContextComp->Release();
-                    m_result = EditSessionResult::Unmodified;
-                    m_finalHr = hr;
-                    return hr;
+                } else {
+                    // Fallback within Level 2: ITfInsertAtSelection when GetSelection is unavailable
+                    ITfInsertAtSelection* pInsertAtSel = nullptr;
+                    if (SUCCEEDED(m_pContext->QueryInterface(IID_ITfInsertAtSelection, (void**)&pInsertAtSel)) && pInsertAtSel) {
+                        ITfRange* pInsertedRange = nullptr;
+                        HRESULT hrIns = pInsertAtSel->InsertTextAtSelection(
+                            ec, 0, m_commitText.c_str(), static_cast<LONG>(m_commitText.length()), &pInsertedRange);
+                        pInsertAtSel->Release();
+                        if (SUCCEEDED(hrIns)) {
+                            HRESULT hrSelection = S_OK;
+                            if (pInsertedRange) {
+                                if (SUCCEEDED(pInsertedRange->Collapse(ec, TF_ANCHOR_END))) {
+                                    TF_SELECTION insSel{};
+                                    insSel.range = pInsertedRange;
+                                    insSel.style.ase = TF_AE_NONE;
+                                    insSel.style.fInterimChar = FALSE;
+                                    hrSelection = m_pContext->SetSelection(ec, 1, &insSel);
+                                }
+                                pInsertedRange->Release();
+                            }
+                            m_pTip->ExitCompositionlessMode(m_contextId);
+                            if (FAILED(hrSelection)) {
+                                m_result = EditSessionResult::PartiallyModified;
+                                m_finalHr = hrSelection;
+                                return hrSelection;
+                            }
+                            m_result = EditSessionResult::Success;
+                            m_finalHr = S_OK;
+                            return S_OK;
+                        }
+                        hr = hrIns;
+                    }
                 }
 
-                HRESULT hrCollapse = sel.range->Collapse(ec, TF_ANCHOR_END);
-                HRESULT hrSelection = S_OK;
-                if (SUCCEEDED(hrCollapse)) {
-                    hrSelection = m_pContext->SetSelection(ec, 1, &sel);
-                }
-                sel.range->Release();
-                pContextComp->Release();
-
-                if (FAILED(hrSelection)) {
-                    m_result = EditSessionResult::PartiallyModified;
-                    m_finalHr = hrSelection;
-                    return hrSelection;
-                }
-
-                m_result = EditSessionResult::Success;
-                m_finalHr = S_OK;
-                return S_OK;
+                m_result = EditSessionResult::Unmodified;
+                m_finalHr = FAILED(hr) ? hr : E_FAIL;
+                return m_finalHr;
             }
         }
 
@@ -350,18 +408,17 @@ public:
                 hideOwnedWindow();
                 if (pComp) {
                     ITfRange* pRange = nullptr;
-                    hr = pComp->GetRange(&pRange);
+                    HRESULT hr = pComp->GetRange(&pRange);
                     if (FAILED(hr) || !pRange) {
-                        pContextComp->Release();
                         m_result = EditSessionResult::Unmodified;
                         m_finalHr = FAILED(hr) ? hr : E_FAIL;
                         return m_finalHr;
                     }
 
+                    ClearDisplayAttribute(ec, pRange);
                     hr = pRange->SetText(ec, 0, L"", 0);
                     pRange->Release();
                     if (FAILED(hr)) {
-                        pContextComp->Release();
                         m_result = EditSessionResult::Unmodified;
                         m_finalHr = hr; // Text could not be cleared: unmodified
                         return hr;
@@ -369,7 +426,6 @@ public:
 
                     // Text was cleared; finish composition
                     HRESULT hrEndComp = pComp->EndComposition(ec);
-                    pContextComp->Release();
 
                     if (FAILED(hrEndComp)) {
                         m_result = EditSessionResult::PartiallyModified;
@@ -381,8 +437,12 @@ public:
                     m_result = EditSessionResult::Success;
                     m_finalHr = S_OK;
                     return S_OK;
+                } else if (m_pTip->GetCompositionState(m_pContext) == CompositionState::CompositionlessComposing) {
+                    m_pTip->ExitCompositionlessMode(m_contextId);
+                    m_result = EditSessionResult::UiOnlyHandled;
+                    m_finalHr = S_OK;
+                    return S_OK;
                 } else {
-                    pContextComp->Release();
                     m_result = EditSessionResult::Success;
                     m_finalHr = S_OK;
                     return S_OK;
@@ -390,11 +450,29 @@ public:
             } else {
                 // Start composition if not active on this context
                 if (!pComp) {
+                    if (m_pTip->GetCompositionState(m_pContext) == CompositionState::CompositionlessComposing) {
+                        return EnterCompositionlessUiOnly(ec);
+                    }
+
+                    ITfContextComposition* pContextComp = nullptr;
+                    HRESULT hr = m_pContext->QueryInterface(IID_ITfContextComposition, (void**)&pContextComp);
+                    if (FAILED(hr) || !pContextComp) {
+                        if (CanDegradeToCompositionless(hr)) {
+                            return EnterCompositionlessUiOnly(ec);
+                        }
+                        m_result = EditSessionResult::Unmodified;
+                        m_finalHr = FAILED(hr) ? hr : E_NOINTERFACE;
+                        return m_finalHr;
+                    }
+
                     TF_SELECTION sel{};
                     ULONG cFetched = 0;
                     hr = m_pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1, &sel, &cFetched);
-                    if (FAILED(hr) || cFetched == 0) {
+                    if (FAILED(hr) || cFetched == 0 || !sel.range) {
                         pContextComp->Release();
+                        if (CanDegradeToCompositionless(hr)) {
+                            return EnterCompositionlessUiOnly(ec);
+                        }
                         m_result = EditSessionResult::Unmodified;
                         m_finalHr = FAILED(hr) ? hr : E_FAIL;
                         return m_finalHr;
@@ -403,8 +481,11 @@ public:
                     ITfComposition* pNewComp = nullptr;
                     hr = pContextComp->StartComposition(ec, sel.range, m_pTip, &pNewComp);
                     sel.range->Release();
+                    pContextComp->Release();
                     if (FAILED(hr) || !pNewComp) {
-                        pContextComp->Release();
+                        if (CanDegradeToCompositionless(hr)) {
+                            return EnterCompositionlessUiOnly(ec);
+                        }
                         m_result = EditSessionResult::Unmodified;
                         m_finalHr = FAILED(hr) ? hr : E_FAIL;
                         return m_finalHr;
@@ -419,9 +500,8 @@ public:
 
                 // Update text
                 ITfRange* pRange = nullptr;
-                hr = pComp->GetRange(&pRange);
+                HRESULT hr = pComp->GetRange(&pRange);
                 if (FAILED(hr) || !pRange) {
-                    pContextComp->Release();
                     m_result = EditSessionResult::Unmodified;
                     m_finalHr = FAILED(hr) ? hr : E_FAIL;
                     return m_finalHr;
@@ -430,11 +510,13 @@ public:
                 hr = pRange->SetText(ec, 0, m_compText.c_str(), static_cast<LONG>(m_compText.length()));
                 if (FAILED(hr)) {
                     pRange->Release();
-                    pContextComp->Release();
                     m_result = EditSessionResult::Unmodified;
                     m_finalHr = hr; // Text not modified: safe to rollback
                     return hr;
                 }
+
+                // Apply standard inline composition underline display attribute (GUID_PROP_ATTRIBUTE)
+                ApplyDisplayAttribute(ec, pRange);
 
                 // Text modified on host
                 HRESULT hrCollapse = pRange->Collapse(ec, TF_ANCHOR_END);
@@ -450,7 +532,7 @@ public:
                 // Locate Caret and display candidate window only if this context is still focused and current
                 bool canShowUI = (m_generation == 0) ||
                                  (m_pTip && m_pTip->CanShowCandidateWindow(m_contextId, m_generation));
-                if (!m_candidates.empty() && m_pCandWnd && canShowUI) {
+                if (m_pCandWnd && canShowUI && m_pCandWnd->ShouldShowWindow(m_snapshot)) {
                     ITfContextView* pView = nullptr;
                     HRESULT hrView = m_pContext->GetActiveView(&pView);
                     if (SUCCEEDED(hrView) && pView) {
@@ -459,6 +541,11 @@ public:
                         if (SUCCEEDED(pView->GetTextExt(ec, pRange, &rc, &fClipped))) {
                             if (rc.right >= rc.left && rc.bottom > rc.top) {
                                 POINT pt = { rc.left, rc.bottom + 2 };
+                                m_pTip->CacheContextAnchorPoint(
+                                    m_contextId,
+                                    m_pTip->EnsureContextEpoch(m_contextId),
+                                    reinterpret_cast<uint64_t>(pView),
+                                    pt);
                                 m_pCandWnd->Show(m_snapshot, pt);
                             } else {
                                 hideOwnedWindow();
@@ -468,8 +555,12 @@ public:
                         }
                         pView->Release();
                     } else if (hrView == E_NOTIMPL) {
-                        POINT pt = { 100, 100 };
-                        m_pCandWnd->Show(m_snapshot, pt);
+                        POINT pt{};
+                        if (m_pTip->ResolveAnchorPointForContext(m_pContext, ec, pRange, true, &pt)) {
+                            m_pCandWnd->Show(m_snapshot, pt);
+                        } else {
+                            hideOwnedWindow();
+                        }
                     } else {
                         hideOwnedWindow();
                     }
@@ -478,7 +569,6 @@ public:
                 }
 
                 pRange->Release();
-                pContextComp->Release();
 
                 if (FAILED(hrSelection)) {
                     m_result = EditSessionResult::PartiallyModified;
@@ -492,13 +582,100 @@ public:
             }
         }
 
-        pContextComp->Release();
         m_result = EditSessionResult::Success;
         m_finalHr = S_OK;
         return S_OK;
     }
 
 private:
+    void ApplyDisplayAttribute(TfEditCookie ec, ITfRange* pRange) {
+        if (!m_pContext || !m_pTip || !pRange) return;
+        TfGuidAtom atom = m_pTip->GetDisplayAttributeAtom();
+        if (atom == TF_INVALID_GUIDATOM) return;
+        ITfProperty* pProp = nullptr;
+        if (SUCCEEDED(m_pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pProp)) && pProp) {
+            VARIANT var;
+            VariantInit(&var);
+            var.vt = VT_I4;
+            var.lVal = static_cast<LONG>(atom);
+            pProp->SetValue(ec, pRange, &var);
+            pProp->Release();
+        }
+    }
+
+    void ClearDisplayAttribute(TfEditCookie ec, ITfRange* pRange) {
+        if (!m_pContext || !pRange) return;
+        ITfProperty* pProp = nullptr;
+        if (SUCCEEDED(m_pContext->GetProperty(GUID_PROP_ATTRIBUTE, &pProp)) && pProp) {
+            pProp->Clear(ec, pRange);
+            pProp->Release();
+        }
+    }
+
+    bool CanDegradeToCompositionless(HRESULT hrFail) const {
+        if (!m_pContext || !m_pTip) return false;
+        // Reject lock, disconnect, read-only, memory, or abort errors
+        if (hrFail == E_OUTOFMEMORY ||
+            hrFail == TF_E_DISCONNECTED ||
+            hrFail == TF_E_NOLOCK ||
+            hrFail == TF_E_READONLY ||
+            hrFail == E_ABORT ||
+            hrFail == TF_E_INVALIDPOINT) {
+            return false;
+        }
+        TF_STATUS status{};
+        if (SUCCEEDED(m_pContext->GetStatus(&status))) {
+            if (status.dwDynamicFlags & TS_SD_READONLY) {
+                return false;
+            }
+        }
+        if (m_pTip->GetComposition(m_pContext) != nullptr) {
+            return false;
+        }
+        if (m_pTip->GetPendingStatus(m_contextId) != CTextInputProcessor::PendingTerminationStatus::Succeeded) {
+            return false;
+        }
+        CompositionState st = m_pTip->GetCompositionState(m_pContext);
+        if (st == CompositionState::CommitPendingEnd || st == CompositionState::Quarantined) {
+            return false;
+        }
+        if (m_generation != 0 && !m_pTip->CanShowCandidateWindow(m_contextId, m_generation)) {
+            return false;
+        }
+        return true;
+    }
+
+    HRESULT EnterCompositionlessUiOnly(TfEditCookie ec) {
+        m_pTip->EnterCompositionlessMode(m_pContext);
+        m_snapshot.mode = CandidateWindowMode::Compositionless;
+        m_snapshot.context_epoch = m_pTip->EnsureContextEpoch(m_contextId);
+        uint64_t gen = m_pTip->GetContextInputGeneration(m_contextId);
+        m_snapshot.input_generation = (gen != 0) ? gen : m_pTip->AdvanceContextInputGeneration(m_contextId);
+        if (m_snapshot.raw_input.empty()) {
+            m_snapshot.raw_input = m_compText;
+        }
+
+        bool canShowUI = (m_generation == 0) ||
+                         (m_pTip && m_pTip->CanShowCandidateWindow(m_contextId, m_generation));
+        if (m_pCandWnd && canShowUI && m_pCandWnd->ShouldShowWindow(m_snapshot)) {
+            POINT pt{};
+            if (m_pTip->ResolveAnchorPointForContext(m_pContext, ec, nullptr, true, &pt)) {
+                m_pCandWnd->Show(m_snapshot, pt);
+            } else {
+                m_pCandWnd->Hide();
+            }
+        } else if (m_pCandWnd) {
+            if (m_generation != 0 && m_pTip) {
+                m_pTip->HideCandidateWindowIfOwnedBy(m_contextId);
+            } else {
+                m_pCandWnd->Hide();
+            }
+        }
+
+        m_result = EditSessionResult::UiOnlyHandled;
+        m_finalHr = S_OK;
+        return S_OK;
+    }
     LONG m_cRef = 1;
     CTextInputProcessor* m_pTip = nullptr;
     ITfContext* m_pContext = nullptr;

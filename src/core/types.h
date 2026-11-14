@@ -156,6 +156,7 @@ struct Candidate {
     std::string layout_id;       // e.g. "natural", "ms", "xiaohe", or ""
     std::string raw_code;        // User typed raw input
     std::string resolved_code;   // Actual resolved code/syllable used for lookup
+    std::string segmented_code;  // Stage 7: Segmented display code (e.g. "da'jia") for Preedit Header
     int method_priority = 0;     // 0 = primary method, 1, 2... for active input methods order
     int dict_priority = 0;       // 0, 1, 2... order in dictionary_order
 

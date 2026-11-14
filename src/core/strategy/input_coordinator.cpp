@@ -358,11 +358,21 @@ static std::optional<MatchQuality> MatchCustomPinyinCandidate(
     }
 }
 
+static std::string BuildSegmentedDisplayCode(const std::string& spacedCode, const std::string& resolvedCode) {
+    if (!spacedCode.empty()) {
+        std::string seg = spacedCode;
+        std::replace(seg.begin(), seg.end(), ' ', '\'');
+        return seg;
+    }
+    return resolvedCode;
+}
+
 std::vector<Candidate>
 InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                                        const MethodResolution& res,
                                        bool exactOnly) const {
     std::vector<Candidate> candidates;
+    const std::string segDisplayCode = BuildSegmentedDisplayCode(res.spaced_code, res.resolved_code);
 
     if (dictId == DICT_ID_CUSTOM) {
         if (res.scheme == InputScheme::Wubi86) {
@@ -382,6 +392,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 c.layout_id = res.layout_id;
                 c.raw_code = res.raw_code;
                 c.resolved_code = res.resolved_code;
+                c.segmented_code = segDisplayCode;
                 c.scheme = res.scheme;
                 c.method_priority = res.method_priority;
                 candMap[c.entry_id] = candidates.size();
@@ -404,6 +415,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 c.layout_id = res.layout_id;
                 c.raw_code = res.raw_code;
                 c.resolved_code = res.resolved_code;
+                c.segmented_code = segDisplayCode;
                 c.scheme = res.scheme;
                 c.method_priority = res.method_priority;
                 candMap[c.entry_id] = candidates.size();
@@ -429,6 +441,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                     c.layout_id = res.layout_id;
                     c.raw_code = res.raw_code;
                     c.resolved_code = res.resolved_code;
+                    c.segmented_code = segDisplayCode;
                     c.scheme = res.scheme;
                     c.method_priority = res.method_priority;
                     candMap[c.entry_id] = candidates.size();
@@ -490,6 +503,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 c.layout_id = res.layout_id;
                 c.raw_code = res.raw_code;
                 c.resolved_code = res.resolved_code;
+                c.segmented_code = segDisplayCode;
                 c.scheme = res.scheme;
                 c.method_priority = res.method_priority;
                 candMap[c.entry_id] = candidates.size();
@@ -506,6 +520,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 c.layout_id = "";
                 c.raw_code = res.raw_code;
                 c.resolved_code = res.resolved_code;
+                c.segmented_code = segDisplayCode;
                 c.scheme = InputScheme::Wubi86;
                 c.method_priority = res.method_priority;
                 seenIds.insert(c.entry_id);
@@ -524,6 +539,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                         cand->layout_id = "";
                         cand->raw_code = res.raw_code;
                         cand->resolved_code = res.resolved_code;
+                        cand->segmented_code = segDisplayCode;
                         cand->scheme = InputScheme::Wubi86;
                         cand->method_priority = res.method_priority;
                         seenIds.insert(pref.entry_id);
@@ -543,6 +559,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                         cand->layout_id = "";
                         cand->raw_code = res.raw_code;
                         cand->resolved_code = res.resolved_code;
+                        cand->segmented_code = segDisplayCode;
                         cand->scheme = InputScheme::Wubi86;
                         cand->method_priority = res.method_priority;
                         seenIds.insert(stat.entry_id);
@@ -572,6 +589,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 c.layout_id = res.layout_id;
                 c.raw_code = res.raw_code;
                 c.resolved_code = res.resolved_code;
+                c.segmented_code = segDisplayCode;
                 c.scheme = res.scheme;
                 c.method_priority = res.method_priority;
                 seenIds.insert(c.entry_id);
@@ -599,6 +617,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                         cand->layout_id = res.layout_id;
                         cand->raw_code = res.raw_code;
                         cand->resolved_code = res.resolved_code;
+                        cand->segmented_code = segDisplayCode;
                         cand->scheme = res.scheme;
                         cand->method_priority = res.method_priority;
                         seenIds.insert(pref.entry_id);
@@ -626,6 +645,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                         cand->layout_id = res.layout_id;
                         cand->raw_code = res.raw_code;
                         cand->resolved_code = res.resolved_code;
+                        cand->segmented_code = segDisplayCode;
                         cand->scheme = res.scheme;
                         cand->method_priority = res.method_priority;
                         seenIds.insert(stat.entry_id);
@@ -1064,6 +1084,7 @@ InputCoordinator::Query(const std::string& rawCode,
                             sentCand.raw_code = rawCode;
                             sentCand.matched_code = rawCode;
                             sentCand.resolved_code = m.resolved_code;
+                            sentCand.segmented_code = BuildSegmentedDisplayCode(m.spaced_code, m.resolved_code);
                             sentCand.layout_id = m.layout_id;
                             sentCand.dict_id = sentenceDictId;
                             sentCand.scheme = m.scheme;

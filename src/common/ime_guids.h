@@ -14,6 +14,10 @@ DEFINE_GUID(GUID_PersonalIME_Profile,
 DEFINE_GUID(GUID_PersonalIME_LangBarItem, 
     0xe8c61b23, 0x9d45, 0x481a, 0xb8, 0x71, 0x38, 0x2c, 0x8c, 0x67, 0x64, 0xb2);
 
+// Display Attribute GUID for Input Composition: {9B4E2D1A-6C83-4E5F-B9A1-1234567890AB}
+DEFINE_GUID(GUID_PersonalIME_DisplayAttributeInput,
+    0x9b4e2d1a, 0x6c83, 0x4e5f, 0xb9, 0xa1, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab);
+
 inline constexpr const wchar_t* IME_NAME = L"人人";
 inline constexpr const wchar_t* IME_PIPE_NAME = L"\\\\.\\pipe\\PersonalIME_Service_Pipe";
 inline constexpr LANGID IME_LANGID = MAKELANGID(LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED);

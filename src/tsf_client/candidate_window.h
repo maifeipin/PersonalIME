@@ -87,6 +87,19 @@ public:
     int GetCandidateCount() const { return static_cast<int>(m_candidates.size()); }
     const std::vector<RECT>& GetCandidateRects() const { return m_candidateRects; }
 
+    // Stage 7.1b: Preedit Header & Pure Candidate Text Extraction
+    void SetPreeditDisplayMode(PreeditDisplayMode mode);
+    PreeditDisplayMode GetPreeditDisplayMode() const { return m_preeditDisplayMode; }
+    bool IsPreeditHeaderVisible() const { return m_isHeaderVisible; }
+    RECT GetPreeditHeaderRect() const { return m_rcHeader; }
+    std::wstring GetDisplayedPreeditText() const;
+    static std::wstring ExtractCandidateCoreText(const std::wstring& formattedCandidate);
+    static bool ShouldShowPreeditHeader(const CandidateDisplaySnapshot& snap, PreeditDisplayMode displayMode);
+    static bool ShouldShowWindow(const CandidateDisplaySnapshot& snap, PreeditDisplayMode displayMode);
+    bool ShouldShowWindow(const CandidateDisplaySnapshot& snap) const {
+        return ShouldShowWindow(snap, m_preeditDisplayMode);
+    }
+
     void SetPlugins(const std::vector<CandidatePluginItem>& plugins);
     const std::vector<CandidatePluginItem>& GetPlugins() const { return m_plugins; }
 
@@ -126,8 +139,17 @@ private:
     int m_pressedIndex = -1;
     uint32_t m_pressedVersion = 0;
     uint64_t m_pressedContextId = 0;
+    uint64_t m_pressedContextEpoch = 0;
+    uint64_t m_pressedInputGeneration = 0;
+    CandidateWindowMode m_pressedMode = CandidateWindowMode::StandardInline;
     uint32_t m_pressedPageIndex = 0;
     std::wstring m_pressedCandidateText;
+
+    PreeditDisplayMode m_preeditDisplayMode = PreeditDisplayMode::Always;
+    bool m_isHeaderVisible = false;
+    int m_headerHeight = 0;
+    RECT m_rcHeader{0, 0, 0, 0};
+    void UpdatePreviewTextFromSelection();
 
     RECT m_rcMgrBtn{0, 0, 0, 0};
     bool m_isHoveringMgrBtn = false;

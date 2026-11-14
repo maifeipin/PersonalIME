@@ -229,6 +229,24 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
         }
         SafeCopyCandidateText(resp.candidates[i], sizeof(resp.candidates[i])/sizeof(wchar_t), label);
     }
+
+    if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 &&
+        resp.has_commit == 0 &&
+        !st.cached_coord_query.candidates.empty()) {
+        uint32_t idx = (startIdx < total) ? startIdx : 0;
+        const auto& topCand = st.cached_coord_query.candidates[idx];
+        const std::string& codeUtf8 = !topCand.segmented_code.empty()
+            ? topCand.segmented_code
+            : topCand.resolved_code;
+        if (!codeUtf8.empty()) {
+            std::wstring qCode = ime::Utf8ToWide(codeUtf8);
+            if (!qCode.empty()) {
+                SafeCopyCandidateText(resp.commit_text, sizeof(resp.commit_text) / sizeof(wchar_t), qCode);
+                resp.commit_length = 0;
+                resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+            }
+        }
+    }
 }
 
 static void PopulateCandidates(ContextState& st, IpcKeyResponse& resp) {
@@ -282,20 +300,6 @@ static void PopulateCandidates(ContextState& st, IpcKeyResponse& resp) {
     resp.candidate_version = st.candidate_version;
 
     PopulateCandidatesPage(resp, st);
-
-    if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 &&
-        resp.has_commit == 0 &&
-        !st.cached_coord_query.candidates.empty()) {
-        const auto& topCand = st.cached_coord_query.candidates[0];
-        std::wstring qCode = !topCand.resolved_code.empty()
-            ? ime::Utf8ToWide(topCand.resolved_code)
-            : st.composition;
-        if (!qCode.empty()) {
-            SafeCopyCandidateText(resp.commit_text, sizeof(resp.commit_text) / sizeof(wchar_t), qCode);
-            resp.commit_length = 0;
-            resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
-        }
-    }
 }
 
 static std::wstring MapChinesePunctuation(uint32_t vk, uint32_t modifiers) {

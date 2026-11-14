@@ -350,6 +350,117 @@ int main() {
     }
     std::wcout << L"[PASS] Verified: Paging arrow press lifecycle strictly bound to snapshot, cancels on Refresh/Hide/Capture loss." << std::endl;
 
+    // 10. Stage 7.1b: Preedit Header DisplayMode, Pure Text Extraction, Live Selection Sync & Press Mutation Guards
+    {
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"1. 大家 [dw]"), std::wstring(L"大家"), L"ExtractCandidateCoreText strips index and reverse code");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"2. 达伽马"), std::wstring(L"达伽马"), L"ExtractCandidateCoreText strips index without reverse code");
+        CHECK_EQ(CCandidateWindow::ExtractCandidateCoreText(L"10. 测试词 [cs]"), std::wstring(L"测试词"), L"ExtractCandidateCoreText strips multi-digit index");
+
+        CCandidateWindow wnd;
+        CHECK_EQ(wnd.GetPreeditDisplayMode() == PreeditDisplayMode::Always, true, L"Default PreeditDisplayMode is Always");
+
+        CandidateDisplaySnapshot snap{};
+        snap.context_id = 500;
+        snap.context_epoch = 10;
+        snap.input_generation = 20;
+        snap.candidate_version = 30;
+        snap.page_index = 0;
+        snap.page_count = 1;
+        snap.mode = CandidateWindowMode::StandardInline;
+        snap.raw_input = L"dajia";
+        snap.query_code = L"da'jia";
+        snap.candidates = { L"1. 大家 [dw]", L"2. 打架 [dj]", L"3. 大街 [dj]" };
+        snap.initial_selected_index = 0;
+
+        // Mode 1: Always -> Preedit Header shown even in StandardInline
+        wnd.Show(snap, { 120, 120 });
+        HWND hWnd = wnd.GetHwnd();
+        CHECK_EQ(hWnd != nullptr && IsWindowVisible(hWnd), true, L"Window visible in Always mode");
+        CHECK_EQ(wnd.IsPreeditHeaderVisible(), true, L"Preedit Header visible in Always mode");
+        CHECK_EQ(wnd.GetDisplayedPreeditText(), std::wstring(L"da'jia [大家]"), L"Initial displayed preedit text with query_code and preview_text");
+        RECT rcHeader = wnd.GetPreeditHeaderRect();
+        CHECK_EQ(rcHeader.bottom > rcHeader.top && rcHeader.right > rcHeader.left, true, L"Header rect has non-zero dimensions");
+
+        // Live preview_text sync on keyboard selection (SetSelectedIndex)
+        wnd.SetSelectedIndex(1);
+        CHECK_EQ(wnd.GetSelectedIndex(), 1, L"Selected index updated to 1");
+        CHECK_EQ(wnd.GetDisplayedPreeditText(), std::wstring(L"da'jia [打架]"), L"Preview text updated on keyboard selection");
+
+        // Live preview_text sync on mouse hover
+        const auto& rects = wnd.GetCandidateRects();
+        CHECK_EQ(rects.size(), size_t(3), L"3 candidate rects");
+        LPARAM hoverCand2 = MAKELPARAM((rects[2].left + rects[2].right) / 2, (rects[2].top + rects[2].bottom) / 2);
+        SendMessageW(hWnd, WM_MOUSEMOVE, 0, hoverCand2);
+        CHECK_EQ(wnd.GetSelectedIndex(), 2, L"Selected index updated to 2 on hover");
+        CHECK_EQ(wnd.GetDisplayedPreeditText(), std::wstring(L"da'jia [大街]"), L"Preview text updated on mouse hover");
+
+        // Mode 2: CompositionlessOnly -> hidden in StandardInline, shown in Compositionless
+        wnd.SetPreeditDisplayMode(PreeditDisplayMode::CompositionlessOnly);
+        CHECK_EQ(wnd.IsPreeditHeaderVisible(), false, L"Header hidden in StandardInline when mode is CompositionlessOnly");
+        CHECK_EQ(IsWindowVisible(hWnd) != FALSE, true, L"Candidate row still visible when candidates non-empty");
+
+        snap.mode = CandidateWindowMode::Compositionless;
+        snap.initial_selected_index = 0;
+        wnd.Show(snap, { 120, 120 });
+        CHECK_EQ(wnd.IsPreeditHeaderVisible(), true, L"Header visible in Compositionless when mode is CompositionlessOnly");
+        CHECK_EQ(wnd.GetDisplayedPreeditText(), std::wstring(L"da'jia [大家]"), L"Preview text in Compositionless mode");
+
+        // Empty candidates with non-empty raw_input:
+        // Shown in Always and CompositionlessOnly(when Compositionless), hidden in Disabled
+        CandidateDisplaySnapshot emptyCandSnap = snap;
+        emptyCandSnap.candidates.clear();
+        emptyCandSnap.query_code.clear();
+        emptyCandSnap.raw_input = L"zzzz";
+        emptyCandSnap.mode = CandidateWindowMode::Compositionless;
+        wnd.Show(emptyCandSnap, { 120, 120 });
+        CHECK_EQ(IsWindowVisible(hWnd) != FALSE, true, L"Window stays visible with Preedit Header even when candidates are empty");
+        CHECK_EQ(wnd.IsPreeditHeaderVisible(), true, L"Header visible when candidates are empty");
+        CHECK_EQ(wnd.GetDisplayedPreeditText(), std::wstring(L"zzzz"), L"Header shows raw_input when candidates are empty");
+
+        wnd.SetPreeditDisplayMode(PreeditDisplayMode::Disabled);
+        wnd.Show(emptyCandSnap, { 120, 120 });
+        CHECK_EQ(IsWindowVisible(hWnd) != FALSE, false, L"Window hidden when candidates empty and PreeditDisplayMode::Disabled");
+        CHECK_EQ(wnd.IsPreeditHeaderVisible(), false, L"Header hidden in Disabled mode");
+
+        // Restore Always mode and verify press-to-release mutation guards on context_epoch / input_generation / mode
+        wnd.SetPreeditDisplayMode(PreeditDisplayMode::Always);
+        snap.mode = CandidateWindowMode::Compositionless;
+        wnd.Show(snap, { 120, 120 });
+
+        int selectCount = 0;
+        wnd.SetOnSelectCandidateSnapshot([&](const CandidateDisplaySnapshot&, int) {
+            selectCount++;
+        });
+
+        const auto& rectsAfter = wnd.GetCandidateRects();
+        LPARAM ptCand0 = MAKELPARAM((rectsAfter[0].left + rectsAfter[0].right) / 2, (rectsAfter[0].top + rectsAfter[0].bottom) / 2);
+
+        // Press on candidate 0, then mutate input_generation before release -> must NOT fire callback
+        SendMessageW(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, ptCand0);
+        CandidateDisplaySnapshot mutatedGenSnap = snap;
+        mutatedGenSnap.input_generation = snap.input_generation + 1;
+        wnd.Show(mutatedGenSnap, { 120, 120 });
+        SendMessageW(hWnd, WM_LBUTTONUP, 0, ptCand0);
+        CHECK_EQ(selectCount, 0, L"Mutation of input_generation between LButtonDown and LButtonUp must cancel click");
+
+        // Press on candidate 0, then mutate context_epoch before release -> must NOT fire callback
+        SendMessageW(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, ptCand0);
+        CandidateDisplaySnapshot mutatedEpochSnap = mutatedGenSnap;
+        mutatedEpochSnap.context_epoch = mutatedGenSnap.context_epoch + 1;
+        wnd.Show(mutatedEpochSnap, { 120, 120 });
+        SendMessageW(hWnd, WM_LBUTTONUP, 0, ptCand0);
+        CHECK_EQ(selectCount, 0, L"Mutation of context_epoch between LButtonDown and LButtonUp must cancel click");
+
+        // Unmutated press + release on candidate 0 -> fires callback exactly once
+        SendMessageW(hWnd, WM_LBUTTONDOWN, MK_LBUTTON, ptCand0);
+        SendMessageW(hWnd, WM_LBUTTONUP, 0, ptCand0);
+        CHECK_EQ(selectCount, 1, L"Unmutated press + release fires selection callback");
+
+        wnd.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+    }
+    std::wcout << L"[PASS] Verified: Stage 7.1b Preedit Header modes, pure preview text sync, empty-candidate header & generation/epoch press guards." << std::endl;
+
     std::wcout << L"=== All Candidate Window tests PASSED! ===" << std::endl;
     return 0;
 }

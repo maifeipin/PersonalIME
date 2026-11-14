@@ -5,6 +5,7 @@
 #include <vector>
 #include <atomic>
 #include <thread>
+#include "../src/common/ime_guids.h"
 #include "../src/tsf_client/globals.h"
 #include "../src/tsf_client/edit_session.h"
 #include "../src/tsf_client/text_input_processor.h"
@@ -364,6 +365,10 @@ public:
     bool m_forceSyncBlocked = false;
     bool m_failAsyncRequest = false;
     bool m_deferAsyncSession = false;
+    bool m_failStartComposition = false;
+    HRESULT m_startCompositionHr = E_FAIL;
+    DWORD m_dynamicStatusFlags = 0;
+    int m_editSessionRequestCount = 0;
     int m_asyncRequestCount = 0;
     ITfEditSession* m_pDeferredSession = nullptr;
 
@@ -401,6 +406,7 @@ public:
     // ITfContext methods
     STDMETHODIMP RequestEditSession(TfClientId tid, ITfEditSession* pes, DWORD dwFlags, HRESULT* phrSession) override {
         g_lastActiveMockContext = this;
+        ++m_editSessionRequestCount;
         if (!pes || !phrSession) return E_INVALIDARG;
         if ((dwFlags & TF_ES_SYNC) && m_forceSyncBlocked) {
             *phrSession = TF_E_SYNCHRONOUS;
@@ -447,7 +453,12 @@ public:
     STDMETHODIMP GetEnd(TfEditCookie ec, ITfRange **ppEnd) override { return E_NOTIMPL; }
     STDMETHODIMP GetActiveView(ITfContextView** ppView) override { return E_NOTIMPL; }
     STDMETHODIMP EnumViews(IEnumTfContextViews **ppEnum) override { return E_NOTIMPL; }
-    STDMETHODIMP GetStatus(TF_STATUS* pdcs) override { return E_NOTIMPL; }
+    STDMETHODIMP GetStatus(TF_STATUS* pdcs) override {
+        if (!pdcs) return E_POINTER;
+        pdcs->dwDynamicFlags = m_dynamicStatusFlags;
+        pdcs->dwStaticFlags = 0;
+        return S_OK;
+    }
     STDMETHODIMP GetProperty(REFGUID guidProp, ITfProperty** ppProp) override { return E_NOTIMPL; }
     STDMETHODIMP GetAppProperty(REFGUID guidProp, ITfReadOnlyProperty** ppProp) override { return E_NOTIMPL; }
     STDMETHODIMP TrackProperties(const GUID **prgProp, ULONG cProp, const GUID **prgAppProp, ULONG cAppProp, ITfReadOnlyProperty** ppProperty) override { return E_NOTIMPL; }
@@ -458,6 +469,10 @@ public:
     // ITfContextComposition methods
     STDMETHODIMP StartComposition(TfEditCookie ecWrite, ITfRange* pCompositionRange, ITfCompositionSink* pSink, ITfComposition** ppComposition) override {
         if (!ppComposition) return E_POINTER;
+        if (m_failStartComposition) {
+            *ppComposition = nullptr;
+            return m_startCompositionHr;
+        }
         auto* comp = new MockComposition();
         m_lastCreatedComposition = comp;
         *ppComposition = comp; // COM contract: returns AddRef'd pointer (ref count = 1)
@@ -1474,6 +1489,35 @@ public:
                             st.candidates = { L"工", L"戈", L"阿", L"啊", L"呵" };
                             FillCandidates(resp, st);
                         }
+                    } else if (vk == VK_BACK) {
+                        if (st.composition.empty()) {
+                            resp.handled = 0;
+                        } else {
+                            st.prev_composition = st.composition;
+                            st.composition.pop_back();
+                            if (!st.composition.empty()) {
+                                st.candidate_version++;
+                                st.page_index = 0;
+                                st.page_count = 2;
+                                st.candidates = { L"工", L"戈", L"阿", L"啊", L"呵" };
+                                FillCandidates(resp, st);
+                            } else {
+                                st.candidates.clear();
+                                resp.has_composition = 1;
+                                resp.composition[0] = L'\0';
+                                resp.candidate_count = 0;
+                            }
+                        }
+                    } else if (vk == VK_ESCAPE) {
+                        if (st.composition.empty()) {
+                            resp.handled = 0;
+                        } else {
+                            st.composition.clear();
+                            st.candidates.clear();
+                            resp.has_composition = 1;
+                            resp.composition[0] = L'\0';
+                            resp.candidate_count = 0;
+                        }
                     } else if (vk == VK_SPACE || (vk >= '1' && vk <= '9')) {
                         pThis->m_lastSelectVersion.store(req.candidate_version);
                         if (st.candidates.empty() || req.candidate_version != st.candidate_version) {
@@ -1988,6 +2032,176 @@ int TestPluginSyncNonBlockingAndDisabledClickRejection() {
     return 0;
 }
 
+// Test 19: Stage 7.1b - Compositionless Degradation (UiOnlyHandled), Non-Degradable Reject,
+// Direct Key Updates without Per-Key Write Locks, Commit/Cancel/Unfocus Leases & Display Attributes
+int TestStage71bCompositionlessAndDisplayAttributes() {
+    std::wcout << L"[TEST 19] Testing Stage 7.1b Compositionless Degradation, Leases, Selection Validation & Display Attributes..." << std::endl;
+
+    const std::wstring testPipeName = L"\\\\.\\pipe\\PersonalIME_MockPipe_T19_" + std::to_wstring(GetCurrentProcessId());
+    SnapshotMockIpcServer server(testPipeName);
+    CHECK_TRUE(server.Start(3), L"Snapshot mock server must start");
+    IpcClient::SetPipeNameForTest(testPipeName.c_str());
+
+    CTextInputProcessor tip;
+    tip.SetClientIdForTest(1);
+
+    // 1. Verify ITfDisplayAttributeProvider implementation
+    {
+        ITfDisplayAttributeProvider* pProvider = nullptr;
+        HRESULT hrQi = tip.QueryInterface(IID_ITfDisplayAttributeProvider, reinterpret_cast<void**>(&pProvider));
+        CHECK_EQUAL(hrQi, S_OK, L"QueryInterface(IID_ITfDisplayAttributeProvider) must succeed");
+        CHECK_TRUE(pProvider != nullptr, L"pProvider non-null");
+
+        ITfDisplayAttributeInfo* pInfo = nullptr;
+        HRESULT hrGet = pProvider->GetDisplayAttributeInfo(GUID_PersonalIME_DisplayAttributeInput, &pInfo);
+        CHECK_EQUAL(hrGet, S_OK, L"GetDisplayAttributeInfo for GUID_PersonalIME_DisplayAttributeInput must succeed");
+        CHECK_TRUE(pInfo != nullptr, L"pInfo non-null");
+
+        TF_DISPLAYATTRIBUTE attr{};
+        CHECK_EQUAL(pInfo->GetAttributeInfo(&attr), S_OK, L"GetAttributeInfo must succeed");
+        CHECK_EQUAL(attr.lsStyle, TF_LS_DOT, L"Display attribute underline style must be TF_LS_DOT");
+        CHECK_EQUAL(attr.bAttr, TF_ATTR_INPUT, L"Display attribute bAttr must be TF_ATTR_INPUT");
+        pInfo->Release();
+
+        IEnumTfDisplayAttributeInfo* pEnum = nullptr;
+        CHECK_EQUAL(pProvider->EnumDisplayAttributeInfo(&pEnum), S_OK, L"EnumDisplayAttributeInfo must succeed");
+        ITfDisplayAttributeInfo* pEnumItem = nullptr;
+        ULONG fetched = 0;
+        CHECK_EQUAL(pEnum->Next(1, &pEnumItem, &fetched), S_OK, L"Enum Next(1) must return S_OK");
+        CHECK_EQUAL(fetched, 1u, L"Fetched 1 display attribute item");
+        pEnumItem->Release();
+        pEnum->Release();
+        pProvider->Release();
+    }
+
+    // 2. Non-degradable failures (TS_SD_READONLY, TF_E_DISCONNECTED, E_OUTOFMEMORY, TF_E_NOLOCK)
+    //    must return Unmodified and rollback server, NEVER entering CompositionlessComposing!
+    {
+        MockContext roCtx;
+        roCtx.m_dynamicStatusFlags = TS_SD_READONLY;
+        roCtx.m_failStartComposition = true;
+        roCtx.m_startCompositionHr = E_FAIL;
+
+        BOOL eaten = TRUE;
+        tip.OnKeyDown(&roCtx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Readonly context must NOT eat key or degrade to CompositionlessComposing");
+        CHECK_TRUE(tip.GetCompositionState(&roCtx) == CompositionState::None, L"Readonly context stays in CompositionState::None");
+
+        MockContext discCtx;
+        discCtx.m_failStartComposition = true;
+        discCtx.m_startCompositionHr = TF_E_DISCONNECTED;
+        eaten = TRUE;
+        tip.OnKeyDown(&discCtx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"TF_E_DISCONNECTED must NOT degrade to CompositionlessComposing");
+        CHECK_TRUE(tip.GetCompositionState(&discCtx) == CompositionState::None, L"Disconnected context stays in CompositionState::None");
+    }
+
+    // 3. Eligible StartComposition failure degrades to CompositionlessComposing (UiOnlyHandled):
+    //    - Key is eaten (*pfEaten = TRUE), server is NOT rolled back
+    //    - Strong COM reference lease is held on ITfContext
+    //    - Subsequent coding keys, Backspace, paging update UI directly WITHOUT requesting per-key write locks!
+    //    - Preedit Header is shown with raw_input and pure preview_text
+    {
+        auto* ctx = new MockContext();
+        LONG initialRef = ctx->m_cRef; // 1
+        ctx->m_failStartComposition = true;
+        ctx->m_startCompositionHr = E_FAIL;
+
+        CCandidateWindow& wnd = tip.GetCandidateWindowForTest();
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"StartComposition failure in eligible context degrades to UiOnlyHandled and eats key 'A'");
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::CompositionlessComposing, L"Context state is CompositionlessComposing");
+        CHECK_TRUE(tip.GetComposition(ctx) == nullptr, L"m_pComposition is nullptr in CompositionlessComposing");
+        CHECK_TRUE(ctx->m_cRef > initialRef, L"TIP holds strong COM reference lease on ITfContext while in CompositionlessComposing");
+        CHECK_EQUAL(IsWindowVisible(wnd.GetHwnd()) != FALSE, true, L"Candidate window is visible in Compositionless mode");
+        CHECK_TRUE(wnd.GetSnapshot().mode == CandidateWindowMode::Compositionless, L"Snapshot mode is Compositionless");
+        CHECK_EQUAL(wnd.IsPreeditHeaderVisible(), true, L"Preedit Header is visible in Compositionless mode");
+        CHECK_EQUAL(wnd.GetDisplayedPreeditText(), std::wstring(L"a [工]"), L"Preedit Header displays 'a [工]'");
+
+        int editSessionsAfterFirstKey = ctx->m_editSessionRequestCount;
+        CHECK_EQUAL(editSessionsAfterFirstKey, 1, L"First key requested 1 EditSession before degrading");
+
+        // Second coding key 'B' in CompositionlessComposing updates UI directly via UiOnlyHandled WITHOUT RequestEditSession!
+        tip.OnKeyDown(ctx, 'B', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Second key 'B' eaten in CompositionlessComposing");
+        CHECK_EQUAL(ctx->m_editSessionRequestCount, editSessionsAfterFirstKey, L"Subsequent keystroke in CompositionlessComposing does NOT request TSF write lock");
+        CHECK_EQUAL(wnd.GetDisplayedPreeditText(), std::wstring(L"ab [节]"), L"Preedit Header updated to 'ab [节]'");
+
+        // Backspace in CompositionlessComposing returns to 'a' ("a [工]") without RequestEditSession
+        tip.OnKeyDown(ctx, VK_BACK, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"VK_BACK eaten in CompositionlessComposing");
+        CHECK_EQUAL(ctx->m_editSessionRequestCount, editSessionsAfterFirstKey, L"VK_BACK in CompositionlessComposing does NOT request TSF write lock");
+        CHECK_EQUAL(wnd.GetDisplayedPreeditText(), std::wstring(L"a [工]"), L"Preedit Header updated back to 'a [工]'");
+
+        // Paging (VK_NEXT) in CompositionlessComposing flips to Page 1 without RequestEditSession
+        tip.OnKeyDown(ctx, VK_NEXT, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"VK_NEXT eaten in CompositionlessComposing");
+        CHECK_EQUAL(ctx->m_editSessionRequestCount, editSessionsAfterFirstKey, L"VK_NEXT in CompositionlessComposing does NOT request TSF write lock");
+        CHECK_EQUAL(wnd.GetSnapshot().page_index, 1u, L"Snapshot page_index updated to 1");
+        CHECK_EQUAL(wnd.GetDisplayedPreeditText(), std::wstring(L"a [腌]"), L"Preedit Header updated to Page 1 first candidate 'a [腌]'");
+
+        // Mouse click selection in CompositionlessComposing passes IsDisplayedSnapshotValid and commits to host selection!
+        int commitsBefore = server.m_commitSuccessCount.load();
+        const auto& rects = wnd.GetCandidateRects();
+        POINT ptCand1 = { (rects[1].left + rects[1].right) / 2, (rects[1].top + rects[1].bottom) / 2 };
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptCand1.x, ptCand1.y));
+        SendMessageW(wnd.GetHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptCand1.x, ptCand1.y));
+
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), commitsBefore + 1, L"Mouse click in CompositionlessComposing committed and confirmed CommitSuccess!");
+        CHECK_EQUAL(ctx->m_activeCompRange, L"锕", L"Host selection range written with committed text '锕'");
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::None, L"Context exited CompositionlessComposing to Idle (None) after commit");
+        CHECK_EQUAL(ctx->m_cRef, initialRef, L"Strong COM reference lease on ITfContext released upon exiting CompositionlessComposing");
+        CHECK_EQUAL(IsWindowVisible(wnd.GetHwnd()) != FALSE, false, L"Candidate window hidden after commit");
+
+        // 4. Compositionless commit where SetSelection fails after SetText succeeds ->
+        //    PartiallyModified (CommitSuccess confirmed once), does NOT enter CommitPendingEnd or fabricate composition!
+        tip.OnKeyDown(ctx, 'A', 0, &eaten);
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::CompositionlessComposing, L"Re-entered CompositionlessComposing");
+        g_failSetSelection = true;
+        commitsBefore = server.m_commitSuccessCount.load();
+        tip.OnKeyDown(ctx, VK_SPACE, 0, &eaten);
+        g_failSetSelection = false;
+        CHECK_EQUAL(eaten, TRUE, L"VK_SPACE commit eaten");
+        CHECK_EQUAL(ctx->m_activeCompRange, L"工", L"Host text written to '工'");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), commitsBefore + 1, L"PartiallyModified in Compositionless commit still confirms CommitSuccess");
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::None, L"Compositionless SetSelection failure must NOT enter CommitPendingEnd");
+        CHECK_TRUE(tip.GetComposition(ctx) == nullptr, L"No composition object fabricated");
+
+        // 5. Esc and focus loss (OnSetFocus(FALSE)) in CompositionlessComposing invalidate snapshot,
+        //    advance epoch/generation, release COM lease, and reset server without touching host text!
+        ctx->m_activeCompRange = L"untouched_host_text";
+        tip.OnKeyDown(ctx, 'A', 0, &eaten);
+        CandidateDisplaySnapshot snapBeforeEsc = wnd.GetSnapshot();
+        CHECK_TRUE(tip.IsDisplayedSnapshotValid(snapBeforeEsc), L"Snapshot valid while in CompositionlessComposing");
+
+        tip.OnKeyDown(ctx, VK_ESCAPE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"VK_ESCAPE eaten in CompositionlessComposing");
+        CHECK_EQUAL(ctx->m_activeCompRange, L"untouched_host_text", L"VK_ESCAPE in CompositionlessComposing does not touch host text");
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::None, L"State returned to None after Esc");
+        CHECK_EQUAL(ctx->m_cRef, initialRef, L"COM reference lease released on Esc");
+        CHECK_EQUAL(tip.IsDisplayedSnapshotValid(snapBeforeEsc), false, L"Old snapshot invalidated after Esc");
+
+        // Re-enter and test OnSetFocus(FALSE)
+        tip.OnKeyDown(ctx, 'A', 0, &eaten);
+        CandidateDisplaySnapshot snapBeforeUnfocus = wnd.GetSnapshot();
+        int resetsBefore = server.m_resetCount.load();
+        tip.OnSetFocus(FALSE);
+        CHECK_TRUE(tip.GetCompositionState(ctx) == CompositionState::None, L"State returned to None on OnSetFocus(FALSE)");
+        CHECK_EQUAL(ctx->m_cRef, initialRef, L"COM reference lease released on OnSetFocus(FALSE)");
+        CHECK_EQUAL(tip.IsDisplayedSnapshotValid(snapBeforeUnfocus), false, L"Old snapshot invalidated on OnSetFocus(FALSE)");
+        CHECK_TRUE(server.m_resetCount.load() > resetsBefore, L"Server context reset on OnSetFocus(FALSE)");
+
+        ctx->Release();
+    }
+
+    tip.Deactivate();
+    server.Stop();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Stage 7.1b Compositionless degradation, leases, selection validation & DisplayAttributes verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -2009,6 +2223,7 @@ int main() {
     if (TestAsyncQueuedEditSessionCommitAndFailureMatrix() != 0) return 1;
     if (TestSnapshotBoundMouseSelectionAndLatePaging() != 0) return 1;
     if (TestPluginSyncNonBlockingAndDisabledClickRejection() != 0) return 1;
+    if (TestStage71bCompositionlessAndDisplayAttributes() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;
