@@ -142,8 +142,10 @@ public:
     DWORD GetLastHookInstallError() const { return m_lastHookInstallError; }
     bool IsHookFallbackManagerVisible() const { return m_showFallbackMgrBtn; }
     static bool IsHookObserverActive();
+    static int GetLiveObserverInstanceCountForTest();
     static void SetHookInstallFailureOverrideForTest(bool fail);
     static void SetHookStartDelayOverrideForTest(DWORD delayMs);
+    static void SetHookExitDelayOverrideForTest(DWORD delayMs);
     static void SetHookWaitTimeoutOverrideForTest(DWORD timeoutMs);
     void SimulateExternalClickForTest(POINT screenPt, uint32_t generationOverride = 0);
     int GetMenuScrollOffset() const { return m_menuScrollOffset; }

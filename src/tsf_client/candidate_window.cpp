@@ -2,6 +2,7 @@
 #include "globals.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -13,7 +14,9 @@ static LONG s_cMenuClassRef = 0;
 static std::atomic<int> s_appsUseLightThemeOverride{-1};
 static std::atomic<bool> s_forceHookInstallFailForTest{false};
 static std::atomic<DWORD> s_hookStartDelayMsForTest{0};
+static std::atomic<DWORD> s_hookExitDelayMsForTest{0};
 static std::atomic<DWORD> s_hookWaitTimeoutMsForTest{0};
+static std::atomic<int> s_liveObserverInstances{0};
 static constexpr UINT WM_APP_EXTERNAL_CLICK = WM_APP + 0x73;
 
 namespace {
@@ -40,6 +43,10 @@ struct ObserverInstance {
     ObserverLifecycle lifecycle = ObserverLifecycle::Starting;
     bool cancelRequested = false;
 
+    ObserverInstance() {
+        s_liveObserverInstances.fetch_add(1, std::memory_order_relaxed);
+    }
+
     ~ObserverInstance() {
         if (hReadyEvent) {
             CloseHandle(hReadyEvent);
@@ -49,6 +56,7 @@ struct ObserverInstance {
             CloseHandle(hThread);
             hThread = nullptr;
         }
+        s_liveObserverInstances.fetch_sub(1, std::memory_order_relaxed);
     }
 };
 
@@ -63,6 +71,11 @@ struct HookObserverState {
 HookObserverState& GetHookObserverState() {
     static HookObserverState s_state;
     return s_state;
+}
+
+DWORD GetObserverWaitTimeoutMs(DWORD defaultMs) {
+    DWORD ov = s_hookWaitTimeoutMsForTest.load(std::memory_order_acquire);
+    return (ov > 0) ? ov : defaultMs;
 }
 
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -163,6 +176,8 @@ DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
             }
             state.cv.notify_all();
         }
+        // Release thread-side shared_ptr before FreeLibraryAndExitThread (which never unwinds locals)
+        inst.reset();
         if (hMod) {
             FreeLibraryAndExitThread(hMod, 1);
         }
@@ -172,6 +187,11 @@ DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    DWORD exitDelayMs = s_hookExitDelayMsForTest.load(std::memory_order_acquire);
+    if (exitDelayMs > 0) {
+        Sleep(exitDelayMs);
     }
 
     UnhookWindowsHookEx(hHook);
@@ -185,6 +205,8 @@ DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
         state.cv.notify_all();
     }
 
+    // Release thread-side shared_ptr before FreeLibraryAndExitThread (which never unwinds locals)
+    inst.reset();
     if (hMod) {
         FreeLibraryAndExitThread(hMod, 0);
     }
@@ -195,12 +217,20 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
     if (pOutError) *pOutError = 0;
     if (generation == 0 || !uiHwnd || !menuHwnd) return false;
 
+    DWORD waitTimeoutMs = GetObserverWaitTimeoutMs(2000);
     auto& state = GetHookObserverState();
     std::shared_ptr<ObserverInstance> inst;
     {
         std::unique_lock<std::mutex> lock(state.mutex);
-        while (state.current != nullptr && state.current->lifecycle == ObserverLifecycle::Stopping) {
-            state.cv.wait(lock);
+        bool stoppedInTime = state.cv.wait_for(
+            lock,
+            std::chrono::milliseconds(waitTimeoutMs),
+            [&state]() {
+                return state.current == nullptr || state.current->lifecycle != ObserverLifecycle::Stopping;
+            });
+        if (!stoppedInTime) {
+            if (pOutError) *pOutError = WAIT_TIMEOUT;
+            return false;
         }
 
         state.entries.push_back({ generation, uiHwnd, menuHwnd });
@@ -237,14 +267,13 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
         }
     }
 
-    DWORD waitTimeoutMs = s_hookWaitTimeoutMsForTest.load(std::memory_order_acquire);
-    if (waitTimeoutMs == 0) waitTimeoutMs = 2000;
     DWORD waitRes = inst->hReadyEvent ? WaitForSingleObject(inst->hReadyEvent, waitTimeoutMs) : WAIT_FAILED;
 
     bool ok = false;
     DWORD err = 0;
-    HANDLE hThreadToJoin = nullptr;
+    HANDLE hThreadToWait = nullptr;
     DWORD tidToQuit = 0;
+    bool shouldBoundedJoin = false;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         if (waitRes == WAIT_OBJECT_0 &&
@@ -264,25 +293,24 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
                 inst->cancelRequested = true;
                 inst->lifecycle = ObserverLifecycle::Stopping;
                 tidToQuit = inst->threadId;
-                hThreadToJoin = inst->hThread;
-                inst->hThread = nullptr;
+                hThreadToWait = inst->hThread;
+                // Only do a brief bounded join on immediate hook-install failure, never after a start timeout
+                shouldBoundedJoin = (waitRes != WAIT_TIMEOUT);
             }
         }
     }
 
-    if (hThreadToJoin) {
-        if (tidToQuit != 0) {
-            PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
+    if (tidToQuit != 0) {
+        PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
+    }
+    if (shouldBoundedJoin && hThreadToWait != nullptr && GetCurrentThreadId() != tidToQuit) {
+        if (WaitForSingleObject(hThreadToWait, 200) == WAIT_OBJECT_0) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.current == inst) {
+                state.current.reset();
+            }
+            state.cv.notify_all();
         }
-        if (GetCurrentThreadId() != tidToQuit) {
-            WaitForSingleObject(hThreadToJoin, INFINITE);
-        }
-        CloseHandle(hThreadToJoin);
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if (state.current == inst) {
-            state.current.reset();
-        }
-        state.cv.notify_all();
     }
 
     if (!ok && pOutError) {
@@ -294,8 +322,8 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
 void UnregisterMenuObserverForWindow(HWND uiHwnd) {
     if (!uiHwnd) return;
     auto& state = GetHookObserverState();
-    std::shared_ptr<ObserverInstance> instToJoin;
-    HANDLE hThreadToJoin = nullptr;
+    std::shared_ptr<ObserverInstance> instToStop;
+    HANDLE hThreadToWait = nullptr;
     DWORD tidToQuit = 0;
     {
         std::unique_lock<std::mutex> lock(state.mutex);
@@ -304,29 +332,28 @@ void UnregisterMenuObserverForWindow(HWND uiHwnd) {
                 [uiHwnd](const MenuObserverEntry& e) { return e.uiHwnd == uiHwnd; }),
             state.entries.end());
         if (state.entries.empty() && state.current != nullptr) {
-            instToJoin = state.current;
-            instToJoin->cancelRequested = true;
-            instToJoin->lifecycle = ObserverLifecycle::Stopping;
-            tidToQuit = instToJoin->threadId;
-            hThreadToJoin = instToJoin->hThread;
-            instToJoin->hThread = nullptr;
+            instToStop = state.current;
+            instToStop->cancelRequested = true;
+            instToStop->lifecycle = ObserverLifecycle::Stopping;
+            tidToQuit = instToStop->threadId;
+            hThreadToWait = instToStop->hThread;
         }
     }
-    if (instToJoin) {
+    if (instToStop) {
         if (tidToQuit != 0) {
             PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
         }
-        if (hThreadToJoin) {
-            if (GetCurrentThreadId() != tidToQuit) {
-                WaitForSingleObject(hThreadToJoin, INFINITE);
+        DWORD exitWaitMs = GetObserverWaitTimeoutMs(200);
+        if (hThreadToWait && GetCurrentThreadId() != tidToQuit) {
+            if (WaitForSingleObject(hThreadToWait, exitWaitMs) == WAIT_OBJECT_0) {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                if (state.current == instToStop) {
+                    state.current.reset();
+                }
+                state.cv.notify_all();
             }
-            CloseHandle(hThreadToJoin);
+            // If timed out, background thread retains instToStop + module ref and cleans up upon exit
         }
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if (state.current == instToJoin) {
-            state.current.reset();
-        }
-        state.cv.notify_all();
     }
 }
 
@@ -353,12 +380,20 @@ bool CCandidateWindow::IsHookObserverActive() {
            !state.entries.empty();
 }
 
+int CCandidateWindow::GetLiveObserverInstanceCountForTest() {
+    return s_liveObserverInstances.load(std::memory_order_acquire);
+}
+
 void CCandidateWindow::SetHookInstallFailureOverrideForTest(bool fail) {
     s_forceHookInstallFailForTest.store(fail, std::memory_order_release);
 }
 
 void CCandidateWindow::SetHookStartDelayOverrideForTest(DWORD delayMs) {
     s_hookStartDelayMsForTest.store(delayMs, std::memory_order_release);
+}
+
+void CCandidateWindow::SetHookExitDelayOverrideForTest(DWORD delayMs) {
+    s_hookExitDelayMsForTest.store(delayMs, std::memory_order_release);
 }
 
 void CCandidateWindow::SetHookWaitTimeoutOverrideForTest(DWORD timeoutMs) {

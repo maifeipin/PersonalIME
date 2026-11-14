@@ -765,24 +765,53 @@ int main() {
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after Destroy");
 
-        // 8b. Delayed hook start exceeding wait timeout cancels cleanly and leaks no thread/observer
+        // 8b. Delayed hook start & delayed hook exit return boundedly without blocking UI and reclaim ObserverInstance
         CCandidateWindow wndTimeout;
         wndTimeout.Show(snap, { 150, 150 });
-        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(50);
-        CCandidateWindow::SetHookStartDelayOverrideForTest(200);
+        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(40);
+        CCandidateWindow::SetHookStartDelayOverrideForTest(250);
+        ULONGLONG tStart = GetTickCount64();
         wndTimeout.OpenMoreMenu();
+        ULONGLONG startElapsed = GetTickCount64() - tStart;
         CHECK_EQ(wndTimeout.IsMenuOpen(), false, L"Menu stays closed when hook start times out");
         CHECK_EQ(wndTimeout.GetLastHookInstallError(), static_cast<DWORD>(WAIT_TIMEOUT), L"Timeout records WAIT_TIMEOUT error");
+        CHECK_EQ(startElapsed < 150, true, L"OpenMoreMenu returns boundedly on start timeout without INFINITE wait");
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer is not left active after wait timeout");
+        CHECK_EQ(wndTimeout.IsHookFallbackManagerVisible(), true, L"Fallback manager shortcut is exposed on start timeout");
+
+        // Wait for delayed background thread to finish exiting and verify 0 leaked ObserverInstances
+        Sleep(300);
+        CHECK_EQ(CCandidateWindow::GetLiveObserverInstanceCountForTest(), 0, L"ObserverInstance reclaimed after delayed start cancellation");
+
+        // Test delayed exit: CloseMoreMenu returns boundedly and background thread cleans up ObserverInstance
         CCandidateWindow::SetHookStartDelayOverrideForTest(0);
         CCandidateWindow::SetHookWaitTimeoutOverrideForTest(0);
         wndTimeout.OpenMoreMenu();
         CHECK_EQ(wndTimeout.IsMenuOpen(), true, L"Subsequent OpenMoreMenu succeeds cleanly after timeout recovery");
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), true, L"Observer active on subsequent OpenMoreMenu");
+
+        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(40);
+        CCandidateWindow::SetHookExitDelayOverrideForTest(250);
+        ULONGLONG tClose = GetTickCount64();
+        wndTimeout.CloseMoreMenu();
+        ULONGLONG closeElapsed = GetTickCount64() - tClose;
+        CHECK_EQ(wndTimeout.IsMenuOpen(), false, L"CloseMoreMenu closes menu immediately");
+        CHECK_EQ(closeElapsed < 150, true, L"CloseMoreMenu returns boundedly even when hook thread exit is delayed");
+
+        // Re-opening while still Stopping also returns boundedly without hanging INFINITE
+        ULONGLONG tReopen = GetTickCount64();
+        wndTimeout.OpenMoreMenu();
+        ULONGLONG reopenElapsed = GetTickCount64() - tReopen;
+        CHECK_EQ(reopenElapsed < 150, true, L"OpenMoreMenu while Stopping returns boundedly without INFINITE wait");
+
+        Sleep(320);
+        CCandidateWindow::SetHookExitDelayOverrideForTest(0);
+        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(0);
         wndTimeout.Destroy();
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after timeout window Destroy");
+        CHECK_EQ(CCandidateWindow::GetLiveObserverInstanceCountForTest(), 0, L"All ObserverInstances reclaimed after delayed exit");
 
-        // 8c. Multi-UI-thread concurrent OpenMoreMenu / CloseMoreMenu
+        // 8c. Multi-UI-thread concurrent OpenMoreMenu / CloseMoreMenu + instance reclamation
         auto workerTask = [&](int seedOffset) {
             for (int r = 0; r < 6; ++r) {
                 CCandidateWindow tWnd;
@@ -804,6 +833,7 @@ int main() {
         th1.join();
         th2.join();
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer cleanly stopped after multi-thread concurrent open/close");
+        CHECK_EQ(CCandidateWindow::GetLiveObserverInstanceCountForTest(), 0, L"Zero leaked ObserverInstances after multi-thread open/close");
 
         // 8d. High-DPI many-plugins menu clamps to monitor work area and scrolls to reach bottom item
         CCandidateWindow wndScroll;
