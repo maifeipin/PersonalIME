@@ -395,6 +395,8 @@ public:
     bool IsUnicodeInjectionAllowedForHost() const;
     void ApplyStage7Settings(const ime::Stage7SettingsPayload& settings);
     bool TrySyncStage7SettingsFromServer(uint64_t contextId, uint32_t advRevTag, bool force = false);
+    void SetStage7SettingsFreshnessMsForTest(ULONGLONG ms) { m_stage7SettingsFreshnessMs = ms; }
+    uint32_t GetSyncedPolicyFullRevisionForTest() const { return m_syncedPolicyFullRevision; }
     using SendInputOverrideFunc = std::function<UINT(UINT, LPINPUT, int)>;
     using TargetReverifyHookForTest = std::function<bool()>;
     void SetSendInputOverrideForTest(SendInputOverrideFunc fn) { m_sendInputOverride = std::move(fn); }
@@ -467,6 +469,8 @@ private:
     bool m_hasSyncedStage7Settings = false;
     uint32_t m_syncedPolicyRevTag = 0;
     uint32_t m_syncedPolicyFullRevision = 0;
+    ULONGLONG m_lastStage7SettingsSyncTickMs = 0;
+    ULONGLONG m_stage7SettingsFreshnessMs = 2000;
     uint32_t m_syncedPluginsRevTag = 0;
     uint32_t m_syncedPluginsFullRevision = 0;
     bool m_lastPluginsTruncated = false;

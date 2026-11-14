@@ -127,6 +127,10 @@ inline bool ValidateInputPolicy(const InputPolicy& p, std::string* errorOut = nu
             if (errorOut) *errorOut = "unicode_injection.allowed_hosts cannot contain empty host names";
             return false;
         }
+        if (host.size() > 260) {
+            if (errorOut) *errorOut = "unicode_injection.allowed_hosts entry exceeds 260 characters";
+            return false;
+        }
         for (unsigned char ch : host) {
             if (ch < 0x20 || ch == '|' || ch == ';') {
                 if (errorOut) *errorOut = "unicode_injection.allowed_hosts contains invalid characters";

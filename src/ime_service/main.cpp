@@ -1170,7 +1170,7 @@ void HandleClient(HANDLE hPipe) {
             if (g_engine.GetCoordinator()) {
                 auto pol = g_engine.GetCoordinator()->GetPolicySnapshot();
                 if (pol) {
-                    ime::EncodeStage7SettingsToIpcResponse(*pol, resp);
+                    ime::EncodeStage7SettingsToIpcResponse(*pol, resp, static_cast<size_t>(req.mode_arg));
                 }
             }
         }

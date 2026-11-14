@@ -3693,6 +3693,97 @@ static int TestStage74SettingsCodecAndHostGating() {
     tip.SetHostProcessNameOverrideForTest(L"SearchApp.exe");
     CHECK_TRUE(!tip.IsUnicodeInjectionAllowedForHost(), L"Empty allowlist with policy filter blocks injection");
 
+    // Paginated delivery for oversized allowlist + 8-revision wrap-around revocation via mock pipe
+    {
+        std::wstring pipeName = L"\\\\.\\pipe\\PersonalIME_Stage74_Test_" + std::to_wstring(GetCurrentProcessId());
+        std::mutex polMu;
+        ime::InputPolicy serverPol;
+        serverPol.revision = 1;
+        serverPol.unicode_injection.enabled = true;
+        for (int i = 0; i < 80; ++i) {
+            serverPol.unicode_injection.allowed_hosts.push_back("host_entry_" + std::to_string(i) + ".exe");
+        }
+        std::atomic<bool> stopServer{false};
+        HANDLE hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        std::thread srv([&]() {
+            while (!stopServer.load()) {
+                HANDLE hPipe = CreateNamedPipeW(
+                    pipeName.c_str(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                    PIPE_UNLIMITED_INSTANCES,
+                    sizeof(IpcKeyResponse),
+                    sizeof(IpcKeyRequest),
+                    0,
+                    nullptr);
+                if (hPipe == INVALID_HANDLE_VALUE) {
+                    SetEvent(hReadyEvent);
+                    break;
+                }
+                SetEvent(hReadyEvent);
+                if (ConnectNamedPipe(hPipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                    IpcKeyRequest req{};
+                    DWORD br = 0;
+                    while (!stopServer.load() && ReadFile(hPipe, &req, sizeof(req), &br, nullptr) && br == sizeof(req)) {
+                        IpcKeyResponse resp{};
+                        resp.msg_type = req.msg_type;
+                        resp.session_id = req.session_id;
+                        resp.context_id = req.context_id;
+                        resp.protocol_version = req.protocol_version;
+                        std::lock_guard<std::mutex> lk(polMu);
+                        resp.status_flags = IPC_STATUS_STAGE7_CAPABLE | IPC_STATUS_HAS_POLICY_REV |
+                                            ((serverPol.revision & 0x7u) << IPC_POLICY_REV_SHIFT);
+                        if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
+                            resp.handled = 1;
+                        } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
+                            ime::EncodeStage7SettingsToIpcResponse(serverPol, resp, static_cast<size_t>(req.mode_arg));
+                        } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::KeyDown)) {
+                            resp.handled = 1;
+                        }
+                        DWORD bw = 0;
+                        WriteFile(hPipe, &resp, sizeof(resp), &bw, nullptr);
+                        FlushFileBuffers(hPipe);
+                    }
+                }
+                DisconnectNamedPipe(hPipe);
+                CloseHandle(hPipe);
+            }
+        });
+
+        WaitForSingleObject(hReadyEvent, 2000);
+        CloseHandle(hReadyEvent);
+        IpcClient::SetPipeNameForTest(pipeName.c_str());
+        CTextInputProcessor pipeTip;
+        pipeTip.SetClientIdForTest(1);
+        pipeTip.SetStage7SettingsFreshnessMsForTest(0);
+        MockContext ctx;
+        CHECK_TRUE(pipeTip.NegotiateStage7ForTest(), L"NegotiateStage7 for Stage7.4 pipe test");
+        CHECK_TRUE(pipeTip.TrySyncStage7SettingsFromServer(0, 0, true), L"Initial paginated Stage7.4 sync succeeds");
+
+        // Verify all 80 hosts synced across multiple IPC pages (including trailing host_entry_79.exe)
+        pipeTip.SetHostProcessNameOverrideForTest(L"host_entry_79.exe");
+        CHECK_TRUE(pipeTip.IsUnicodeInjectionAllowedForHost(), L"Paginated 80-host allowlist includes trailing host_entry_79.exe");
+        CHECK_EQUAL(pipeTip.GetSyncedPolicyFullRevisionForTest(), 1u, L"Initial full revision synced == 1");
+
+        // Advance policy revision by 8 (1 -> 9, same 3-bit tag 1) and revoke unicode_injection
+        {
+            std::lock_guard<std::mutex> lk(polMu);
+            serverPol.revision = 9;
+            serverPol.unicode_injection.enabled = false;
+        }
+        BOOL eaten = FALSE;
+        pipeTip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(pipeTip.GetSyncedPolicyFullRevisionForTest(), 9u, L"8-update wrap-around still refreshes full revision to 9");
+        CHECK_TRUE(!pipeTip.IsUnicodeInjectionAllowedForHost(), L"Revoked unicode_injection after 8-revision wrap-around takes effect");
+
+        pipeTip.Deactivate();
+        stopServer.store(true);
+        HANDLE hWake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hWake != INVALID_HANDLE_VALUE) CloseHandle(hWake);
+        srv.join();
+        IpcClient::SetPipeNameForTest(nullptr);
+    }
+
     std::wcout << L"[PASS] Stage 7.4 Settings Codec & Per-Host Unicode Injection Gating verified!" << std::endl;
     return 0;
 }

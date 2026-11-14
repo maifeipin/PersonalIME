@@ -64,6 +64,20 @@ public class CalendarViewModelTests
     }
 
     [TestMethod]
+    public void TestReselectingCurrentDayRemainsSelected()
+    {
+        var vm = new CalendarViewModel();
+        var current = vm.SelectedDay;
+        Assert.IsNotNull(current);
+        Assert.IsTrue(current.IsSelected);
+
+        vm.SelectDayCommand.Execute(current);
+
+        Assert.AreSame(current, vm.SelectedDay);
+        Assert.IsTrue(current.IsSelected);
+    }
+
+    [TestMethod]
     public void TestCityChangeUpdatesSunTimes()
     {
         var vm = new CalendarViewModel();

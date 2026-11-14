@@ -28,44 +28,46 @@ inline std::wstring NormalizeProcessNameLower(const std::wstring& name) {
 
 inline void EncodeStage7SettingsToIpcResponse(
     const InputPolicy& policy,
-    IpcKeyResponse& resp)
+    IpcKeyResponse& resp,
+    size_t startHostIndex = 0)
 {
+    const auto& hosts = policy.unicode_injection.allowed_hosts;
+    size_t idx = (startHostIndex < hosts.size()) ? startHostIndex : hosts.size();
+
     nlohmann::json j = {
         {"theme_mode", policy.theme_mode},
         {"preedit_display_mode", policy.preedit_display_mode},
         {"unicode_injection", {
             {"enabled", policy.unicode_injection.enabled},
-            {"allowed_hosts", policy.unicode_injection.allowed_hosts}
+            {"allowed_hosts", nlohmann::json::array()}
         }}
     };
 
-    // Fit within 1023 wchar_t; if host list is huge, truncate trailing hosts rather than failing
     std::wstring payload = Utf8ToWide(j.dump());
-    if (payload.size() >= 1024) {
-        nlohmann::json trimmedHosts = nlohmann::json::array();
-        for (const auto& h : policy.unicode_injection.allowed_hosts) {
-            trimmedHosts.push_back(h);
-            j["unicode_injection"]["allowed_hosts"] = trimmedHosts;
-            std::wstring candidate = Utf8ToWide(j.dump());
-            if (candidate.size() >= 1024) {
-                trimmedHosts.erase(trimmedHosts.end() - 1);
-                j["unicode_injection"]["allowed_hosts"] = trimmedHosts;
-                resp.status_flags |= IPC_STATUS_TRUNCATED;
-                break;
-            }
-            payload = std::move(candidate);
+    nlohmann::json includedHosts = nlohmann::json::array();
+    while (idx < hosts.size()) {
+        includedHosts.push_back(hosts[idx]);
+        j["unicode_injection"]["allowed_hosts"] = includedHosts;
+        std::wstring candidate = Utf8ToWide(j.dump());
+        if (candidate.size() >= 1024) {
+            includedHosts.erase(includedHosts.end() - 1);
+            j["unicode_injection"]["allowed_hosts"] = includedHosts;
+            break;
         }
-        if (payload.size() >= 1024) {
-            j["unicode_injection"]["allowed_hosts"] = nlohmann::json::array();
-            payload = Utf8ToWide(j.dump());
-            resp.status_flags |= IPC_STATUS_TRUNCATED;
-        }
+        payload = std::move(candidate);
+        ++idx;
     }
 
     resp.handled = 1;
     resp.has_commit = 0;
     resp.candidate_version = policy.revision;
-    resp.commit_length = static_cast<uint32_t>(std::min<size_t>(payload.size(), 1023));
+    resp.total_candidates = static_cast<uint32_t>(hosts.size());
+    resp.page_index = static_cast<uint32_t>(idx);
+    if (idx < hosts.size()) {
+        resp.status_flags |= IPC_STATUS_TRUNCATED;
+    }
+    size_t capLen = (payload.size() < 1023) ? payload.size() : 1023;
+    resp.commit_length = static_cast<uint32_t>(capLen);
     wcsncpy_s(resp.commit_text, payload.c_str(), 1023);
     resp.commit_text[1023] = L'\0';
 }
@@ -77,7 +79,7 @@ inline bool DecodeStage7SettingsFromIpcResponse(
     if (resp.handled != 1 || resp.has_commit != 0 || resp.commit_length == 0) {
         return false;
     }
-    size_t len = std::min<size_t>(resp.commit_length, 1023);
+    size_t len = (resp.commit_length < 1023) ? static_cast<size_t>(resp.commit_length) : 1023;
     std::wstring wjson(resp.commit_text, len);
     std::string utf8 = WideToUtf8(wjson);
     try {

@@ -135,6 +135,8 @@ bool CTextInputProcessor::IsUnicodeInjectionAllowedForHost() const {
 }
 
 void CTextInputProcessor::ApplyStage7Settings(const ime::Stage7SettingsPayload& settings) {
+    m_lastStage7SettingsSyncTickMs = GetTickCount64();
+
     if (settings.theme_mode == "light") {
         m_candidateWindow.SetThemeMode(ThemeMode::Light);
     } else if (settings.theme_mode == "dark") {
@@ -2493,8 +2495,11 @@ bool CTextInputProcessor::ProcessKeyInternal(
         }
         if ((resp.status_flags & IPC_STATUS_HAS_POLICY_REV) != 0) {
             uint32_t advPolicyRevTag = (resp.status_flags & IPC_POLICY_REV_MASK) >> IPC_POLICY_REV_SHIFT;
-            if (!m_hasSyncedStage7Settings || advPolicyRevTag != m_syncedPolicyRevTag) {
-                TrySyncStage7SettingsFromServer(contextId, advPolicyRevTag, false);
+            ULONGLONG nowTick = GetTickCount64();
+            bool tagMismatch = !m_hasSyncedStage7Settings || advPolicyRevTag != m_syncedPolicyRevTag;
+            bool freshnessExpired = (nowTick - m_lastStage7SettingsSyncTickMs) >= m_stage7SettingsFreshnessMs;
+            if (tagMismatch || freshnessExpired) {
+                TrySyncStage7SettingsFromServer(contextId, advPolicyRevTag, freshnessExpired);
             }
         }
         uint64_t currentInputGen = AdvanceContextInputGeneration(contextId);

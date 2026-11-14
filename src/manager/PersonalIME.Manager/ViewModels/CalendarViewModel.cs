@@ -44,6 +44,14 @@ public sealed class CalendarViewModel : ViewModelBase, IDisposable
         get => _selectedDay;
         set
         {
+            if (ReferenceEquals(_selectedDay, value))
+            {
+                if (_selectedDay != null)
+                {
+                    _selectedDay.IsSelected = true;
+                }
+                return;
+            }
             if (_selectedDay != null) _selectedDay.IsSelected = false;
             if (SetProperty(ref _selectedDay, value))
             {

@@ -496,16 +496,48 @@ bool IpcClient::GetPlugins(uint64_t sessionId, uint64_t contextId, std::vector<C
 }
 
 bool IpcClient::GetStage7Settings(uint64_t sessionId, uint64_t contextId, ime::Stage7SettingsPayload& outSettings) {
-    IpcKeyRequest req{};
-    req.msg_type = static_cast<uint32_t>(IpcMsgType::GetStage7Settings);
-    req.session_id = sessionId;
-    req.context_id = contextId;
-    req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
-    IpcKeyResponse resp{};
-    if (!SendRequest(req, resp, 30) || resp.handled != 1) {
-        return false;
+    ime::Stage7SettingsPayload merged;
+    uint32_t startIndex = 0;
+    constexpr int kMaxPages = 64;
+
+    for (int page = 0; page < kMaxPages; ++page) {
+        IpcKeyRequest req{};
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::GetStage7Settings);
+        req.session_id = sessionId;
+        req.context_id = contextId;
+        req.mode_arg = startIndex;
+        req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse resp{};
+        if (!SendRequest(req, resp, 30) || resp.handled != 1) {
+            return false;
+        }
+        ime::Stage7SettingsPayload decoded;
+        if (!ime::DecodeStage7SettingsFromIpcResponse(resp, decoded)) {
+            return false;
+        }
+        if (page == 0) {
+            merged.revision = decoded.revision;
+            merged.theme_mode = std::move(decoded.theme_mode);
+            merged.preedit_display_mode = std::move(decoded.preedit_display_mode);
+            merged.unicode_injection_enabled = decoded.unicode_injection_enabled;
+        } else if (decoded.revision != merged.revision) {
+            // Policy changed mid-pagination; abort so caller does not cache torn/partial state
+            return false;
+        }
+        for (auto& h : decoded.unicode_allowed_hosts) {
+            merged.unicode_allowed_hosts.push_back(std::move(h));
+        }
+
+        if ((resp.status_flags & IPC_STATUS_TRUNCATED) == 0) {
+            outSettings = std::move(merged);
+            return true;
+        }
+        if (resp.page_index <= startIndex) {
+            return false;
+        }
+        startIndex = resp.page_index;
     }
-    return ime::DecodeStage7SettingsFromIpcResponse(resp, outSettings);
+    return false;
 }
 
 bool IpcClient::SendRequest(const IpcKeyRequest& req, IpcKeyResponse& resp, DWORD totalBudgetMs) {
