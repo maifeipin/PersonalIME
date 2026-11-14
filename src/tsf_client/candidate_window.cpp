@@ -2,6 +2,8 @@
 #include "globals.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
 
 static const wchar_t* CANDIDATE_WND_CLASS = L"PersonalIME_CandidateWnd";
@@ -10,6 +12,8 @@ static LONG s_cClassRef = 0;
 static LONG s_cMenuClassRef = 0;
 static std::atomic<int> s_appsUseLightThemeOverride{-1};
 static std::atomic<bool> s_forceHookInstallFailForTest{false};
+static std::atomic<DWORD> s_hookStartDelayMsForTest{0};
+static std::atomic<DWORD> s_hookWaitTimeoutMsForTest{0};
 static constexpr UINT WM_APP_EXTERNAL_CLICK = WM_APP + 0x73;
 
 namespace {
@@ -20,15 +24,40 @@ struct MenuObserverEntry {
     HWND menuHwnd = nullptr;
 };
 
-struct HookObserverState {
-    std::mutex mutex;
-    std::vector<MenuObserverEntry> entries;
+enum class ObserverLifecycle {
+    Starting,
+    Running,
+    Stopping
+};
+
+struct ObserverInstance {
+    uint64_t instanceGen = 0;
     HANDLE hThread = nullptr;
     DWORD threadId = 0;
+    HANDLE hReadyEvent = nullptr;
     HHOOK hHook = nullptr;
     DWORD lastError = 0;
-    HANDLE hReadyEvent = nullptr;
-    bool hookInstalled = false;
+    ObserverLifecycle lifecycle = ObserverLifecycle::Starting;
+    bool cancelRequested = false;
+
+    ~ObserverInstance() {
+        if (hReadyEvent) {
+            CloseHandle(hReadyEvent);
+            hReadyEvent = nullptr;
+        }
+        if (hThread) {
+            CloseHandle(hThread);
+            hThread = nullptr;
+        }
+    }
+};
+
+struct HookObserverState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t nextInstanceGen = 1;
+    std::vector<MenuObserverEntry> entries;
+    std::shared_ptr<ObserverInstance> current;
 };
 
 HookObserverState& GetHookObserverState() {
@@ -64,7 +93,11 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
 
-DWORD WINAPI HookObserverThreadProc(LPVOID) {
+DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
+    auto* pHolder = static_cast<std::shared_ptr<ObserverInstance>*>(lpParam);
+    std::shared_ptr<ObserverInstance> inst = *pHolder;
+    delete pHolder;
+
     HMODULE hMod = nullptr;
     GetModuleHandleExW(
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -74,9 +107,23 @@ DWORD WINAPI HookObserverThreadProc(LPVOID) {
     MSG msg{};
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
+    DWORD delayMs = s_hookStartDelayMsForTest.load(std::memory_order_acquire);
+    if (delayMs > 0) {
+        Sleep(delayMs);
+    }
+
+    auto& state = GetHookObserverState();
+    bool cancelledBeforeHook = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        cancelledBeforeHook = inst->cancelRequested;
+    }
+
     HHOOK hHook = nullptr;
     DWORD err = 0;
-    if (s_forceHookInstallFailForTest.load(std::memory_order_acquire)) {
+    if (cancelledBeforeHook) {
+        err = ERROR_CANCELLED;
+    } else if (s_forceHookInstallFailForTest.load(std::memory_order_acquire)) {
         err = ERROR_ACCESS_DENIED;
     } else {
         hHook = SetWindowsHookExW(WH_MOUSE_LL, LowLevelMouseProc, hMod, 0);
@@ -86,20 +133,36 @@ DWORD WINAPI HookObserverThreadProc(LPVOID) {
         }
     }
 
-    HANDLE hReadyToSignal = nullptr;
+    bool shouldRun = false;
     {
-        auto& state = GetHookObserverState();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.hHook = hHook;
-        state.lastError = err;
-        state.hookInstalled = (hHook != nullptr);
-        hReadyToSignal = state.hReadyEvent;
-    }
-    if (hReadyToSignal) {
-        SetEvent(hReadyToSignal);
+        inst->hHook = hHook;
+        inst->lastError = err;
+        if (hHook != nullptr && !inst->cancelRequested) {
+            inst->lifecycle = ObserverLifecycle::Running;
+            shouldRun = true;
+        } else {
+            inst->lifecycle = ObserverLifecycle::Stopping;
+            shouldRun = false;
+        }
+        if (inst->hReadyEvent) {
+            SetEvent(inst->hReadyEvent);
+        }
+        state.cv.notify_all();
     }
 
-    if (!hHook) {
+    if (!shouldRun) {
+        if (hHook) {
+            UnhookWindowsHookEx(hHook);
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            inst->hHook = nullptr;
+            if (state.current == inst) {
+                state.current.reset();
+            }
+            state.cv.notify_all();
+        }
         if (hMod) {
             FreeLibraryAndExitThread(hMod, 1);
         }
@@ -113,10 +176,13 @@ DWORD WINAPI HookObserverThreadProc(LPVOID) {
 
     UnhookWindowsHookEx(hHook);
     {
-        auto& state = GetHookObserverState();
         std::lock_guard<std::mutex> lock(state.mutex);
-        state.hHook = nullptr;
-        state.hookInstalled = false;
+        inst->hHook = nullptr;
+        inst->lifecycle = ObserverLifecycle::Stopping;
+        if (state.current == inst) {
+            state.current.reset();
+        }
+        state.cv.notify_all();
     }
 
     if (hMod) {
@@ -130,75 +196,95 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
     if (generation == 0 || !uiHwnd || !menuHwnd) return false;
 
     auto& state = GetHookObserverState();
-    HANDLE hWaitThread = nullptr;
-    HANDLE hReadyEvent = nullptr;
+    std::shared_ptr<ObserverInstance> inst;
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        std::unique_lock<std::mutex> lock(state.mutex);
+        while (state.current != nullptr && state.current->lifecycle == ObserverLifecycle::Stopping) {
+            state.cv.wait(lock);
+        }
+
         state.entries.push_back({ generation, uiHwnd, menuHwnd });
-        if (state.hThread != nullptr && state.hookInstalled) {
+
+        if (state.current != nullptr && state.current->lifecycle == ObserverLifecycle::Running) {
             return true;
         }
-        if (state.hThread == nullptr) {
-            state.lastError = 0;
-            state.hookInstalled = false;
-            state.hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            hReadyEvent = state.hReadyEvent;
+
+        if (state.current == nullptr) {
+            inst = std::make_shared<ObserverInstance>();
+            inst->instanceGen = state.nextInstanceGen++;
+            inst->hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            inst->lifecycle = ObserverLifecycle::Starting;
+            auto* pArg = new std::shared_ptr<ObserverInstance>(inst);
             DWORD tid = 0;
-            state.hThread = CreateThread(nullptr, 0, HookObserverThreadProc, nullptr, 0, &tid);
-            state.threadId = tid;
-            if (!state.hThread) {
+            inst->hThread = CreateThread(nullptr, 0, HookObserverThreadProc, pArg, 0, &tid);
+            inst->threadId = tid;
+            if (!inst->hThread) {
                 DWORD err = GetLastError();
                 if (err == 0) err = ERROR_NOT_ENOUGH_MEMORY;
-                state.entries.pop_back();
-                if (state.hReadyEvent) {
-                    CloseHandle(state.hReadyEvent);
-                    state.hReadyEvent = nullptr;
-                }
+                delete pArg;
+                state.entries.erase(
+                    std::remove_if(state.entries.begin(), state.entries.end(),
+                        [generation, uiHwnd](const MenuObserverEntry& e) {
+                            return e.generation == generation && e.uiHwnd == uiHwnd;
+                        }),
+                    state.entries.end());
                 if (pOutError) *pOutError = err;
                 return false;
             }
-            hWaitThread = state.hThread;
+            state.current = inst;
         } else {
-            hReadyEvent = state.hReadyEvent;
-            hWaitThread = state.hThread;
+            inst = state.current;
         }
     }
 
-    if (hReadyEvent) {
-        WaitForSingleObject(hReadyEvent, 2000);
-    }
+    DWORD waitTimeoutMs = s_hookWaitTimeoutMsForTest.load(std::memory_order_acquire);
+    if (waitTimeoutMs == 0) waitTimeoutMs = 2000;
+    DWORD waitRes = inst->hReadyEvent ? WaitForSingleObject(inst->hReadyEvent, waitTimeoutMs) : WAIT_FAILED;
 
     bool ok = false;
     DWORD err = 0;
-    HANDLE hFailedThread = nullptr;
-    HANDLE hEventToClose = nullptr;
+    HANDLE hThreadToJoin = nullptr;
+    DWORD tidToQuit = 0;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
-        ok = state.hookInstalled;
-        err = state.lastError;
-        if (state.hReadyEvent) {
-            hEventToClose = state.hReadyEvent;
-            state.hReadyEvent = nullptr;
-        }
-        if (!ok) {
+        if (waitRes == WAIT_OBJECT_0 &&
+            inst->lifecycle == ObserverLifecycle::Running &&
+            inst->hHook != nullptr &&
+            !inst->cancelRequested) {
+            ok = true;
+        } else {
+            err = (waitRes == WAIT_TIMEOUT) ? WAIT_TIMEOUT : inst->lastError;
             state.entries.erase(
                 std::remove_if(state.entries.begin(), state.entries.end(),
-                    [generation](const MenuObserverEntry& e) { return e.generation == generation; }),
+                    [generation, uiHwnd](const MenuObserverEntry& e) {
+                        return e.generation == generation && e.uiHwnd == uiHwnd;
+                    }),
                 state.entries.end());
-            if (state.entries.empty() && state.hThread == hWaitThread) {
-                hFailedThread = state.hThread;
-                state.hThread = nullptr;
-                state.threadId = 0;
+            if (state.entries.empty() && state.current == inst) {
+                inst->cancelRequested = true;
+                inst->lifecycle = ObserverLifecycle::Stopping;
+                tidToQuit = inst->threadId;
+                hThreadToJoin = inst->hThread;
+                inst->hThread = nullptr;
             }
         }
     }
-    if (hEventToClose) {
-        CloseHandle(hEventToClose);
+
+    if (hThreadToJoin) {
+        if (tidToQuit != 0) {
+            PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
+        }
+        if (GetCurrentThreadId() != tidToQuit) {
+            WaitForSingleObject(hThreadToJoin, INFINITE);
+        }
+        CloseHandle(hThreadToJoin);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.current == inst) {
+            state.current.reset();
+        }
+        state.cv.notify_all();
     }
-    if (hFailedThread) {
-        WaitForSingleObject(hFailedThread, 2000);
-        CloseHandle(hFailedThread);
-    }
+
     if (!ok && pOutError) {
         *pOutError = err ? err : ERROR_HOOK_NOT_INSTALLED;
     }
@@ -208,29 +294,39 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
 void UnregisterMenuObserverForWindow(HWND uiHwnd) {
     if (!uiHwnd) return;
     auto& state = GetHookObserverState();
+    std::shared_ptr<ObserverInstance> instToJoin;
     HANDLE hThreadToJoin = nullptr;
     DWORD tidToQuit = 0;
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        std::unique_lock<std::mutex> lock(state.mutex);
         state.entries.erase(
             std::remove_if(state.entries.begin(), state.entries.end(),
                 [uiHwnd](const MenuObserverEntry& e) { return e.uiHwnd == uiHwnd; }),
             state.entries.end());
-        if (state.entries.empty() && state.hThread != nullptr) {
-            hThreadToJoin = state.hThread;
-            tidToQuit = state.threadId;
-            state.hThread = nullptr;
-            state.threadId = 0;
+        if (state.entries.empty() && state.current != nullptr) {
+            instToJoin = state.current;
+            instToJoin->cancelRequested = true;
+            instToJoin->lifecycle = ObserverLifecycle::Stopping;
+            tidToQuit = instToJoin->threadId;
+            hThreadToJoin = instToJoin->hThread;
+            instToJoin->hThread = nullptr;
         }
     }
-    if (hThreadToJoin) {
+    if (instToJoin) {
         if (tidToQuit != 0) {
             PostThreadMessageW(tidToQuit, WM_QUIT, 0, 0);
         }
-        if (GetCurrentThreadId() != tidToQuit) {
-            WaitForSingleObject(hThreadToJoin, 2000);
+        if (hThreadToJoin) {
+            if (GetCurrentThreadId() != tidToQuit) {
+                WaitForSingleObject(hThreadToJoin, INFINITE);
+            }
+            CloseHandle(hThreadToJoin);
         }
-        CloseHandle(hThreadToJoin);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.current == instToJoin) {
+            state.current.reset();
+        }
+        state.cv.notify_all();
     }
 }
 
@@ -251,11 +347,22 @@ bool IsMenuObserverEntryAlive(uint32_t generation, HWND uiHwnd, HWND menuHwnd) {
 bool CCandidateWindow::IsHookObserverActive() {
     auto& state = GetHookObserverState();
     std::lock_guard<std::mutex> lock(state.mutex);
-    return state.hookInstalled && !state.entries.empty();
+    return state.current != nullptr &&
+           state.current->lifecycle == ObserverLifecycle::Running &&
+           state.current->hHook != nullptr &&
+           !state.entries.empty();
 }
 
 void CCandidateWindow::SetHookInstallFailureOverrideForTest(bool fail) {
     s_forceHookInstallFailForTest.store(fail, std::memory_order_release);
+}
+
+void CCandidateWindow::SetHookStartDelayOverrideForTest(DWORD delayMs) {
+    s_hookStartDelayMsForTest.store(delayMs, std::memory_order_release);
+}
+
+void CCandidateWindow::SetHookWaitTimeoutOverrideForTest(DWORD timeoutMs) {
+    s_hookWaitTimeoutMsForTest.store(timeoutMs, std::memory_order_release);
 }
 
 LONG CCandidateWindow::GetClassRefCount() {
@@ -1851,16 +1958,23 @@ void CCandidateWindow::OpenMoreMenu() {
     int itemH = ScaleDip(28);
     int menuW = (std::min)(maxMenuWidth, (std::max)(ScaleDip(156), maxTextW + padX * 2));
     int itemCount = 1 + static_cast<int>(m_plugins.size());
-    int menuH = padY * 2 + itemCount * itemH;
 
-    int curY = padY;
-    m_rcMenuMgrItem = { ScaleDip(4), curY, menuW - ScaleDip(4), curY + itemH };
-    curY += itemH;
-    m_menuPluginRects.resize(m_plugins.size());
-    for (size_t i = 0; i < m_plugins.size(); ++i) {
-        m_menuPluginRects[i] = { ScaleDip(4), curY, menuW - ScaleDip(4), curY + itemH };
-        curY += itemH;
-    }
+    int workHeight = static_cast<int>(mi.rcWork.bottom - mi.rcWork.top);
+    int maxMenuHeight = (std::max)(padY * 2 + itemH, workHeight - ScaleDip(16));
+    int naturalMenuH = padY * 2 + itemCount * itemH;
+    int menuH = (std::min)(naturalMenuH, maxMenuHeight);
+    int visibleCount = (std::max)(1, (menuH - padY * 2) / itemH);
+    if (visibleCount > itemCount) visibleCount = itemCount;
+    menuH = padY * 2 + visibleCount * itemH;
+
+    m_menuWidth = menuW;
+    m_menuHeight = menuH;
+    m_menuItemHeight = itemH;
+    m_menuPadY = padY;
+    m_menuVisibleCount = visibleCount;
+    m_menuMaxScroll = (std::max)(0, itemCount - visibleCount);
+    m_menuScrollOffset = 0;
+    UpdateMenuItemRects();
 
     int x = moreRightBottom.x - menuW;
     int y = candWndRc.bottom + ScaleDip(4);
@@ -1902,6 +2016,37 @@ void CCandidateWindow::OpenMoreMenu() {
     InvalidateRect(m_hMenuWnd, nullptr, TRUE);
     if (m_hWnd && IsWindow(m_hWnd)) {
         InvalidateRect(m_hWnd, &m_rcMoreBtn, FALSE);
+    }
+}
+
+void CCandidateWindow::UpdateMenuItemRects() {
+    int rightMargin = (m_menuMaxScroll > 0) ? ScaleDip(10) : ScaleDip(4);
+    int leftMargin = ScaleDip(4);
+    auto rectForIndex = [&](int itemIdx) -> RECT {
+        if (itemIdx < m_menuScrollOffset || itemIdx >= m_menuScrollOffset + m_menuVisibleCount) {
+            return { 0, 0, 0, 0 };
+        }
+        int row = itemIdx - m_menuScrollOffset;
+        int top = m_menuPadY + row * m_menuItemHeight;
+        return { leftMargin, top, m_menuWidth - rightMargin, top + m_menuItemHeight };
+    };
+    m_rcMenuMgrItem = rectForIndex(0);
+    m_menuPluginRects.resize(m_plugins.size());
+    for (size_t i = 0; i < m_plugins.size(); ++i) {
+        m_menuPluginRects[i] = rectForIndex(static_cast<int>(i) + 1);
+    }
+}
+
+void CCandidateWindow::ScrollMoreMenu(int deltaItems) {
+    if (!m_isMenuOpen || m_menuMaxScroll <= 0) return;
+    int nextOffset = (std::max)(0, (std::min)(m_menuMaxScroll, m_menuScrollOffset + deltaItems));
+    if (nextOffset != m_menuScrollOffset) {
+        m_menuScrollOffset = nextOffset;
+        m_menuHoveredIdx = -1;
+        UpdateMenuItemRects();
+        if (m_hMenuWnd && IsWindow(m_hMenuWnd)) {
+            InvalidateRect(m_hMenuWnd, nullptr, TRUE);
+        }
     }
 }
 
@@ -1983,6 +2128,14 @@ LRESULT CALLBACK CCandidateWindow::MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wPar
 
     if (uMsg == WM_MOUSEACTIVATE) {
         return MA_NOACTIVATE;
+    }
+
+    if (uMsg == WM_MOUSEWHEEL && pThis) {
+        short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        if (zDelta != 0) {
+            pThis->ScrollMoreMenu(zDelta < 0 ? 1 : -1);
+        }
+        return 0;
     }
 
     if (uMsg == WM_SETCURSOR && pThis) {
@@ -2130,6 +2283,7 @@ LRESULT CALLBACK CCandidateWindow::MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wPar
         int textPadX = pThis->ScaleDip(10);
 
         auto drawMenuItem = [&](const RECT& rc, int idx, const std::wstring& label) {
+            if (IsRectEmpty(&rc)) return;
             bool isHovered = (pThis->m_menuHoveredIdx == idx);
             bool isPressed = (pThis->m_menuPressedIdx == idx);
             if (isHovered || isPressed) {
@@ -2153,6 +2307,21 @@ LRESULT CALLBACK CCandidateWindow::MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wPar
         for (size_t i = 0; i < pThis->m_plugins.size() && i < pThis->m_menuPluginRects.size(); ++i) {
             const auto& p = pThis->m_plugins[i];
             drawMenuItem(pThis->m_menuPluginRects[i], static_cast<int>(i) + 1, p.icon + L"  " + p.name);
+        }
+
+        if (pThis->m_menuMaxScroll > 0) {
+            int totalItems = 1 + static_cast<int>(pThis->m_plugins.size());
+            int trackTop = pThis->m_menuPadY;
+            int trackBottom = clientRc.bottom - pThis->m_menuPadY;
+            int trackH = (std::max)(1, trackBottom - trackTop);
+            int thumbH = (std::max)(pThis->ScaleDip(16), (trackH * pThis->m_menuVisibleCount) / totalItems);
+            int maxThumbTravel = (std::max)(0, trackH - thumbH);
+            int thumbTop = trackTop + (pThis->m_menuMaxScroll > 0 ? (maxThumbTravel * pThis->m_menuScrollOffset) / pThis->m_menuMaxScroll : 0);
+            int barW = (std::max)(2, pThis->ScaleDip(3));
+            RECT rcThumb = { clientRc.right - pThis->ScaleDip(5), thumbTop, clientRc.right - pThis->ScaleDip(5) + barW, thumbTop + thumbH };
+            HBRUSH hThumb = CreateSolidBrush(pal.dividerColor);
+            FillRect(memDC, &rcThumb, hThumb);
+            DeleteObject(hThumb);
         }
 
         BitBlt(hdc, 0, 0, clientRc.right, clientRc.bottom, memDC, 0, 0, SRCCOPY);

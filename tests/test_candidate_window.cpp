@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <iostream>
+#include <thread>
 #include "../src/tsf_client/candidate_window.h"
 
 HINSTANCE g_hInst = nullptr;
@@ -763,6 +764,93 @@ int main() {
         wnd.Destroy();
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after Destroy");
+
+        // 8b. Delayed hook start exceeding wait timeout cancels cleanly and leaks no thread/observer
+        CCandidateWindow wndTimeout;
+        wndTimeout.Show(snap, { 150, 150 });
+        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(50);
+        CCandidateWindow::SetHookStartDelayOverrideForTest(200);
+        wndTimeout.OpenMoreMenu();
+        CHECK_EQ(wndTimeout.IsMenuOpen(), false, L"Menu stays closed when hook start times out");
+        CHECK_EQ(wndTimeout.GetLastHookInstallError(), static_cast<DWORD>(WAIT_TIMEOUT), L"Timeout records WAIT_TIMEOUT error");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer is not left active after wait timeout");
+        CCandidateWindow::SetHookStartDelayOverrideForTest(0);
+        CCandidateWindow::SetHookWaitTimeoutOverrideForTest(0);
+        wndTimeout.OpenMoreMenu();
+        CHECK_EQ(wndTimeout.IsMenuOpen(), true, L"Subsequent OpenMoreMenu succeeds cleanly after timeout recovery");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), true, L"Observer active on subsequent OpenMoreMenu");
+        wndTimeout.Destroy();
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after timeout window Destroy");
+
+        // 8c. Multi-UI-thread concurrent OpenMoreMenu / CloseMoreMenu
+        auto workerTask = [&](int seedOffset) {
+            for (int r = 0; r < 6; ++r) {
+                CCandidateWindow tWnd;
+                CandidateDisplaySnapshot tSnap = snap;
+                tSnap.candidate_version = static_cast<uint32_t>(r + 1);
+                tWnd.Show(tSnap, { 160 + seedOffset * 40, 160 });
+                tWnd.OpenMoreMenu();
+                MSG m{};
+                while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&m);
+                    DispatchMessageW(&m);
+                }
+                tWnd.CloseMoreMenu();
+                tWnd.Destroy();
+            }
+        };
+        std::thread th1(workerTask, 0);
+        std::thread th2(workerTask, 1);
+        th1.join();
+        th2.join();
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer cleanly stopped after multi-thread concurrent open/close");
+
+        // 8d. High-DPI many-plugins menu clamps to monitor work area and scrolls to reach bottom item
+        CCandidateWindow wndScroll;
+        std::vector<CandidatePluginItem> manyPlugins;
+        for (uint32_t i = 1; i <= 60; ++i) {
+            manyPlugins.push_back({ i, L"扩展功能_" + std::to_wstring(i), L"*", L"", L"" });
+        }
+        wndScroll.SetPlugins(manyPlugins);
+        wndScroll.Show(snap, { 150, 150 });
+
+        HMONITOR hMon = MonitorFromPoint({ 150, 150 }, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(hMon, &mi);
+        RECT highDpiSuggested = { mi.rcWork.left + 100, mi.rcWork.top + 100, mi.rcWork.left + 400, mi.rcWork.top + 200 };
+        SendMessageW(wndScroll.GetHwnd(), 0x02E0 /* WM_DPICHANGED */, MAKEWPARAM(192, 192), reinterpret_cast<LPARAM>(&highDpiSuggested));
+        CHECK_EQ(wndScroll.GetCurrentDpi(), static_cast<UINT>(192), L"Menu scroll test running at 192 DPI");
+
+        wndScroll.OpenMoreMenu();
+        CHECK_EQ(wndScroll.IsMenuOpen(), true, L"Many-plugins menu opens");
+        CHECK_EQ(wndScroll.IsMenuScrollable(), true, L"Many-plugins menu is scrollable at high DPI");
+        RECT manyMenuRc{};
+        GetWindowRect(wndScroll.GetMenuHwnd(), &manyMenuRc);
+        CHECK_EQ(manyMenuRc.top >= mi.rcWork.top && manyMenuRc.bottom <= mi.rcWork.bottom, true, L"Many-plugins menu clamped inside monitor work area");
+        RECT rcLastBeforeScroll = wndScroll.GetMenuPluginItemRect(59);
+        CHECK_EQ(IsRectEmpty(&rcLastBeforeScroll) != FALSE, true, L"Last plugin starts scrolled out of viewport");
+
+        int executedScrollPluginId = 0;
+        wndScroll.SetOnExecutePlugin([&](const CandidatePluginItem& item) {
+            executedScrollPluginId = static_cast<int>(item.id);
+        });
+        int maxScroll = wndScroll.GetMenuMaxScroll();
+        for (int s = 0; s < maxScroll; ++s) {
+            SendMessageW(wndScroll.GetMenuHwnd(), WM_MOUSEWHEEL, MAKEWPARAM(0, -WHEEL_DELTA), 0);
+        }
+        CHECK_EQ(wndScroll.GetMenuScrollOffset(), maxScroll, L"Mouse wheel scrolls menu to bottom");
+        RECT rcLastPlugin = wndScroll.GetMenuPluginItemRect(59);
+        CHECK_EQ(!IsRectEmpty(&rcLastPlugin), true, L"Last plugin is visible after scrolling to bottom");
+        POINT ptLast = { (rcLastPlugin.left + rcLastPlugin.right) / 2, (rcLastPlugin.top + rcLastPlugin.bottom) / 2 };
+        SendMessageW(wndScroll.GetMenuHwnd(), WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(ptLast.x, ptLast.y));
+        SendMessageW(wndScroll.GetMenuHwnd(), WM_LBUTTONUP, 0, MAKELPARAM(ptLast.x, ptLast.y));
+        CHECK_EQ(executedScrollPluginId, 60, L"Clicking scrolled-into-view last plugin executes id=60");
+        CHECK_EQ(wndScroll.IsMenuOpen(), false, L"Menu closes after clicking scrolled plugin");
+
+        wndScroll.Destroy();
+        CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
+        CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after scroll test Destroy");
     }
     std::wcout << L"[PASS] Verified: Stage 7.3 non-activating overflow menu, on-demand WH_MOUSE_LL observer & hook failure fallback." << std::endl;
 

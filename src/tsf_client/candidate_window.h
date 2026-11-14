@@ -143,7 +143,12 @@ public:
     bool IsHookFallbackManagerVisible() const { return m_showFallbackMgrBtn; }
     static bool IsHookObserverActive();
     static void SetHookInstallFailureOverrideForTest(bool fail);
+    static void SetHookStartDelayOverrideForTest(DWORD delayMs);
+    static void SetHookWaitTimeoutOverrideForTest(DWORD timeoutMs);
     void SimulateExternalClickForTest(POINT screenPt, uint32_t generationOverride = 0);
+    int GetMenuScrollOffset() const { return m_menuScrollOffset; }
+    int GetMenuMaxScroll() const { return m_menuMaxScroll; }
+    bool IsMenuScrollable() const { return m_menuMaxScroll > 0; }
 
     RECT GetPrevButtonRect() const { return m_rcPrevBtn; }
     RECT GetNextButtonRect() const { return m_rcNextBtn; }
@@ -182,6 +187,8 @@ private:
     void ApplyWindowRoundingTo(HWND hWnd, int width, int height, bool* pUsedNative = nullptr);
     bool EnsureMenuWindow();
     void RefreshMenuTheme();
+    void UpdateMenuItemRects();
+    void ScrollMoreMenu(int deltaItems);
     void HandleExternalClick(POINT screenPt, uint32_t generation);
     static LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -240,6 +247,13 @@ private:
     bool m_menuTrackingMouse = false;
     RECT m_rcMenuMgrItem{0, 0, 0, 0};
     std::vector<RECT> m_menuPluginRects;
+    int m_menuWidth = 0;
+    int m_menuHeight = 0;
+    int m_menuItemHeight = 0;
+    int m_menuPadY = 0;
+    int m_menuScrollOffset = 0;
+    int m_menuMaxScroll = 0;
+    int m_menuVisibleCount = 0;
 
     RECT m_rcPrevBtn{0, 0, 0, 0};
     RECT m_rcNextBtn{0, 0, 0, 0};
