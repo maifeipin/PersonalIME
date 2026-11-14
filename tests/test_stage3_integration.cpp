@@ -720,46 +720,73 @@ int main(int argc, char* argv[]) {
         req.vk_code = VK_ESCAPE;
         client.SendRequest(req, resp, 80);
 
-        // 2b. CapsLock (VK_CAPITAL) and Ctrl+Space switching to English commits uncommitted raw composition!
+        // 2b. CapsLock (VK_CAPITAL) passes through to OS; Shift-tap commits raw composition, and Ctrl+Space switches to English
         req.modifiers = 0;
         req.vk_code = 'H'; client.SendRequest(req, resp, 80);
         req.vk_code = 'I'; client.SendRequest(req, resp, 80);
         CHECK_TRUE(wcscmp(resp.composition, L"hi") == 0, L"Composition is 'hi'");
 
-        // TestKeyDown for VK_CAPITAL must be handled
+        // TestKeyDown & KeyDown for VK_CAPITAL must pass through (handled = 0) and preserve Chinese mode
         req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
         req.vk_code = VK_CAPITAL;
         client.SendRequest(req, resp, 80);
-        CHECK_EQUAL(resp.handled, 1, L"VK_CAPITAL TestKeyDown must be handled");
+        CHECK_EQUAL(resp.handled, 0, L"VK_CAPITAL TestKeyDown must pass through (handled = 0)");
 
-        // KeyDown for VK_CAPITAL switches to English and commits raw 'hi'
         req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
         client.SendRequest(req, resp, 80);
-        CHECK_EQUAL(resp.handled, 1, L"VK_CAPITAL KeyDown must be handled");
-        CHECK_EQUAL(resp.has_commit, 1, L"VK_CAPITAL with active composition must commit raw composition");
-        CHECK_TRUE(wcscmp(resp.commit_text, L"hi") == 0, L"VK_CAPITAL must commit 'hi'");
-        CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition cleared after committing raw input");
-        CHECK_EQUAL(resp.status_flags & IPC_MODE_CHINESE, 0u, L"Context switched to English mode on CapsLock");
+        CHECK_EQUAL(resp.handled, 0, L"VK_CAPITAL KeyDown must pass through (handled = 0)");
+        CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"VK_CAPITAL must preserve Chinese mode");
 
-        // 2c. Verify English mode lowercase default and Shift uppercase assistance
+        // Shift-tap with active composition commits raw 'hi' first (keeping Chinese until client settles commit)
+        req.vk_code = VK_SHIFT;
+        req.mode_arg = IPC_KEYDOWN_SHIFT_TAP;
+        client.SendRequest(req, resp, 80);
+        req.mode_arg = 0;
+        CHECK_EQUAL(resp.handled, 1, L"Shift-tap KeyDown must be handled");
+        CHECK_EQUAL(resp.has_commit, 1, L"Shift-tap with active composition must commit raw composition");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"hi") == 0, L"Shift-tap must commit 'hi'");
+        CHECK_TRUE(resp.commit_event_id != 0, L"Shift-tap raw commit must allocate commit_event_id");
+        CHECK_TRUE(wcslen(resp.composition) == 0, L"Composition cleared after committing raw input");
+        CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Chinese mode preserved until commit settles");
+
+        // Client settles commit via SetMode -> English mode
+        CHECK_TRUE(client.SetMode(sessionId, ctxId, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE), L"SetMode to English succeeds");
+
+        // 2c. Verify English half-width passes through to Windows and English full-width respects Shift XOR CapsLock
         req.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
         req.vk_code = 'A';
         req.modifiers = 0;
         client.SendRequest(req, resp, 80);
-        CHECK_EQUAL(resp.handled, 1, L"TestKeyDown for 'A' in English mode must be handled");
+        CHECK_EQUAL(resp.handled, 0, L"TestKeyDown for 'A' in English half-width mode must pass through");
 
         req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
         client.SendRequest(req, resp, 80);
-        CHECK_EQUAL(resp.handled, 1, L"KeyDown for 'A' in English mode must be handled");
-        CHECK_EQUAL(resp.has_commit, 1, L"English 'A' must commit");
-        CHECK_TRUE(wcscmp(resp.commit_text, L"a") == 0, L"English 'A' without Shift must commit lowercase 'a'");
+        CHECK_EQUAL(resp.handled, 0, L"KeyDown for 'A' in English half-width mode must pass through");
 
-        // Shift + 'A' must commit uppercase 'A'
+        // English full-width: 4 combinations of (Shift, CapsLock)
+        CHECK_TRUE(client.SetMode(sessionId, ctxId, IPC_MODE_FULL_WIDTH, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
+                   L"SetMode to Full-width succeeds");
+        req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        req.vk_code = 'A';
+        req.modifiers = 0;
+        client.SendRequest(req, resp, 80);
+        CHECK_EQUAL(resp.handled, 1, L"Full-width 'A' handled");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"\uFF41") == 0, L"Full-width Shift=0 Caps=0 -> lowercase a");
+
         req.modifiers = 1; // Shift
         client.SendRequest(req, resp, 80);
-        CHECK_EQUAL(resp.handled, 1, L"KeyDown for Shift+'A' in English mode must be handled");
-        CHECK_EQUAL(resp.has_commit, 1, L"Shift+'A' must commit");
-        CHECK_TRUE(wcscmp(resp.commit_text, L"A") == 0, L"Shift+'A' must commit uppercase 'A'");
+        CHECK_TRUE(wcscmp(resp.commit_text, L"\uFF21") == 0, L"Full-width Shift=1 Caps=0 -> uppercase A");
+
+        req.modifiers = IPC_MOD_CAPSLOCK; // CapsLock
+        client.SendRequest(req, resp, 80);
+        CHECK_TRUE(wcscmp(resp.commit_text, L"\uFF21") == 0, L"Full-width Shift=0 Caps=1 -> uppercase A");
+
+        req.modifiers = 1 | IPC_MOD_CAPSLOCK; // Shift + CapsLock
+        client.SendRequest(req, resp, 80);
+        CHECK_TRUE(wcscmp(resp.commit_text, L"\uFF41") == 0, L"Full-width Shift=1 Caps=1 -> lowercase a");
+        req.modifiers = 0;
+        CHECK_TRUE(client.SetMode(sessionId, ctxId, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_FULL_WIDTH),
+                   L"Restore Half-width succeeds");
 
         // Shortcuts like Ctrl+C must NOT be handled (pass through to OS)
         req.modifiers = 2; // Ctrl
@@ -768,10 +795,12 @@ int main(int argc, char* argv[]) {
         CHECK_EQUAL(resp.handled, 0, L"Ctrl+C in English mode must pass through (handled = 0)");
         req.modifiers = 0;
 
-        // Press VK_CAPITAL again to return to Chinese mode
-        req.vk_code = VK_CAPITAL;
+        // Shift-tap again returns to Chinese mode
+        req.vk_code = VK_SHIFT;
+        req.mode_arg = IPC_KEYDOWN_SHIFT_TAP;
         client.SendRequest(req, resp, 80);
-        CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Second VK_CAPITAL returns to Chinese mode");
+        req.mode_arg = 0;
+        CHECK_TRUE((resp.status_flags & IPC_MODE_CHINESE) != 0, L"Second Shift-tap returns to Chinese mode");
 
         // Type 'ok' and press Ctrl+Space -> commits 'ok' and switches to English
         req.vk_code = 'O'; client.SendRequest(req, resp, 80);

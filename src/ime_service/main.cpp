@@ -356,11 +356,13 @@ static std::wstring MapChinesePunctuation(uint32_t vk, uint32_t modifiers) {
 
 static std::wstring MapFullWidthChar(uint32_t vk, uint32_t modifiers) {
     bool isShift = (modifiers & 1) != 0;
+    bool isCapsLock = (modifiers & IPC_MOD_CAPSLOCK) != 0;
     if (vk >= '0' && vk <= '9' && !isShift) {
         return std::wstring(1, static_cast<wchar_t>(L'\uFF10' + (vk - '0')));
     }
     if (vk >= 'A' && vk <= 'Z') {
-        wchar_t base = isShift ? L'\uFF21' : L'\uFF41';
+        bool isUpper = isShift ^ isCapsLock;
+        wchar_t base = isUpper ? L'\uFF21' : L'\uFF41';
         return std::wstring(1, static_cast<wchar_t>(base + (vk - 'A')));
     }
     if (vk == VK_SPACE) {
@@ -1209,10 +1211,11 @@ void HandleClient(HANDLE hPipe) {
             else if ((mods & 1) && vk == VK_SPACE) {
                 resp.handled = 1; // Shift + Space (Full/Half width)
             }
-            else if (vk == VK_CAPITAL && (mods & ~1u) == 0) {
-                resp.handled = 1; // CapsLock (Switch Chinese / English)
+            else if (vk == VK_CAPITAL) {
+                // CapsLock belongs to OS/host for case locking; never intercept
+                resp.handled = 0;
             }
-            else if (vk == VK_SHIFT) {
+            else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
                 // Standalone Shift down: DO NOT eat in TestKeyDown so host key state machine is intact
                 resp.handled = 0;
             }
@@ -1246,10 +1249,8 @@ void HandleClient(HANDLE hPipe) {
                     }
                 }
             } else {
-                // English mode
+                // English mode: only intercept full-width mapped characters; half-width passes through to Windows
                 if (state.full_width && !MapFullWidthChar(vk, mods).empty()) {
-                    resp.handled = 1;
-                } else if (!state.full_width && (mods & (2 | 4 | 8)) == 0 && (vk >= 'A' && vk <= 'Z')) {
                     resp.handled = 1;
                 } else {
                     resp.handled = 0;
@@ -1303,21 +1304,40 @@ void HandleClient(HANDLE hPipe) {
                 resp.candidate_count = 0;
                 resp.handled = 1;
             }
-            else if (vk == VK_CAPITAL && (mods & ~1u) == 0) {
-                // CapsLock: switch to English (committing any uncommitted raw composition) or toggle back to Chinese
-                if (state.is_chinese && !state.composition.empty()) {
-                    SafeCopyCommitText(resp, state.composition);
-                    resp.commit_event_id = 0;
-                }
-                state.is_chinese = !state.is_chinese;
-                ResetContextCompositionAndState(state);
-                resp.status_flags = ComputeModeFlags(state);
-                resp.has_composition = 1;
-                resp.composition[0] = L'\0';
-                resp.candidate_count = 0;
-                resp.handled = 1;
+            else if (vk == VK_CAPITAL) {
+                // CapsLock belongs to OS/host for case locking; never intercept
+                resp.handled = 0;
             }
-            else if (vk == VK_SHIFT && mods == 1) {
+            else if ((vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) &&
+                     (req.mode_arg & IPC_KEYDOWN_SHIFT_TAP) != 0) {
+                if (state.is_chinese && !state.composition.empty()) {
+                    // First confirm raw composition commit; client will toggle to English after commit settles
+                    SafeCopyCommitText(resp, state.composition);
+                    resp.commit_event_id = NextEventId();
+                    state.AdvanceGeneration();
+                    resp.candidate_version = state.input_generation;
+                    state.composition.clear();
+                    state.prev_composition.clear();
+                    state.current_query_code.clear();
+                    state.current_page = 0;
+                    state.has_paged = false;
+                    state.cached_coord_query = {};
+                    resp.status_flags = ComputeModeFlags(state);
+                    resp.has_composition = 1;
+                    resp.composition[0] = L'\0';
+                    resp.candidate_count = 0;
+                    resp.handled = 1;
+                } else {
+                    state.is_chinese = !state.is_chinese;
+                    ResetContextCompositionAndState(state);
+                    resp.status_flags = ComputeModeFlags(state);
+                    resp.has_composition = 1;
+                    resp.composition[0] = L'\0';
+                    resp.candidate_count = 0;
+                    resp.handled = 1;
+                }
+            }
+            else if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
                 // Standalone Shift down: DO NOT toggle or clear composition on KeyDown!
                 // Passing through ensures typing Shift+character does not destroy existing composition.
                 resp.handled = 0;
@@ -1344,15 +1364,8 @@ void HandleClient(HANDLE hPipe) {
                     } else {
                         resp.handled = 0;
                     }
-                } else if ((mods & (2 | 4 | 8)) == 0 && (vk >= 'A' && vk <= 'Z')) {
-                    // English half-width mode:
-                    // Commit LOWERCASE by default; require Shift for UPPERCASE!
-                    bool isShift = (mods & 1) != 0;
-                    wchar_t ch = isShift ? static_cast<wchar_t>(vk) : static_cast<wchar_t>(std::tolower(static_cast<char>(vk)));
-                    SafeCopyCommitText(resp, std::wstring(1, ch));
-                    resp.commit_event_id = 0;
-                    resp.handled = 1;
                 } else {
+                    // Half-width English passes through to Windows so Shift/CapsLock work natively
                     resp.handled = 0;
                 }
             }

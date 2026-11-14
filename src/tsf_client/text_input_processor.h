@@ -83,6 +83,7 @@ struct EditRequestControlBlock {
     bool observation_timed_out = false;
     bool was_compositionless = false;
     bool injection_attempted = false;
+    bool toggle_chinese_after_commit = false;
     EditSessionResult outcome = EditSessionResult::Unmodified;
     HRESULT hr = S_OK;
     std::chrono::steady_clock::time_point created_at = std::chrono::steady_clock::now();
@@ -579,7 +580,16 @@ private:
     std::map<uint64_t, CachedAnchorPoint> m_cachedAnchors;
 
     bool ProcessKeyInternal(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten,
-                            bool hasExplicitVersion, uint32_t explicitCandidateVersion);
+                            bool hasExplicitVersion, uint32_t explicitCandidateVersion,
+                            bool isShiftTap = false);
+
+    bool m_shiftTapPending = false;
+    bool m_leftShiftDown = false;
+    bool m_rightShiftDown = false;
+    bool m_genericShiftDown = false;
+    void ResetShiftTapState();
+    static bool IsShiftKeyCode(WPARAM wParam);
+    void UpdateShiftKeyState(WPARAM wParam, LPARAM lParam, bool isDown);
 
     // Taskbar Tray / Language Bar button
     class CLangBarItemButton* m_pLangBarButton = nullptr;

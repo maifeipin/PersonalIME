@@ -123,6 +123,10 @@ enum IpcUpdateMask : uint32_t {
 
 // KeyDown mode_arg flags
 constexpr uint32_t IPC_KEYDOWN_EXPLICIT_SELECT = 1u << 0; // Explicit candidate selection from UI click or Enter/Space on highlighted item
+constexpr uint32_t IPC_KEYDOWN_SHIFT_TAP       = 1u << 1; // Standalone Shift tap-release toggle Chinese/English
+
+// Modifiers bitmask additions (IpcKeyRequest::modifiers)
+constexpr uint32_t IPC_MOD_CAPSLOCK = 1u << 4; // CapsLock toggle state active
 
 #pragma pack(push, 1)
 

@@ -58,10 +58,12 @@ CTextInputProcessor::CTextInputProcessor() {
     });
 
     m_candidateWindow.SetOnSelectCandidateSnapshot([this](const CandidateDisplaySnapshot& snap, int index) {
+        ResetShiftTapState();
         SubmitCandidateSelectionFromSnapshot(snap, index);
     });
 
     m_candidateWindow.SetOnPageScrollSnapshot([this](const CandidateDisplaySnapshot& snap, bool nextPage) {
+        ResetShiftTapState();
         SubmitPageScrollFromSnapshot(snap, nextPage);
     });
 }
@@ -708,6 +710,13 @@ void CTextInputProcessor::OnEditSessionCompleted(
             } else {
                 EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
                 DrainUnconfirmedCommits(true);
+                if (pending.controlBlock && pending.controlBlock->toggle_chinese_after_commit) {
+                    m_ipcClient.SetMode(pending.controlBlock->session_id, pending.controlBlock->context_id,
+                                        0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE);
+                    if (m_pLangBarButton) {
+                        m_pLangBarButton->UpdateStatus();
+                    }
+                }
             }
         }
 
@@ -756,6 +765,13 @@ void CTextInputProcessor::OnEditSessionCompleted(
             } else {
                 EnqueueUnconfirmedCommit(contextId, pending.commitEventId, UnconfirmedAction::Success);
                 DrainUnconfirmedCommits(true);
+                if (pending.controlBlock && pending.controlBlock->toggle_chinese_after_commit) {
+                    m_ipcClient.SetMode(pending.controlBlock->session_id, pending.controlBlock->context_id,
+                                        0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE);
+                    if (m_pLangBarButton) {
+                        m_pLangBarButton->UpdateStatus();
+                    }
+                }
             }
         }
     } else if (result == EditSessionResult::Indeterminate) {
@@ -981,6 +997,14 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
     }
     if (!cb->wal_acked) {
         EnqueuePendingV2Receipt(buildPendingReceipt(true, ok, ok ? finalDisp : IpcCommitDisposition::None));
+    }
+    if (ok && cb->toggle_chinese_after_commit &&
+        (finalDisp == IpcCommitDisposition::ConfirmedWritten ||
+         finalDisp == IpcCommitDisposition::DispatchedUnverified)) {
+        m_ipcClient.SetMode(cb->session_id, cb->context_id, 0, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE);
+        if (m_pLangBarButton) {
+            m_pLangBarButton->UpdateStatus();
+        }
     }
     return ok;
 }
@@ -1671,6 +1695,7 @@ bool CTextInputProcessor::IsDisplayedSnapshotValid(
 }
 
 bool CTextInputProcessor::SubmitCandidateSelectionFromSnapshot(const CandidateDisplaySnapshot& snap, int index) {
+    ResetShiftTapState();
     if (index < 0 || index >= 9 || index >= static_cast<int>(snap.candidates.size())) {
         return false;
     }
@@ -1689,6 +1714,7 @@ bool CTextInputProcessor::SubmitCandidateSelectionFromSnapshot(const CandidateDi
 }
 
 bool CTextInputProcessor::SubmitPageScrollFromSnapshot(const CandidateDisplaySnapshot& snap, bool nextPage) {
+    ResetShiftTapState();
     if (!IsDisplayedSnapshotValid(snap)) {
         return false;
     }
@@ -1821,6 +1847,7 @@ STDMETHODIMP CTextInputProcessor::ActivateEx(ITfThreadMgr* ptim, TfClientId tid,
 
 STDMETHODIMP CTextInputProcessor::Deactivate() {
     m_isDeactivated = true;
+    ResetShiftTapState();
     SuppressAllQueuedEditSessions(true);
     UninitKeyEventSink();
 
@@ -1952,9 +1979,72 @@ static bool IsContextReadOnly(ITfContext* pic) {
     return false;
 }
 
+void CTextInputProcessor::ResetShiftTapState() {
+    m_shiftTapPending = false;
+    m_leftShiftDown = false;
+    m_rightShiftDown = false;
+    m_genericShiftDown = false;
+}
+
+bool CTextInputProcessor::IsShiftKeyCode(WPARAM wParam) {
+    return wParam == VK_SHIFT || wParam == VK_LSHIFT || wParam == VK_RSHIFT;
+}
+
+void CTextInputProcessor::UpdateShiftKeyState(WPARAM wParam, LPARAM lParam, bool isDown) {
+    UINT vkSide = static_cast<UINT>(wParam);
+    if (vkSide == VK_SHIFT) {
+        UINT sc = static_cast<UINT>((lParam >> 16) & 0xFF);
+        if (sc != 0) {
+            UINT mapped = MapVirtualKeyW(sc, MAPVK_VSC_TO_VK_EX);
+            if (mapped == VK_LSHIFT || mapped == VK_RSHIFT) {
+                vkSide = mapped;
+            }
+        }
+    }
+
+    if (isDown) {
+        bool isRepeat = (lParam & 0x40000000) != 0;
+        bool otherMods = ((GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU) |
+                           GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0;
+        bool alreadyAnyShiftDown = m_leftShiftDown || m_rightShiftDown || m_genericShiftDown;
+
+        if (vkSide == VK_LSHIFT) {
+            if (m_rightShiftDown || m_genericShiftDown || isRepeat || otherMods) {
+                m_shiftTapPending = false;
+            } else if (!alreadyAnyShiftDown) {
+                m_shiftTapPending = true;
+            }
+            m_leftShiftDown = true;
+        } else if (vkSide == VK_RSHIFT) {
+            if (m_leftShiftDown || m_genericShiftDown || isRepeat || otherMods) {
+                m_shiftTapPending = false;
+            } else if (!alreadyAnyShiftDown) {
+                m_shiftTapPending = true;
+            }
+            m_rightShiftDown = true;
+        } else {
+            if (alreadyAnyShiftDown || isRepeat || otherMods) {
+                m_shiftTapPending = false;
+            } else {
+                m_shiftTapPending = true;
+            }
+            m_genericShiftDown = true;
+        }
+    } else {
+        if (vkSide == VK_LSHIFT) {
+            m_leftShiftDown = false;
+        } else if (vkSide == VK_RSHIFT) {
+            m_rightShiftDown = false;
+        } else {
+            m_genericShiftDown = false;
+        }
+    }
+}
+
 STDMETHODIMP CTextInputProcessor::OnSetFocus(BOOL fForeground) {
     m_hasFocus = (fForeground != FALSE);
     if (!fForeground) {
+        ResetShiftTapState();
         if (m_activeContextId != 0) {
             AdvanceContextEpoch(m_activeContextId);
         }
@@ -1983,8 +2073,15 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     *pfEaten = FALSE;
 
     if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
+        ResetShiftTapState();
         return S_OK;
     }
+
+    if (IsShiftKeyCode(wParam)) {
+        UpdateShiftKeyState(wParam, lParam, true);
+        return S_OK;
+    }
+    m_shiftTapPending = false;
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
     CheckObservationTimeouts();
@@ -2012,6 +2109,7 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
     if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
+    if (GetKeyState(VK_CAPITAL) & 0x0001) req.modifiers |= IPC_MOD_CAPSLOCK;
     req.protocol_version = m_ipcClient.GetPreferredProtocolVersion(m_sessionId);
 
     IpcKeyResponse resp{};
@@ -2330,6 +2428,9 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
 STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
+    if (!IsShiftKeyCode(wParam)) {
+        m_shiftTapPending = false;
+    }
     ProcessKeyInternal(pic, wParam, lParam, pfEaten, false, 0);
     return S_OK;
 }
@@ -2340,7 +2441,8 @@ bool CTextInputProcessor::ProcessKeyInternal(
     LPARAM lParam,
     BOOL* pfEaten,
     bool hasExplicitVersion,
-    uint32_t explicitCandidateVersion)
+    uint32_t explicitCandidateVersion,
+    bool isShiftTap)
 {
     if (!pfEaten) return false;
     *pfEaten = FALSE;
@@ -2467,13 +2569,17 @@ bool CTextInputProcessor::ProcessKeyInternal(
     req.vk_code = static_cast<uint32_t>(wParam);
     req.scan_code = static_cast<uint32_t>(lParam & 0xFF);
     req.modifiers = 0;
-    if (GetKeyState(VK_SHIFT) & 0x8000) req.modifiers |= 1;
+    if (!isShiftTap && (GetKeyState(VK_SHIFT) & 0x8000)) req.modifiers |= 1;
     if (GetKeyState(VK_CONTROL) & 0x8000) req.modifiers |= 2;
     if (GetKeyState(VK_MENU) & 0x8000) req.modifiers |= 4;
     if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) req.modifiers |= 8;
+    if (GetKeyState(VK_CAPITAL) & 0x0001) req.modifiers |= IPC_MOD_CAPSLOCK;
     req.protocol_version = m_ipcClient.GetPreferredProtocolVersion(m_sessionId);
     if (isExplicitCandidateSelect) {
         req.mode_arg |= IPC_KEYDOWN_EXPLICIT_SELECT;
+    }
+    if (isShiftTap) {
+        req.mode_arg |= IPC_KEYDOWN_SHIFT_TAP;
     }
 
     uint32_t currentCandVer = 0;
@@ -2502,6 +2608,9 @@ bool CTextInputProcessor::ProcessKeyInternal(
     if (sentOk) {
         if (!resp.handled) {
             return false;
+        }
+        if (isShiftTap && !resp.has_commit && m_pLangBarButton) {
+            m_pLangBarButton->UpdateStatus();
         }
         if ((resp.status_flags & IPC_STATUS_HAS_POLICY_REV) != 0) {
             uint32_t advPolicyRevTag = (resp.status_flags & IPC_POLICY_REV_MASK) >> IPC_POLICY_REV_SHIFT;
@@ -2551,6 +2660,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             controlBlock->commit_text = resp.commit_text;
             controlBlock->target_context = pic;
             controlBlock->has_commit = (resp.has_commit != 0);
+            controlBlock->toggle_chinese_after_commit = (isShiftTap && resp.has_commit != 0);
             controlBlock->was_compositionless =
                 (GetContextState(contextId) == CompositionState::CompositionlessComposing) &&
                 (GetComposition(pic) == nullptr);
@@ -2874,12 +2984,31 @@ bool CTextInputProcessor::ProcessKeyInternal(
 STDMETHODIMP CTextInputProcessor::OnTestKeyUp(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
+    if (IsShiftKeyCode(wParam)) {
+        UpdateShiftKeyState(wParam, lParam, false);
+        bool allShiftsReleased = !m_leftShiftDown && !m_rightShiftDown && !m_genericShiftDown;
+        bool otherMods = ((GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU) |
+                           GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0;
+        uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+        if (m_shiftTapPending && allShiftsReleased && !otherMods &&
+            !ShouldFilterKeystroke(wParam) && !IsContextReadOnly(pic) &&
+            !HasQueuedEditSession(contextId) && !IsContextQuarantined(contextId)) {
+            *pfEaten = TRUE;
+        } else if (allShiftsReleased) {
+            m_shiftTapPending = false;
+        }
+    }
     return S_OK;
 }
 
 STDMETHODIMP CTextInputProcessor::OnKeyUp(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
+    if (IsShiftKeyCode(wParam) && m_shiftTapPending) {
+        m_shiftTapPending = false;
+        BOOL dummyEaten = FALSE;
+        ProcessKeyInternal(pic, VK_SHIFT, lParam, &dummyEaten, false, 0, true);
+    }
     return S_OK;
 }
 

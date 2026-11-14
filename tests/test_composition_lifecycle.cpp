@@ -3819,6 +3819,217 @@ static int TestStage74SettingsCodecAndHostGating() {
     return 0;
 }
 
+static int TestShiftTapAndCapsLockDispatchChain() {
+    std::wcout << L"[TEST] Shift-Tap Chinese/English Toggle & TSF Dispatch Chain..." << std::endl;
+
+    std::wstring pipeName = L"\\\\.\\pipe\\PersonalIME_ShiftTap_Test_" + std::to_wstring(GetCurrentProcessId());
+    std::mutex mu;
+    bool isChinese = true;
+    std::wstring comp;
+    int toggleCalls = 0;
+    int setModeCalls = 0;
+    bool lastSetModeChinese = true;
+    uint64_t nextEventId = 100;
+
+    std::atomic<bool> stopServer{false};
+    HANDLE hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::thread srv([&]() {
+        while (!stopServer.load()) {
+            HANDLE hPipe = CreateNamedPipeW(
+                pipeName.c_str(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES,
+                sizeof(IpcKeyResponse),
+                sizeof(IpcKeyRequest),
+                0,
+                nullptr);
+            if (hPipe == INVALID_HANDLE_VALUE) {
+                SetEvent(hReadyEvent);
+                break;
+            }
+            SetEvent(hReadyEvent);
+            if (ConnectNamedPipe(hPipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                IpcKeyRequest req{};
+                DWORD br = 0;
+                while (!stopServer.load() && ReadFile(hPipe, &req, sizeof(req), &br, nullptr) && br == sizeof(req)) {
+                    IpcKeyResponse resp{};
+                    resp.msg_type = req.msg_type;
+                    resp.session_id = req.session_id;
+                    resp.context_id = req.context_id;
+                    resp.protocol_version = req.protocol_version;
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
+                        resp.handled = 1;
+                    } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::SetMode)) {
+                        ++setModeCalls;
+                        if (req.update_mask & IPC_UPDATE_CHINESE) {
+                            isChinese = (req.mode_arg & IPC_MODE_CHINESE) != 0;
+                            lastSetModeChinese = isChinese;
+                        }
+                        resp.handled = 1;
+                    } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::CommitTerminal)) {
+                        resp.handled = 1;
+                    } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::TestKeyDown)) {
+                        if (req.vk_code == VK_CAPITAL) {
+                            resp.handled = 0;
+                        } else if (isChinese && req.vk_code >= 'A' && req.vk_code <= 'Z') {
+                            resp.handled = 1;
+                        }
+                    } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::KeyDown)) {
+                        if ((req.vk_code == VK_SHIFT || req.vk_code == VK_LSHIFT || req.vk_code == VK_RSHIFT) &&
+                            (req.mode_arg & IPC_KEYDOWN_SHIFT_TAP) != 0) {
+                            ++toggleCalls;
+                            if (isChinese && !comp.empty()) {
+                                resp.has_commit = 1;
+                                resp.commit_event_id = ++nextEventId;
+                                wcsncpy_s(resp.commit_text, comp.c_str(), _TRUNCATE);
+                                resp.commit_length = static_cast<uint32_t>(comp.size());
+                                comp.clear();
+                                resp.has_composition = 1;
+                                resp.composition[0] = L'\0';
+                            } else {
+                                isChinese = !isChinese;
+                            }
+                            resp.handled = 1;
+                        } else if (isChinese && req.vk_code >= 'A' && req.vk_code <= 'Z') {
+                            comp.push_back(static_cast<wchar_t>(L'a' + (req.vk_code - 'A')));
+                            resp.has_composition = 1;
+                            wcsncpy_s(resp.composition, comp.c_str(), _TRUNCATE);
+                            resp.candidate_count = 1;
+                            wcsncpy_s(resp.candidates[0], L"1. 测", _TRUNCATE);
+                            resp.candidate_version = 1;
+                            resp.handled = 1;
+                        }
+                    }
+                    resp.status_flags = IPC_STATUS_STAGE7_CAPABLE | (isChinese ? IPC_MODE_CHINESE : 0u);
+                    DWORD bw = 0;
+                    WriteFile(hPipe, &resp, sizeof(resp), &bw, nullptr);
+                    FlushFileBuffers(hPipe);
+                }
+            }
+            DisconnectNamedPipe(hPipe);
+            CloseHandle(hPipe);
+        }
+    });
+
+    WaitForSingleObject(hReadyEvent, 2000);
+    CloseHandle(hReadyEvent);
+    IpcClient::SetPipeNameForTest(pipeName.c_str());
+
+    CTextInputProcessor tip;
+    tip.SetClientIdForTest(1);
+    CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7 for ShiftTap test");
+    MockContext ctx;
+
+    // Simulate real TSF dispatch: OnTestKeyDown -> (only if eaten) OnKeyDown; OnTestKeyUp -> (only if eaten) OnKeyUp
+    auto dispatchKeyDown = [&](WPARAM vk, LPARAM lp, BOOL* outTestEaten = nullptr) {
+        BOOL eaten = FALSE;
+        tip.OnTestKeyDown(&ctx, vk, lp, &eaten);
+        if (outTestEaten) *outTestEaten = eaten;
+        if (eaten) {
+            BOOL keyEaten = FALSE;
+            tip.OnKeyDown(&ctx, vk, lp, &keyEaten);
+        }
+    };
+    auto dispatchKeyUp = [&](WPARAM vk, LPARAM lp, BOOL* outTestEaten = nullptr, BOOL* outKeyEaten = nullptr) {
+        BOOL eaten = FALSE;
+        tip.OnTestKeyUp(&ctx, vk, lp, &eaten);
+        if (outTestEaten) *outTestEaten = eaten;
+        if (eaten) {
+            BOOL keyEaten = FALSE;
+            tip.OnKeyUp(&ctx, vk, lp, &keyEaten);
+            if (outKeyEaten) *outKeyEaten = keyEaten;
+        }
+    };
+
+    // 1. Single Shift tap without composition: OnTestKeyDown=FALSE, OnTestKeyUp=TRUE, OnKeyUp=FALSE -> toggles Chinese->English
+    BOOL tdEaten = TRUE, tuEaten = FALSE, kuEaten = TRUE;
+    dispatchKeyDown(VK_LSHIFT, 0, &tdEaten);
+    CHECK_EQUAL(tdEaten, FALSE, L"Shift OnTestKeyDown must return FALSE");
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten, &kuEaten);
+    CHECK_EQUAL(tuEaten, TRUE, L"Single Shift OnTestKeyUp must return TRUE");
+    CHECK_EQUAL(kuEaten, FALSE, L"Single Shift OnKeyUp must return FALSE so host receives keyup");
+    CHECK_EQUAL(toggleCalls, 1, L"Single Shift tap toggled once");
+    CHECK_TRUE(!isChinese, L"Switched to English mode");
+
+    // 2. Shift tap back to Chinese
+    dispatchKeyDown(VK_RSHIFT, 0);
+    dispatchKeyUp(VK_RSHIFT, 0, &tuEaten, &kuEaten);
+    CHECK_EQUAL(tuEaten, TRUE, L"Second Shift tap OnTestKeyUp returns TRUE");
+    CHECK_TRUE(isChinese, L"Switched back to Chinese mode");
+
+    // 3. Shift + 'A' combo must NOT toggle
+    int prevToggles = toggleCalls;
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyDown('A', 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Shift+'A' must cancel Shift-tap (OnTestKeyUp=FALSE)");
+    CHECK_EQUAL(toggleCalls, prevToggles, L"Shift+'A' did not toggle");
+
+    // 4. Simultaneous L+R Shift must NOT toggle
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyDown(VK_RSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Simultaneous L+R Shift first release must not trigger");
+    dispatchKeyUp(VK_RSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Simultaneous L+R Shift second release must not trigger");
+    CHECK_EQUAL(toggleCalls, prevToggles, L"Simultaneous L+R Shift did not toggle");
+
+    // 5. Auto-repeat Shift down (bit 30 set) must NOT toggle
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyDown(VK_LSHIFT, 0x40000000);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Auto-repeated Shift must not trigger");
+
+    // 6. Focus loss while Shift held cancels Shift-tap
+    dispatchKeyDown(VK_LSHIFT, 0);
+    tip.OnSetFocus(FALSE);
+    tip.OnSetFocus(TRUE);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Focus loss during Shift hold cancels Shift-tap");
+
+    // 7. Mouse paging during Shift hold cancels Shift-tap
+    dispatchKeyDown(VK_LSHIFT, 0);
+    tip.SubmitPageScrollFromSnapshot(tip.GetCandidateWindowForTest().GetSnapshot(), true);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, FALSE, L"Mouse paging during Shift hold cancels Shift-tap");
+
+    // 8. CapsLock passes through without toggling
+    dispatchKeyDown(VK_CAPITAL, 0, &tdEaten);
+    CHECK_EQUAL(tdEaten, FALSE, L"CapsLock passes through (OnTestKeyDown=FALSE)");
+    CHECK_TRUE(isChinese, L"CapsLock preserves Chinese mode");
+
+    // 9. Active composition + commit FAILURE keeps composition and Chinese mode
+    ctx.m_failSetText = true;
+    int prevSetMode = setModeCalls;
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(tuEaten, TRUE, L"Shift-tap with composition routes to OnKeyUp");
+    CHECK_EQUAL(setModeCalls, prevSetMode, L"Failed commit must NOT call SetMode to switch to English");
+    CHECK_TRUE(isChinese, L"Failed commit preserves Chinese mode");
+    ctx.m_failSetText = false;
+
+    // 10. Active composition + commit SUCCESS settles commit and switches to English
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        comp = L"ab";
+    }
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(setModeCalls, prevSetMode + 1, L"Confirmed commit calls SetMode to switch to English");
+    CHECK_TRUE(!isChinese && !lastSetModeChinese, L"Confirmed commit completes switch to English");
+
+    tip.Deactivate();
+    stopServer.store(true);
+    HANDLE hWake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hWake != INVALID_HANDLE_VALUE) CloseHandle(hWake);
+    srv.join();
+    IpcClient::SetPipeNameForTest(nullptr);
+    std::wcout << L"[PASS] Shift-Tap Chinese/English Toggle & TSF Dispatch Chain verified!" << std::endl;
+    return 0;
+}
+
 int main() {
     std::wcout << L"=== Running TSF EditSession & Composition Lifecycle Test Suite ===" << std::endl;
 
@@ -3845,6 +4056,7 @@ int main() {
     if (TestStage71cRequestFenceAndWalRecovery() != 0) return 1;
     if (TestStage71dUnicodeInjectionChannel() != 0) return 1;
     if (TestStage74SettingsCodecAndHostGating() != 0) return 1;
+    if (TestShiftTapAndCapsLockDispatchChain() != 0) return 1;
 
     std::wcout << L"=== ALL Composition Lifecycle Tests PASSED! ===" << std::endl;
     return 0;
