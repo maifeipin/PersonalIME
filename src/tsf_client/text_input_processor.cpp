@@ -113,6 +113,12 @@ bool CTextInputProcessor::IsUnicodeInjectionAllowedForHost() const {
     if (!m_unicodeHostFilterActive) {
         return true;
     }
+    if (!m_stage7SettingsSyncHealthy) {
+        return false;
+    }
+    if ((GetTickCount64() - m_lastStage7SettingsSyncTickMs) >= m_stage7SettingsFreshnessMs) {
+        return false;
+    }
     if (m_unicodeAllowedHosts.empty()) {
         return false;
     }
@@ -156,16 +162,20 @@ void CTextInputProcessor::ApplyStage7Settings(const ime::Stage7SettingsPayload& 
     m_unicodeInjectionEnabled = settings.unicode_injection_enabled;
     SetUnicodeInjectionAllowedHosts(settings.unicode_allowed_hosts, true);
     m_hasSyncedStage7Settings = true;
+    m_stage7SettingsSyncHealthy = true;
     m_syncedPolicyFullRevision = settings.revision;
     m_syncedPolicyRevTag = settings.revision & 0x7u;
 }
 
 bool CTextInputProcessor::TrySyncStage7SettingsFromServer(uint64_t contextId, uint32_t advRevTag, bool force) {
-    if (!force && m_hasSyncedStage7Settings && advRevTag == m_syncedPolicyRevTag) {
+    if (!force && m_hasSyncedStage7Settings && m_stage7SettingsSyncHealthy && advRevTag == m_syncedPolicyRevTag) {
         return true;
     }
     ime::Stage7SettingsPayload settings;
     if (!m_ipcClient.GetStage7Settings(m_sessionId, contextId, settings)) {
+        // Fail closed for Unicode injection until a complete, consistent policy is synced;
+        // existing appearance settings on CCandidateWindow remain intact.
+        m_stage7SettingsSyncHealthy = false;
         return false;
     }
     ApplyStage7Settings(settings);

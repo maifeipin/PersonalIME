@@ -3704,6 +3704,7 @@ static int TestStage74SettingsCodecAndHostGating() {
             serverPol.unicode_injection.allowed_hosts.push_back("host_entry_" + std::to_string(i) + ".exe");
         }
         std::atomic<bool> stopServer{false};
+        std::atomic<bool> mutateMidPagination{false};
         HANDLE hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         std::thread srv([&]() {
             while (!stopServer.load()) {
@@ -3737,6 +3738,10 @@ static int TestStage74SettingsCodecAndHostGating() {
                             resp.handled = 1;
                         } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
                             ime::EncodeStage7SettingsToIpcResponse(serverPol, resp, static_cast<size_t>(req.mode_arg));
+                            if (mutateMidPagination.load() && req.mode_arg == 0) {
+                                serverPol.revision += 1;
+                                serverPol.unicode_injection.enabled = false;
+                            }
                         } else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::KeyDown)) {
                             resp.handled = 1;
                         }
@@ -3755,7 +3760,7 @@ static int TestStage74SettingsCodecAndHostGating() {
         IpcClient::SetPipeNameForTest(pipeName.c_str());
         CTextInputProcessor pipeTip;
         pipeTip.SetClientIdForTest(1);
-        pipeTip.SetStage7SettingsFreshnessMsForTest(0);
+        pipeTip.SetStage7SettingsFreshnessMsForTest(30);
         MockContext ctx;
         CHECK_TRUE(pipeTip.NegotiateStage7ForTest(), L"NegotiateStage7 for Stage7.4 pipe test");
         CHECK_TRUE(pipeTip.TrySyncStage7SettingsFromServer(0, 0, true), L"Initial paginated Stage7.4 sync succeeds");
@@ -3765,15 +3770,41 @@ static int TestStage74SettingsCodecAndHostGating() {
         CHECK_TRUE(pipeTip.IsUnicodeInjectionAllowedForHost(), L"Paginated 80-host allowlist includes trailing host_entry_79.exe");
         CHECK_EQUAL(pipeTip.GetSyncedPolicyFullRevisionForTest(), 1u, L"Initial full revision synced == 1");
 
-        // Advance policy revision by 8 (1 -> 9, same 3-bit tag 1) and revoke unicode_injection
+        // Freshness expiration alone blocks stale cached permission
+        Sleep(40);
+        CHECK_TRUE(!pipeTip.IsUnicodeInjectionAllowedForHost(), L"Expired Stage7 settings freshness blocks injection");
+
+        // Re-sync while still enabled, then test mid-pagination revision change & revocation failure:
+        // Previously allowed -> mid-pagination revision bump & revoke -> sync fails -> injection rejected!
+        CHECK_TRUE(pipeTip.TrySyncStage7SettingsFromServer(0, 0, true), L"Re-sync succeeds before mid-pagination test");
+        CHECK_TRUE(pipeTip.IsUnicodeInjectionAllowedForHost(), L"Injection allowed before mid-pagination failure");
         {
             std::lock_guard<std::mutex> lk(polMu);
-            serverPol.revision = 9;
-            serverPol.unicode_injection.enabled = false;
+            serverPol.revision = 2;
+            mutateMidPagination.store(true);
         }
         BOOL eaten = FALSE;
         pipeTip.OnKeyDown(&ctx, 'A', 0, &eaten);
-        CHECK_EQUAL(pipeTip.GetSyncedPolicyFullRevisionForTest(), 9u, L"8-update wrap-around still refreshes full revision to 9");
+        CHECK_TRUE(!pipeTip.IsUnicodeInjectionAllowedForHost(),
+                   L"Mid-pagination revision change & revocation causes sync failure and blocks injection");
+        mutateMidPagination.store(false);
+
+        // Re-enable at rev 3, sync, then advance policy revision by 8 (3 -> 11, same 3-bit tag 3) and revoke
+        {
+            std::lock_guard<std::mutex> lk(polMu);
+            serverPol.revision = 3;
+            serverPol.unicode_injection.enabled = true;
+        }
+        CHECK_TRUE(pipeTip.TrySyncStage7SettingsFromServer(0, 0, true), L"Re-sync at rev 3 succeeds");
+        CHECK_TRUE(pipeTip.IsUnicodeInjectionAllowedForHost(), L"Injection re-enabled at rev 3");
+        {
+            std::lock_guard<std::mutex> lk(polMu);
+            serverPol.revision = 11;
+            serverPol.unicode_injection.enabled = false;
+        }
+        Sleep(40);
+        pipeTip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(pipeTip.GetSyncedPolicyFullRevisionForTest(), 11u, L"8-update wrap-around still refreshes full revision to 11");
         CHECK_TRUE(!pipeTip.IsUnicodeInjectionAllowedForHost(), L"Revoked unicode_injection after 8-revision wrap-around takes effect");
 
         pipeTip.Deactivate();

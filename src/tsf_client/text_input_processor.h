@@ -467,6 +467,7 @@ private:
     PluginExecuteOverrideFunc m_pluginExecuteOverride;
     bool m_hasSyncedPlugins = false;
     bool m_hasSyncedStage7Settings = false;
+    bool m_stage7SettingsSyncHealthy = false;
     uint32_t m_syncedPolicyRevTag = 0;
     uint32_t m_syncedPolicyFullRevision = 0;
     ULONGLONG m_lastStage7SettingsSyncTickMs = 0;
