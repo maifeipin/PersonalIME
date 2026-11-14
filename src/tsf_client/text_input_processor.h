@@ -492,6 +492,7 @@ private:
     std::map<uint64_t, uint32_t> m_walFaultedEvents;
     void RecordWalFault(uint64_t eventId, WalFaultStage stage);
     void ClearWalFault(uint64_t eventId, WalFaultStage stage);
+    void ClearAllWalFaultsForEvent(uint64_t eventId);
 
     std::map<uint64_t, std::shared_ptr<EditRequestControlBlock>> m_activeRequestBlocks;
     uint64_t m_nextEditRequestId = 0;

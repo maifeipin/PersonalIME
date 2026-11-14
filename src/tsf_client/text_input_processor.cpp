@@ -628,6 +628,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             return false;
         }
         cb->wal_resolved = true;
+        ClearWalFault(cb->commit_event_id, WalFaultStage::Resolved);
 
         IpcCommitDisposition finalDisp = IpcCommitDisposition::None;
         bool conflict = false;
@@ -650,6 +651,7 @@ void CTextInputProcessor::OnEditSessionCompleted(
             entry.disposition = static_cast<uint32_t>(finalDisp);
             if (receipt_journal_v2::AppendServiceAck(entry)) {
                 cb->wal_acked = true;
+                ClearAllWalFaultsForEvent(cb->commit_event_id);
             } else {
                 RecordWalFault(cb->commit_event_id, WalFaultStage::ServiceAck);
             }
@@ -1634,6 +1636,10 @@ void CTextInputProcessor::ClearWalFault(uint64_t eventId, WalFaultStage stage) {
     }
 }
 
+void CTextInputProcessor::ClearAllWalFaultsForEvent(uint64_t eventId) {
+    m_walFaultedEvents.erase(eventId);
+}
+
 bool CTextInputProcessor::HasPendingObservationRequests() const {
     for (const auto& kv : m_activeRequestBlocks) {
         const auto& cb = kv.second;
@@ -1754,8 +1760,7 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
             ackEntry.disposition = static_cast<uint32_t>(it->acked_disp);
             ackEntry.hr = it->hr;
             if (receipt_journal_v2::AppendServiceAck(ackEntry)) {
-                ClearWalFault(it->commit_event_id, WalFaultStage::ServiceAck);
-                ClearWalFault(it->commit_event_id, WalFaultStage::UnknownPending);
+                ClearAllWalFaultsForEvent(it->commit_event_id);
                 uint64_t ctxId = it->context_id;
                 auto cbIt = m_activeRequestBlocks.find(it->edit_request_id);
                 if (cbIt != m_activeRequestBlocks.end() && cbIt->second) {

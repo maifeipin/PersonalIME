@@ -2992,6 +2992,41 @@ int TestStage71cRequestFenceAndWalRecovery() {
 
     cleanupWals();
 
+    // 2e. V2_UNK failure on timeout followed by direct completion (V2_RES -> CommitTerminal -> V2_ACK)
+    //     MUST clear that event's UnknownPending fault without clearing other events' faults.
+    {
+        CTextInputProcessor tipUnk;
+        tipUnk.SetClientIdForTest(1);
+        CHECK_TRUE(tipUnk.NegotiateStage7ForTest(), L"NegotiateStage7 for tipUnk");
+
+        MockContext ctxU;
+        BOOL eaten = FALSE;
+        tipUnk.OnKeyDown(&ctxU, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxU 'A' eaten");
+        ctxU.m_forceSyncBlocked = true;
+        ctxU.m_deferAsyncSession = true;
+        tipUnk.OnKeyDown(&ctxU, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxU commit queued");
+        auto cbU = tipUnk.GetRequestControlBlockForTest(2);
+        CHECK_TRUE(cbU != nullptr && cbU->wal_prepared, L"ctxU V2_PREP persisted");
+
+        // Inject V2_UNK _commit failure on timeout
+        receipt_journal_v2::FailCommitInjectCountForTest() = 1;
+        CHECK_TRUE(tipUnk.MarkObservationTimeout(cbU->edit_request_id), L"MarkObservationTimeout ran");
+        CHECK_TRUE(tipUnk.IsWalBarrierFaulted(), L"V2_UNK failure set WAL barrier fault");
+
+        // Late revoked callback completes directly: V2_RES -> CommitTerminal -> V2_ACK all succeed
+        CHECK_EQUAL(ctxU.m_pDeferredSession->DoEditSession(1), E_ABORT, L"Revoked late callback aborted cleanly");
+        CHECK_TRUE(cbU->wal_resolved && cbU->wal_acked, L"Direct completion persisted V2_RES and V2_ACK");
+        CHECK_TRUE(!tipUnk.IsWalBarrierFaulted(), L"Direct completion cleared UnknownPending fault for this event");
+
+        ctxU.m_pDeferredSession->Release();
+        ctxU.m_pDeferredSession = nullptr;
+        tipUnk.Deactivate();
+    }
+
+    cleanupWals();
+
     // 3. v2 WAL contradictory terminal frame & corrupt tail resilience
     {
         receipt_journal_v2::Entry e{};
