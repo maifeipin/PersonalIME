@@ -449,6 +449,15 @@ bool CTextInputProcessor::IsCompositionlessCommitTargetValid(
         if (ShouldTerminateAfterEdit(contextId, editGeneration)) {
             return false;
         }
+        for (const auto& p : m_pendingEditSessions) {
+            if (p.contextId == contextId && p.generation == editGeneration &&
+                p.status == PendingEditStatus::QueuedAsync) {
+                if (!HasTextEditSinkAdvised(contextId)) {
+                    return false;
+                }
+                break;
+            }
+        }
     } else if (m_activeContextId != 0 && m_activeContextId != contextId) {
         return false;
     }
@@ -1513,11 +1522,25 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 for (uint32_t i = 0; i < resp.candidate_count && i < 9; ++i) {
                     size_t labelLen = wcsnlen(resp.candidates[i], kCandCap);
                     std::wstring core;
-                    if (labelLen + 1 < kCandCap) {
-                        const wchar_t* corePtr = resp.candidates[i] + labelLen + 1;
-                        size_t maxCoreLen = kCandCap - (labelLen + 1);
-                        size_t coreLen = wcsnlen(corePtr, maxCoreLen);
-                        core.assign(corePtr, coreLen);
+                    if (labelLen + 2 < kCandCap && resp.candidates[i][labelLen + 1] >= 1) {
+                        size_t coreLen = static_cast<size_t>(resp.candidates[i][labelLen + 1] - 1);
+                        size_t prefixLen = 0;
+                        size_t dotPos = cands[i].find(L". ");
+                        if (dotPos != std::wstring::npos && dotPos > 0 && dotPos <= 3) {
+                            bool allDigits = true;
+                            for (size_t d = 0; d < dotPos; ++d) {
+                                if (cands[i][d] < L'0' || cands[i][d] > L'9') {
+                                    allDigits = false;
+                                    break;
+                                }
+                            }
+                            if (allDigits) {
+                                prefixLen = dotPos + 2;
+                            }
+                        }
+                        if (prefixLen + coreLen <= cands[i].length()) {
+                            core = cands[i].substr(prefixLen, coreLen);
+                        }
                     }
                     snap.candidate_core_texts.push_back(std::move(core));
                 }
@@ -1598,7 +1621,14 @@ bool CTextInputProcessor::ProcessKeyInternal(
             HRESULT hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
             bool isSyncBlocked = (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS);
             if (isSyncBlocked) {
-                EnsureTextEditSinkAdvised(pic);
+                bool sinkAdvised = EnsureTextEditSinkAdvised(pic);
+                if (!sinkAdvised && resp.has_commit && GetComposition(pic) == nullptr) {
+                    // Cannot monitor same-context selection changes for an unguarded compositionless async commit
+                    OnEditSessionCompleted(contextId, editGen, EditSessionResult::Unmodified, E_ACCESSDENIED);
+                    pSession->Release();
+                    *pfEaten = FALSE;
+                    return false;
+                }
                 for (auto& pe : m_pendingEditSessions) {
                     if (pe.contextId == contextId && pe.generation == editGen) {
                         pe.status = PendingEditStatus::QueuedAsync;
@@ -1817,11 +1847,11 @@ void CTextInputProcessor::ExitCompositionlessMode(uint64_t contextId) {
     }
 }
 
-void CTextInputProcessor::EnsureTextEditSinkAdvised(ITfContext* pic) {
-    if (!pic) return;
+bool CTextInputProcessor::EnsureTextEditSinkAdvised(ITfContext* pic) {
+    if (!pic) return false;
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
     if (m_textEditSinks.find(contextId) != m_textEditSinks.end()) {
-        return;
+        return true;
     }
     Microsoft::WRL::ComPtr<ITfSource> pSource;
     if (SUCCEEDED(pic->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(pSource.GetAddressOf()))) && pSource) {
@@ -1832,8 +1862,14 @@ void CTextInputProcessor::EnsureTextEditSinkAdvised(ITfContext* pic) {
             binding.context = pic;
             binding.cookie = cookie;
             m_textEditSinks[contextId] = std::move(binding);
+            return true;
         }
     }
+    return false;
+}
+
+bool CTextInputProcessor::HasTextEditSinkAdvised(uint64_t contextId) const {
+    return m_textEditSinks.find(contextId) != m_textEditSinks.end();
 }
 
 void CTextInputProcessor::UnadviseTextEditSink(uint64_t contextId) {
@@ -1865,6 +1901,12 @@ void CTextInputProcessor::UnadviseAllTextEditSinks() {
 STDMETHODIMP CTextInputProcessor::OnEndEdit(ITfContext* pic, TfEditCookie /*ecReadOnly*/, ITfEditRecord* pEditRecord) {
     if (!pic || !pEditRecord || m_internalEditDepth > 0) {
         return S_OK;
+    }
+    if (m_tfClientId != TF_CLIENTID_NULL) {
+        BOOL fInWriteSession = FALSE;
+        if (SUCCEEDED(pic->InWriteSession(m_tfClientId, &fInWriteSession)) && fInWriteSession) {
+            return S_OK;
+        }
     }
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
     bool isTracked =

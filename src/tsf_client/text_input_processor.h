@@ -91,7 +91,8 @@ public:
     STDMETHODIMP OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) override;
     void BeginInternalEdit() { ++m_internalEditDepth; }
     void EndInternalEdit() { if (m_internalEditDepth > 0) --m_internalEditDepth; }
-    void EnsureTextEditSinkAdvised(ITfContext* pic);
+    bool EnsureTextEditSinkAdvised(ITfContext* pic);
+    bool HasTextEditSinkAdvised(uint64_t contextId) const;
     void UnadviseTextEditSink(uint64_t contextId);
     void UnadviseAllTextEditSinks();
 

@@ -221,9 +221,11 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
     }
     resp.candidate_count = count;
 
+    bool allCoresEncoded = (count > 0 && resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
     for (uint32_t i = 0; i < count; ++i) {
         const auto& cand = st.cached_coord_query.candidates[startIdx + i];
-        std::wstring label = std::to_wstring(i + 1) + L". " + cand.text;
+        std::wstring prefix = std::to_wstring(i + 1) + L". ";
+        std::wstring label = prefix + cand.text;
         if (!cand.reverse_lookup_code.empty()) {
             label += L" [" + ime::Utf8ToWide(cand.reverse_lookup_code) + L"]";
         }
@@ -231,11 +233,13 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
         SafeCopyCandidateText(resp.candidates[i], kCandCap, label);
         if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
             size_t labelLen = wcslen(resp.candidates[i]);
-            if (labelLen + 1 < kCandCap) {
-                size_t remCap = kCandCap - (labelLen + 1);
-                if (cand.text.length() < remCap) {
-                    SafeCopyCandidateText(resp.candidates[i] + labelLen + 1, remCap, cand.text);
-                } else {
+            bool coreFitsInLabel = (prefix.length() + cand.text.length() <= labelLen);
+            if (coreFitsInLabel && labelLen + 3 <= kCandCap) {
+                resp.candidates[i][labelLen + 1] = static_cast<wchar_t>(1 + cand.text.length());
+                resp.candidates[i][labelLen + 2] = L'\0';
+            } else {
+                allCoresEncoded = false;
+                if (labelLen + 1 < kCandCap) {
                     resp.candidates[i][labelLen + 1] = L'\0';
                 }
             }
@@ -243,7 +247,7 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
     }
 
     if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
-        if (count > 0) {
+        if (allCoresEncoded) {
             resp.status_flags |= IPC_STATUS_HAS_CAND_CORES;
         }
         if (resp.has_commit == 0 && !st.cached_coord_query.candidates.empty()) {

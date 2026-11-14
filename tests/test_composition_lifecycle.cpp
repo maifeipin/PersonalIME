@@ -409,6 +409,9 @@ public:
     bool m_deferAsyncSession = false;
     bool m_failStartComposition = false;
     bool m_failGetSelection = false;
+    bool m_failAdviseSink = false;
+    bool m_inOwnWriteSession = false;
+    bool m_fireOnEndEditAfterDoEditSession = false;
     HRESULT m_startCompositionHr = E_FAIL;
     DWORD m_dynamicStatusFlags = 0;
     int m_editSessionRequestCount = 0;
@@ -428,7 +431,13 @@ public:
         if (m_pDeferredSession) {
             ITfEditSession* pes = m_pDeferredSession;
             m_pDeferredSession = nullptr;
+            m_inOwnWriteSession = true;
             pes->DoEditSession(ec);
+            if (m_fireOnEndEditAfterDoEditSession && m_pTextEditSink) {
+                MockEditRecord rec(TRUE);
+                m_pTextEditSink->OnEndEdit(this, ec, &rec);
+            }
+            m_inOwnWriteSession = false;
             pes->Release();
         }
     }
@@ -486,12 +495,18 @@ public:
                 return S_OK;
             }
         }
+        m_inOwnWriteSession = true;
         *phrSession = pes->DoEditSession(1001); // Invoke directly with mock cookie
+        if (m_fireOnEndEditAfterDoEditSession && m_pTextEditSink) {
+            MockEditRecord rec(TRUE);
+            m_pTextEditSink->OnEndEdit(this, 1001, &rec);
+        }
+        m_inOwnWriteSession = false;
         return S_OK;
     }
 
     STDMETHODIMP InWriteSession(TfClientId tid, BOOL *pfWriteSession) override {
-        if (pfWriteSession) *pfWriteSession = TRUE;
+        if (pfWriteSession) *pfWriteSession = m_inOwnWriteSession ? TRUE : FALSE;
         return S_OK;
     }
 
@@ -569,6 +584,7 @@ public:
     // ITfSource methods
     STDMETHODIMP AdviseSink(REFIID riid, IUnknown* punk, DWORD* pdwCookie) override {
         if (!punk || !pdwCookie) return E_POINTER;
+        if (m_failAdviseSink) return E_FAIL;
         if (IsEqualIID(riid, IID_ITfTextEditSink)) {
             ITfTextEditSink* pSink = nullptr;
             if (SUCCEEDED(punk->QueryInterface(IID_ITfTextEditSink, reinterpret_cast<void**>(&pSink))) && pSink) {
@@ -1592,6 +1608,11 @@ public:
                         } else if (vk == 'V') {
                             st.page_count = 1;
                             st.candidates = { L"版本 [beta]", L"测试 [alpha]" };
+                        } else if (vk == 'L') {
+                            st.page_count = 1;
+                            std::wstring longCore(64, L'汉');
+                            longCore += L" [beta]";
+                            st.candidates = { longCore, L"短词" };
                         } else {
                             st.page_count = 1;
                             st.candidates = { L"华", L"花", L"化" };
@@ -1603,8 +1624,9 @@ public:
                             resp.commit_length = 0;
                             for (uint32_t i = 0; i < resp.candidate_count; ++i) {
                                 size_t labelLen = wcslen(resp.candidates[i]);
-                                if (labelLen + 1 < 128 && i < st.candidates.size()) {
-                                    wcsncpy_s(resp.candidates[i] + labelLen + 1, 128 - (labelLen + 1), st.candidates[i].c_str(), _TRUNCATE);
+                                if (labelLen + 3 <= 128 && i < st.candidates.size()) {
+                                    resp.candidates[i][labelLen + 1] = static_cast<wchar_t>(1 + st.candidates[i].length());
+                                    resp.candidates[i][labelLen + 2] = L'\0';
                                 }
                             }
                         }
@@ -2495,7 +2517,7 @@ int TestStage71bReviewFixes() {
         CHECK_TRUE(ctx.m_pTextEditSink == nullptr, L"ITfTextEditSink cleanly unadvised on Deactivate");
     }
 
-    // 6. Server-supplied candidate_core_texts (IPC_STATUS_HAS_CAND_CORES) preserves "版本 [beta]" with space + ASCII brackets
+    // 6. Server-supplied candidate_core_texts (IPC_STATUS_HAS_CAND_CORES) preserves "版本 [beta]" AND long 64-char + " [beta]"
     {
         CTextInputProcessor tip;
         tip.SetClientIdForTest(1);
@@ -2510,6 +2532,62 @@ int TestStage71bReviewFixes() {
         CHECK_EQUAL(snap.candidate_core_texts.size(), size_t(2), L"2 explicit candidate_core_texts received from Stage 7 server");
         CHECK_EQUAL(snap.candidate_core_texts[0], std::wstring(L"版本 [beta]"), L"Core text 0 preserves '版本 [beta]'");
         CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"da'jia [版本 [beta]]"), L"Preedit Header preserves '版本 [beta]' intact without stripping [beta]!");
+
+        tip.OnKeyDown(&ctx, 'L', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'L' eaten for long candidate");
+        std::wstring expectedLongCore(64, L'汉');
+        expectedLongCore += L" [beta]";
+        const auto& snapLong = tip.GetCandidateWindowForTest().GetSnapshot();
+        CHECK_EQUAL(snapLong.candidate_core_texts.size(), size_t(2), L"Long candidate core_texts received");
+        CHECK_EQUAL(snapLong.candidate_core_texts[0], expectedLongCore, L"64-char + ' [beta]' core text preserved without fallback guessing");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), L"da'jia [" + expectedLongCore + L"]", L"Preedit Header preserves long 64-char + ' [beta]' intact");
+
+        tip.Deactivate();
+    }
+
+    // 7. AdviseSink failure blocks queuing an unguarded compositionless async commit
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_failAdviseSink = true;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Entered CompositionlessComposing even when AdviseSink fails");
+        CHECK_TRUE(ctx.m_pTextEditSink == nullptr, L"AdviseSink failed as injected");
+
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+        int cancelBefore = server.m_commitCancelCount.load();
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, FALSE, L"Unguarded compositionless async commit MUST be rejected when AdviseSink failed!");
+        CHECK_EQUAL(tip.GetPendingEditSessionCount(), 0, L"No async EditSession queued when AdviseSink failed");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"Rejected unguarded async commit sent CommitCancel");
+
+        tip.Deactivate();
+    }
+
+    // 8. Real TSF OnEndEdit timing (fired after DoEditSession returns while InWriteSession == TRUE)
+    //    must NOT falsely cancel our own edit/composition!
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+        ctx.m_fireOnEndEditAfterDoEditSession = true;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'A' eaten");
+        CHECK_TRUE(tip.GetCompositionState(&ctx) == CompositionState::CompositionlessComposing, L"Remains in CompositionlessComposing");
+
+        // Trigger a synchronous commit; OnEndEdit fires after DoEditSession returns while InWriteSession == TRUE
+        int successBefore = server.m_commitSuccessCount.load();
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Commit succeeded despite OnEndEdit firing after DoEditSession");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore + 1, L"CommitSuccess confirmed");
 
         tip.Deactivate();
     }
