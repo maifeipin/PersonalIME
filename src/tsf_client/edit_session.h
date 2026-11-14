@@ -57,6 +57,12 @@ public:
     }
 
     STDMETHODIMP DoEditSession(TfEditCookie ec) override {
+        if (m_pTip) m_pTip->BeginInternalEdit();
+        struct InternalEditGuard {
+            CTextInputProcessor* tip;
+            ~InternalEditGuard() { if (tip) tip->EndInternalEdit(); }
+        } editGuard{m_pTip};
+
         HRESULT hr = S_OK;
         if (m_pComp) {
             ITfRange* pRange = nullptr;
@@ -181,6 +187,9 @@ public:
         struct CompletionGuard {
             CEditSession* self;
             ~CompletionGuard() {
+                if (self->m_pTip) {
+                    self->m_pTip->EndInternalEdit();
+                }
                 if (self->m_pTip && self->m_generation != 0) {
                     self->m_pTip->OnEditSessionCompleted(
                         self->m_contextId,
@@ -190,6 +199,7 @@ public:
                 }
             }
         } guard{this};
+        if (m_pTip) m_pTip->BeginInternalEdit();
 
         if (!m_pContext || !m_pTip) {
             m_result = EditSessionResult::Unmodified;

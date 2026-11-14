@@ -536,6 +536,17 @@ void CTextInputProcessor::OnEditSessionCompleted(
         return;
     }
 
+    struct SinkCleanupGuard {
+        CTextInputProcessor* tip;
+        uint64_t ctxId;
+        ~SinkCleanupGuard() {
+            if (!tip->HasQueuedEditSession(ctxId) &&
+                tip->GetContextState(ctxId) != CompositionState::CompositionlessComposing) {
+                tip->UnadviseTextEditSink(ctxId);
+            }
+        }
+    } sinkCleanupGuard{this, contextId};
+
     auto applySnapshotState = [&](uint32_t ver, uint32_t pageIdx, uint32_t pageCnt) {
         m_contextCandidateVersions[contextId] = ver;
         m_latestServerCandidateVersions[contextId] = ver;
@@ -838,6 +849,8 @@ STDMETHODIMP CTextInputProcessor::QueryInterface(REFIID riid, void** ppvObj) {
         *ppvObj = static_cast<ITfCompositionSink*>(this);
     } else if (IsEqualIID(riid, IID_ITfDisplayAttributeProvider)) {
         *ppvObj = static_cast<ITfDisplayAttributeProvider*>(this);
+    } else if (IsEqualIID(riid, IID_ITfTextEditSink)) {
+        *ppvObj = static_cast<ITfTextEditSink*>(this);
     }
 
     if (*ppvObj) {
@@ -938,6 +951,7 @@ STDMETHODIMP CTextInputProcessor::Deactivate() {
     m_candidateWindow.Destroy();
 
     ResetAllCompositionlessContexts(true);
+    UnadviseAllTextEditSinks();
 
     if (m_pCompositionContext) {
         uint64_t oldContextId = m_compositionContextId;
@@ -1493,6 +1507,27 @@ bool CTextInputProcessor::ProcessKeyInternal(
                 snap.initial_selected_index < static_cast<int>(cands.size())) {
                 snap.preview_text = CCandidateWindow::ExtractCandidateCoreText(cands[snap.initial_selected_index]);
             }
+            if ((resp.status_flags & IPC_STATUS_HAS_CAND_CORES) != 0) {
+                constexpr size_t kCandCap = sizeof(resp.candidates[0]) / sizeof(wchar_t);
+                snap.candidate_core_texts.reserve(cands.size());
+                for (uint32_t i = 0; i < resp.candidate_count && i < 9; ++i) {
+                    size_t labelLen = wcsnlen(resp.candidates[i], kCandCap);
+                    std::wstring core;
+                    if (labelLen + 1 < kCandCap) {
+                        const wchar_t* corePtr = resp.candidates[i] + labelLen + 1;
+                        size_t maxCoreLen = kCandCap - (labelLen + 1);
+                        size_t coreLen = wcsnlen(corePtr, maxCoreLen);
+                        core.assign(corePtr, coreLen);
+                    }
+                    snap.candidate_core_texts.push_back(std::move(core));
+                }
+                if (!snap.candidate_core_texts.empty() &&
+                    snap.initial_selected_index >= 0 &&
+                    static_cast<size_t>(snap.initial_selected_index) < snap.candidate_core_texts.size() &&
+                    !snap.candidate_core_texts[snap.initial_selected_index].empty()) {
+                    snap.preview_text = snap.candidate_core_texts[snap.initial_selected_index];
+                }
+            }
 
             // Stage 7.1b: If context is already in CompositionlessComposing and this is not a commit,
             // update UI directly (UiOnlyHandled) without requesting per-key TF_ES_READWRITE locks!
@@ -1563,6 +1598,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             HRESULT hr = pic->RequestEditSession(m_tfClientId, pSession, TF_ES_SYNC | TF_ES_READWRITE, &hrSession);
             bool isSyncBlocked = (hr == TF_E_SYNCHRONOUS || hrSession == TF_E_SYNCHRONOUS);
             if (isSyncBlocked) {
+                EnsureTextEditSinkAdvised(pic);
                 for (auto& pe : m_pendingEditSessions) {
                     if (pe.contextId == contextId && pe.generation == editGen) {
                         pe.status = PendingEditStatus::QueuedAsync;
@@ -1766,6 +1802,7 @@ void CTextInputProcessor::EnterCompositionlessMode(ITfContext* pContext) {
     m_compositionlessContextLeases[contextId] = pContext;
     SetContextState(contextId, CompositionState::CompositionlessComposing);
     SetContextMode(contextId, CandidateWindowMode::Compositionless);
+    EnsureTextEditSinkAdvised(pContext);
 }
 
 void CTextInputProcessor::ExitCompositionlessMode(uint64_t contextId) {
@@ -1775,6 +1812,95 @@ void CTextInputProcessor::ExitCompositionlessMode(uint64_t contextId) {
     }
     SetContextMode(contextId, CandidateWindowMode::StandardInline);
     m_compositionlessContextLeases.erase(contextId);
+    if (!HasQueuedEditSession(contextId)) {
+        UnadviseTextEditSink(contextId);
+    }
+}
+
+void CTextInputProcessor::EnsureTextEditSinkAdvised(ITfContext* pic) {
+    if (!pic) return;
+    uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    if (m_textEditSinks.find(contextId) != m_textEditSinks.end()) {
+        return;
+    }
+    Microsoft::WRL::ComPtr<ITfSource> pSource;
+    if (SUCCEEDED(pic->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(pSource.GetAddressOf()))) && pSource) {
+        DWORD cookie = TF_INVALID_COOKIE;
+        if (SUCCEEDED(pSource->AdviseSink(IID_ITfTextEditSink, static_cast<ITfTextEditSink*>(this), &cookie)) &&
+            cookie != TF_INVALID_COOKIE) {
+            TextEditSinkBinding binding;
+            binding.context = pic;
+            binding.cookie = cookie;
+            m_textEditSinks[contextId] = std::move(binding);
+        }
+    }
+}
+
+void CTextInputProcessor::UnadviseTextEditSink(uint64_t contextId) {
+    auto it = m_textEditSinks.find(contextId);
+    if (it == m_textEditSinks.end()) return;
+    TextEditSinkBinding binding = std::move(it->second);
+    m_textEditSinks.erase(it);
+    if (binding.context && binding.cookie != TF_INVALID_COOKIE) {
+        Microsoft::WRL::ComPtr<ITfSource> pSource;
+        if (SUCCEEDED(binding.context->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(pSource.GetAddressOf()))) && pSource) {
+            pSource->UnadviseSink(binding.cookie);
+        }
+    }
+}
+
+void CTextInputProcessor::UnadviseAllTextEditSinks() {
+    auto sinks = std::move(m_textEditSinks);
+    m_textEditSinks.clear();
+    for (auto& kv : sinks) {
+        if (kv.second.context && kv.second.cookie != TF_INVALID_COOKIE) {
+            Microsoft::WRL::ComPtr<ITfSource> pSource;
+            if (SUCCEEDED(kv.second.context->QueryInterface(IID_ITfSource, reinterpret_cast<void**>(pSource.GetAddressOf()))) && pSource) {
+                pSource->UnadviseSink(kv.second.cookie);
+            }
+        }
+    }
+}
+
+STDMETHODIMP CTextInputProcessor::OnEndEdit(ITfContext* pic, TfEditCookie /*ecReadOnly*/, ITfEditRecord* pEditRecord) {
+    if (!pic || !pEditRecord || m_internalEditDepth > 0) {
+        return S_OK;
+    }
+    uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    bool isTracked =
+        (contextId == m_activeContextId) ||
+        HasQueuedEditSession(contextId) ||
+        (GetContextState(contextId) == CompositionState::CompositionlessComposing);
+    if (!isTracked) {
+        return S_OK;
+    }
+
+    BOOL fSelectionChanged = FALSE;
+    pEditRecord->GetSelectionStatus(&fSelectionChanged);
+
+    bool hasExternalTextChange = false;
+    IEnumTfRanges* pEnumRanges = nullptr;
+    if (SUCCEEDED(pEditRecord->GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, nullptr, 0, &pEnumRanges)) && pEnumRanges) {
+        ITfRange* pTmp = nullptr;
+        ULONG fetched = 0;
+        if (pEnumRanges->Next(1, &pTmp, &fetched) == S_OK && fetched > 0 && pTmp) {
+            hasExternalTextChange = true;
+            pTmp->Release();
+        }
+        pEnumRanges->Release();
+    }
+
+    if (fSelectionChanged || hasExternalTextChange) {
+        Microsoft::WRL::ComPtr<ITfTextInputProcessorEx> selfGuard(this);
+        AdvanceContextInputGeneration(contextId);
+        SuppressQueuedEditSessionsForContext(contextId, true);
+        if (GetContextState(contextId) == CompositionState::CompositionlessComposing) {
+            ResetCompositionlessContext(contextId, false, true);
+        } else {
+            HideCandidateWindowIfOwnedBy(contextId);
+        }
+    }
+    return S_OK;
 }
 
 bool CTextInputProcessor::HasCompositionlessLease(uint64_t contextId, ITfContext* pContext) const {

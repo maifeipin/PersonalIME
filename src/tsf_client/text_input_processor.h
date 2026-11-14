@@ -54,7 +54,8 @@ class CTextInputProcessor :
     public ITfTextInputProcessorEx,
     public ITfKeyEventSink,
     public ITfCompositionSink,
-    public ITfDisplayAttributeProvider {
+    public ITfDisplayAttributeProvider,
+    public ITfTextEditSink {
 public:
     CTextInputProcessor();
     ~CTextInputProcessor();
@@ -85,6 +86,14 @@ public:
     STDMETHODIMP GetDisplayAttributeInfo(REFGUID guid, ITfDisplayAttributeInfo** ppInfo) override;
     TfGuidAtom GetDisplayAttributeAtom() const { return m_displayAttributeAtom; }
     void SetDisplayAttributeAtomForTest(TfGuidAtom atom) { m_displayAttributeAtom = atom; }
+
+    // ITfTextEditSink
+    STDMETHODIMP OnEndEdit(ITfContext* pic, TfEditCookie ecReadOnly, ITfEditRecord* pEditRecord) override;
+    void BeginInternalEdit() { ++m_internalEditDepth; }
+    void EndInternalEdit() { if (m_internalEditDepth > 0) --m_internalEditDepth; }
+    void EnsureTextEditSinkAdvised(ITfContext* pic);
+    void UnadviseTextEditSink(uint64_t contextId);
+    void UnadviseAllTextEditSinks();
 
     // Context-scoped composition helpers
     TfClientId GetClientId() const { return m_tfClientId; }
@@ -398,6 +407,13 @@ private:
     std::map<uint64_t, CompositionState> m_contextStates;
     std::map<uint64_t, CandidateWindowMode> m_contextModes;
     std::map<uint64_t, Microsoft::WRL::ComPtr<ITfContext>> m_compositionlessContextLeases;
+
+    struct TextEditSinkBinding {
+        Microsoft::WRL::ComPtr<ITfContext> context;
+        DWORD cookie = TF_INVALID_COOKIE;
+    };
+    std::map<uint64_t, TextEditSinkBinding> m_textEditSinks;
+    int m_internalEditDepth = 0;
 
     struct CachedAnchorPoint {
         uint64_t contextEpoch = 0;

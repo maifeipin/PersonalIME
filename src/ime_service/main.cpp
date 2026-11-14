@@ -227,23 +227,38 @@ static void PopulateCandidatesPage(IpcKeyResponse& resp, ContextState& st) {
         if (!cand.reverse_lookup_code.empty()) {
             label += L" [" + ime::Utf8ToWide(cand.reverse_lookup_code) + L"]";
         }
-        SafeCopyCandidateText(resp.candidates[i], sizeof(resp.candidates[i])/sizeof(wchar_t), label);
+        constexpr size_t kCandCap = sizeof(resp.candidates[i]) / sizeof(wchar_t);
+        SafeCopyCandidateText(resp.candidates[i], kCandCap, label);
+        if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
+            size_t labelLen = wcslen(resp.candidates[i]);
+            if (labelLen + 1 < kCandCap) {
+                size_t remCap = kCandCap - (labelLen + 1);
+                if (cand.text.length() < remCap) {
+                    SafeCopyCandidateText(resp.candidates[i] + labelLen + 1, remCap, cand.text);
+                } else {
+                    resp.candidates[i][labelLen + 1] = L'\0';
+                }
+            }
+        }
     }
 
-    if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 &&
-        resp.has_commit == 0 &&
-        !st.cached_coord_query.candidates.empty()) {
-        uint32_t idx = (startIdx < total) ? startIdx : 0;
-        const auto& topCand = st.cached_coord_query.candidates[idx];
-        const std::string& codeUtf8 = !topCand.segmented_code.empty()
-            ? topCand.segmented_code
-            : topCand.resolved_code;
-        if (!codeUtf8.empty()) {
-            std::wstring qCode = ime::Utf8ToWide(codeUtf8);
-            if (!qCode.empty()) {
-                SafeCopyCandidateText(resp.commit_text, sizeof(resp.commit_text) / sizeof(wchar_t), qCode);
-                resp.commit_length = 0;
-                resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+    if (resp.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
+        if (count > 0) {
+            resp.status_flags |= IPC_STATUS_HAS_CAND_CORES;
+        }
+        if (resp.has_commit == 0 && !st.cached_coord_query.candidates.empty()) {
+            uint32_t idx = (startIdx < total) ? startIdx : 0;
+            const auto& topCand = st.cached_coord_query.candidates[idx];
+            const std::string& codeUtf8 = !topCand.segmented_code.empty()
+                ? topCand.segmented_code
+                : topCand.resolved_code;
+            if (!codeUtf8.empty()) {
+                std::wstring qCode = ime::Utf8ToWide(codeUtf8);
+                if (!qCode.empty()) {
+                    SafeCopyCandidateText(resp.commit_text, sizeof(resp.commit_text) / sizeof(wchar_t), qCode);
+                    resp.commit_length = 0;
+                    resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+                }
             }
         }
     }

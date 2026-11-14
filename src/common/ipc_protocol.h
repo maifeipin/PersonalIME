@@ -95,7 +95,8 @@ enum IpcModeFlags : uint32_t {
     IPC_STATUS_HAS_PLUGINS_REV = 1 << 7,  // 1 = status_flags bits 24..31 carry 8-bit plugins revision tag
     IPC_STATUS_STAGE7_CAPABLE  = 1 << 8,  // 1 = Server supports Stage 7 protocol (CommitTerminal / QueryCommitStatus / QueryCode)
     IPC_STATUS_CONFLICT_ERROR  = 1 << 9,  // 1 = CommitTerminal rejected due to mutually exclusive disposition conflict
-    IPC_STATUS_HAS_QUERY_CODE  = 1 << 10  // 1 = When has_commit==0, commit_text carries segmented query_code for Preedit Header
+    IPC_STATUS_HAS_QUERY_CODE  = 1 << 10, // 1 = When has_commit==0, commit_text carries segmented query_code for Preedit Header
+    IPC_STATUS_HAS_CAND_CORES  = 1 << 11  // 1 = Each candidates[i] carries null-terminated core text immediately after the label's NUL
 };
 
 // Scheme encoding in status_flags (bits 16..23)

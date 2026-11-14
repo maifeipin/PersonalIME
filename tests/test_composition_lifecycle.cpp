@@ -352,8 +352,41 @@ private:
     LONG m_cRef = 1;
 };
 
-// 3. Mock ITfContext, ITfContextComposition, and ITfInsertAtSelection
-class MockContext : public ITfContext, public ITfContextComposition, public ITfInsertAtSelection {
+// 3. Mock ITfEditRecord, ITfContext, ITfContextComposition, ITfInsertAtSelection, and ITfSource
+class MockEditRecord : public ITfEditRecord {
+public:
+    MockEditRecord(BOOL selChanged) : m_selChanged(selChanged) {}
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
+        if (!ppvObj) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfEditRecord)) {
+            *ppvObj = static_cast<ITfEditRecord*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppvObj = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_cRef); }
+    STDMETHODIMP_(ULONG) Release() override {
+        LONG cr = InterlockedDecrement(&m_cRef);
+        if (cr == 0) delete this;
+        return cr;
+    }
+    STDMETHODIMP GetSelectionStatus(BOOL* pfChanged) override {
+        if (!pfChanged) return E_POINTER;
+        *pfChanged = m_selChanged;
+        return S_OK;
+    }
+    STDMETHODIMP GetTextAndPropertyUpdates(DWORD dwFlags, const GUID** prgProperties, ULONG cProperties, IEnumTfRanges** ppEnum) override {
+        if (ppEnum) *ppEnum = nullptr;
+        return S_OK;
+    }
+private:
+    LONG m_cRef = 1;
+    BOOL m_selChanged = FALSE;
+};
+
+class MockContext : public ITfContext, public ITfContextComposition, public ITfInsertAtSelection, public ITfSource {
 public:
     MockContext() : m_cRef(1) {}
     virtual ~MockContext() {
@@ -363,6 +396,10 @@ public:
         if (m_pDeferredSession) {
             m_pDeferredSession->Release();
             m_pDeferredSession = nullptr;
+        }
+        if (m_pTextEditSink) {
+            m_pTextEditSink->Release();
+            m_pTextEditSink = nullptr;
         }
     }
 
@@ -377,6 +414,15 @@ public:
     int m_editSessionRequestCount = 0;
     int m_asyncRequestCount = 0;
     ITfEditSession* m_pDeferredSession = nullptr;
+    ITfTextEditSink* m_pTextEditSink = nullptr;
+    DWORD m_textEditCookie = 0;
+
+    void SimulateExternalSelectionMove() {
+        if (m_pTextEditSink) {
+            MockEditRecord rec(TRUE);
+            m_pTextEditSink->OnEndEdit(this, 1002, &rec);
+        }
+    }
 
     void ExecuteDeferredSession(TfEditCookie ec = 1001) {
         if (m_pDeferredSession) {
@@ -399,6 +445,10 @@ public:
             return S_OK;
         } else if (IsEqualIID(riid, IID_ITfInsertAtSelection)) {
             *ppvObj = static_cast<ITfInsertAtSelection*>(this);
+            AddRef();
+            return S_OK;
+        } else if (IsEqualIID(riid, IID_ITfSource)) {
+            *ppvObj = static_cast<ITfSource*>(this);
             AddRef();
             return S_OK;
         }
@@ -514,6 +564,32 @@ public:
 
     STDMETHODIMP InsertEmbeddedAtSelection(TfEditCookie ec, DWORD dwFlags, IDataObject* pDataObject, ITfRange** ppRange) override {
         return E_NOTIMPL;
+    }
+
+    // ITfSource methods
+    STDMETHODIMP AdviseSink(REFIID riid, IUnknown* punk, DWORD* pdwCookie) override {
+        if (!punk || !pdwCookie) return E_POINTER;
+        if (IsEqualIID(riid, IID_ITfTextEditSink)) {
+            ITfTextEditSink* pSink = nullptr;
+            if (SUCCEEDED(punk->QueryInterface(IID_ITfTextEditSink, reinterpret_cast<void**>(&pSink))) && pSink) {
+                if (m_pTextEditSink) m_pTextEditSink->Release();
+                m_pTextEditSink = pSink;
+                m_textEditCookie = 42;
+                *pdwCookie = m_textEditCookie;
+                return S_OK;
+            }
+        }
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP UnadviseSink(DWORD dwCookie) override {
+        if (dwCookie == m_textEditCookie && m_pTextEditSink) {
+            m_pTextEditSink->Release();
+            m_pTextEditSink = nullptr;
+            m_textEditCookie = 0;
+            return S_OK;
+        }
+        return E_INVALIDARG;
     }
 
     MockComposition* m_lastCreatedComposition = nullptr;
@@ -1513,15 +1589,24 @@ public:
                         } else if (vk == 'B') {
                             st.page_count = 1;
                             st.candidates = { L"节", L"芭", L"吧" };
+                        } else if (vk == 'V') {
+                            st.page_count = 1;
+                            st.candidates = { L"版本 [beta]", L"测试 [alpha]" };
                         } else {
                             st.page_count = 1;
                             st.candidates = { L"华", L"花", L"化" };
                         }
                         FillCandidates(resp, st);
                         if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7) {
-                            resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE;
+                            resp.status_flags |= IPC_STATUS_HAS_QUERY_CODE | IPC_STATUS_HAS_CAND_CORES;
                             wcsncpy_s(resp.commit_text, L"da'jia", _TRUNCATE);
                             resp.commit_length = 0;
+                            for (uint32_t i = 0; i < resp.candidate_count; ++i) {
+                                size_t labelLen = wcslen(resp.candidates[i]);
+                                if (labelLen + 1 < 128 && i < st.candidates.size()) {
+                                    wcsncpy_s(resp.candidates[i] + labelLen + 1, 128 - (labelLen + 1), st.candidates[i].c_str(), _TRUNCATE);
+                                }
+                            }
                         }
                     } else if (vk == VK_NEXT) {
                         if (req.candidate_version != st.candidate_version) {
@@ -2364,6 +2449,68 @@ int TestStage71bReviewFixes() {
         }
 
         g_failCollapse = false;
+        tip.Deactivate();
+    }
+
+    // 5. Same-context caret move while keeping focus (ITfTextEditSink::OnEndEdit):
+    //    Async compositionless commit queued -> external selection move in same context (focus retained) ->
+    //    deferred DoEditSession MUST NOT write to new selection and MUST send CommitCancel!
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        tip.NegotiateStage7ForTest();
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'A' eaten in CompositionlessComposing");
+        CHECK_TRUE(ctx.m_pTextEditSink != nullptr, L"ITfTextEditSink advised on CompositionlessComposing");
+
+        ctx.m_activeCompRange = L"moved_caret_untouched";
+        ctx.m_forceSyncBlocked = true;
+        ctx.m_deferAsyncSession = true;
+
+        int successBefore = server.m_commitSuccessCount.load();
+        int cancelBefore = server.m_commitCancelCount.load();
+        int learnedBefore = server.m_learnedCount.load();
+
+        tip.OnKeyDown(&ctx, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async compositionless commit queued");
+
+        // Keep focus, stay in same context, only move caret / selection!
+        ctx.SimulateExternalSelectionMove();
+        CHECK_TRUE(tip.GetCompositionState(&ctx) == CompositionState::None, L"Selection move exited CompositionlessComposing");
+
+        ctx.m_forceSyncBlocked = false;
+        ctx.m_deferAsyncSession = false;
+        ctx.ExecuteDeferredSession();
+
+        CHECK_EQUAL(ctx.m_activeCompRange, std::wstring(L"moved_caret_untouched"), L"Same-context caret move must prevent deferred compositionless write!");
+        CHECK_EQUAL(server.m_commitSuccessCount.load(), successBefore, L"Same-context caret move must NOT confirm CommitSuccess!");
+        CHECK_EQUAL(server.m_learnedCount.load(), learnedBefore, L"Same-context caret move must NOT learn!");
+        CHECK_EQUAL(server.m_commitCancelCount.load(), cancelBefore + 1, L"Same-context caret move must send CommitCancel!");
+
+        tip.Deactivate();
+        CHECK_TRUE(ctx.m_pTextEditSink == nullptr, L"ITfTextEditSink cleanly unadvised on Deactivate");
+    }
+
+    // 6. Server-supplied candidate_core_texts (IPC_STATUS_HAS_CAND_CORES) preserves "版本 [beta]" with space + ASCII brackets
+    {
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"Negotiate Stage 7 for core text test");
+        MockContext ctx;
+        ctx.m_failStartComposition = true;
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctx, 'V', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Key 'V' eaten");
+        const auto& snap = tip.GetCandidateWindowForTest().GetSnapshot();
+        CHECK_EQUAL(snap.candidate_core_texts.size(), size_t(2), L"2 explicit candidate_core_texts received from Stage 7 server");
+        CHECK_EQUAL(snap.candidate_core_texts[0], std::wstring(L"版本 [beta]"), L"Core text 0 preserves '版本 [beta]'");
+        CHECK_EQUAL(tip.GetCandidateWindowForTest().GetDisplayedPreeditText(), std::wstring(L"da'jia [版本 [beta]]"), L"Preedit Header preserves '版本 [beta]' intact without stripping [beta]!");
+
         tip.Deactivate();
     }
 
