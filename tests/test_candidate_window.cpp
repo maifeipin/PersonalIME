@@ -765,6 +765,18 @@ int main() {
         CHECK_EQ(CCandidateWindow::GetClassRefCount(), 0, L"Destroy restores class ref to 0");
         CHECK_EQ(CCandidateWindow::IsHookObserverActive(), false, L"Observer inactive after Destroy");
 
+        // 8a-2. Module ref acquisition failure before CreateThread falls back cleanly
+        CCandidateWindow wndModFail;
+        wndModFail.Show(snap, { 150, 150 });
+        CCandidateWindow::SetHookModuleRefFailureOverrideForTest(true);
+        wndModFail.OpenMoreMenu();
+        CHECK_EQ(wndModFail.IsMenuOpen(), false, L"Menu stays closed when module ref acquisition fails");
+        CHECK_EQ(wndModFail.GetLastHookInstallError(), static_cast<DWORD>(ERROR_MOD_NOT_FOUND), L"Module ref failure records ERROR_MOD_NOT_FOUND");
+        CHECK_EQ(wndModFail.IsHookFallbackManagerVisible(), true, L"Fallback manager shortcut exposed on module ref failure");
+        CHECK_EQ(CCandidateWindow::GetLiveObserverInstanceCountForTest(), 0, L"No ObserverInstance created on module ref failure");
+        CCandidateWindow::SetHookModuleRefFailureOverrideForTest(false);
+        wndModFail.Destroy();
+
         // 8b. Delayed hook start & delayed hook exit return boundedly without blocking UI and reclaim ObserverInstance
         CCandidateWindow wndTimeout;
         wndTimeout.Show(snap, { 150, 150 });

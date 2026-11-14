@@ -144,6 +144,7 @@ public:
     static bool IsHookObserverActive();
     static int GetLiveObserverInstanceCountForTest();
     static void SetHookInstallFailureOverrideForTest(bool fail);
+    static void SetHookModuleRefFailureOverrideForTest(bool fail);
     static void SetHookStartDelayOverrideForTest(DWORD delayMs);
     static void SetHookExitDelayOverrideForTest(DWORD delayMs);
     static void SetHookWaitTimeoutOverrideForTest(DWORD timeoutMs);

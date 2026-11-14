@@ -13,6 +13,7 @@ static LONG s_cClassRef = 0;
 static LONG s_cMenuClassRef = 0;
 static std::atomic<int> s_appsUseLightThemeOverride{-1};
 static std::atomic<bool> s_forceHookInstallFailForTest{false};
+static std::atomic<bool> s_forceHookModuleRefFailForTest{false};
 static std::atomic<DWORD> s_hookStartDelayMsForTest{0};
 static std::atomic<DWORD> s_hookExitDelayMsForTest{0};
 static std::atomic<DWORD> s_hookWaitTimeoutMsForTest{0};
@@ -35,6 +36,7 @@ enum class ObserverLifecycle {
 
 struct ObserverInstance {
     uint64_t instanceGen = 0;
+    HMODULE hMod = nullptr;
     HANDLE hThread = nullptr;
     DWORD threadId = 0;
     HANDLE hReadyEvent = nullptr;
@@ -55,6 +57,10 @@ struct ObserverInstance {
         if (hThread) {
             CloseHandle(hThread);
             hThread = nullptr;
+        }
+        if (hMod) {
+            FreeLibrary(hMod);
+            hMod = nullptr;
         }
         s_liveObserverInstances.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -107,23 +113,19 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
-    auto* pHolder = static_cast<std::shared_ptr<ObserverInstance>*>(lpParam);
-    std::shared_ptr<ObserverInstance> inst = *pHolder;
-    delete pHolder;
-
-    HMODULE hMod = nullptr;
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        reinterpret_cast<LPCWSTR>(&LowLevelMouseProc),
-        &hMod);
-
-    MSG msg{};
-    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-
     DWORD delayMs = s_hookStartDelayMsForTest.load(std::memory_order_acquire);
     if (delayMs > 0) {
         Sleep(delayMs);
     }
+
+    auto* pHolder = static_cast<std::shared_ptr<ObserverInstance>*>(lpParam);
+    std::shared_ptr<ObserverInstance> inst = *pHolder;
+    delete pHolder;
+
+    HMODULE hMod = inst->hMod;
+
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
 
     auto& state = GetHookObserverState();
     bool cancelledBeforeHook = false;
@@ -176,7 +178,8 @@ DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
             }
             state.cv.notify_all();
         }
-        // Release thread-side shared_ptr before FreeLibraryAndExitThread (which never unwinds locals)
+        // Transfer module ref out before releasing inst (FreeLibraryAndExitThread never unwinds locals)
+        inst->hMod = nullptr;
         inst.reset();
         if (hMod) {
             FreeLibraryAndExitThread(hMod, 1);
@@ -205,7 +208,8 @@ DWORD WINAPI HookObserverThreadProc(LPVOID lpParam) {
         state.cv.notify_all();
     }
 
-    // Release thread-side shared_ptr before FreeLibraryAndExitThread (which never unwinds locals)
+    // Transfer module ref out before releasing inst (FreeLibraryAndExitThread never unwinds locals)
+    inst->hMod = nullptr;
     inst.reset();
     if (hMod) {
         FreeLibraryAndExitThread(hMod, 0);
@@ -240,8 +244,32 @@ bool RegisterMenuObserver(uint32_t generation, HWND uiHwnd, HWND menuHwnd, DWORD
         }
 
         if (state.current == nullptr) {
+            HMODULE hMod = nullptr;
+            DWORD modErr = 0;
+            if (s_forceHookModuleRefFailForTest.load(std::memory_order_acquire)) {
+                modErr = ERROR_MOD_NOT_FOUND;
+            } else if (!GetModuleHandleExW(
+                           GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           reinterpret_cast<LPCWSTR>(&LowLevelMouseProc),
+                           &hMod) ||
+                       !hMod) {
+                modErr = GetLastError();
+                if (modErr == 0) modErr = ERROR_MOD_NOT_FOUND;
+            }
+            if (!hMod) {
+                state.entries.erase(
+                    std::remove_if(state.entries.begin(), state.entries.end(),
+                        [generation, uiHwnd](const MenuObserverEntry& e) {
+                            return e.generation == generation && e.uiHwnd == uiHwnd;
+                        }),
+                    state.entries.end());
+                if (pOutError) *pOutError = modErr ? modErr : ERROR_MOD_NOT_FOUND;
+                return false;
+            }
+
             inst = std::make_shared<ObserverInstance>();
             inst->instanceGen = state.nextInstanceGen++;
+            inst->hMod = hMod;
             inst->hReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             inst->lifecycle = ObserverLifecycle::Starting;
             auto* pArg = new std::shared_ptr<ObserverInstance>(inst);
@@ -386,6 +414,10 @@ int CCandidateWindow::GetLiveObserverInstanceCountForTest() {
 
 void CCandidateWindow::SetHookInstallFailureOverrideForTest(bool fail) {
     s_forceHookInstallFailForTest.store(fail, std::memory_order_release);
+}
+
+void CCandidateWindow::SetHookModuleRefFailureOverrideForTest(bool fail) {
+    s_forceHookModuleRefFailForTest.store(fail, std::memory_order_release);
 }
 
 void CCandidateWindow::SetHookStartDelayOverrideForTest(DWORD delayMs) {
