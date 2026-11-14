@@ -388,6 +388,38 @@ private:
     BOOL m_selChanged = FALSE;
 };
 
+class MockContextView : public ITfContextView {
+public:
+    explicit MockContextView(HWND hwnd) : m_hwnd(hwnd) {}
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
+        if (!ppvObj) return E_POINTER;
+        if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfContextView)) {
+            *ppvObj = static_cast<ITfContextView*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppvObj = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_cRef); }
+    STDMETHODIMP_(ULONG) Release() override {
+        LONG cr = InterlockedDecrement(&m_cRef);
+        if (cr == 0) delete this;
+        return cr;
+    }
+    STDMETHODIMP GetRangeFromPoint(TfEditCookie, const POINT*, DWORD, ITfRange**) override { return E_NOTIMPL; }
+    STDMETHODIMP GetTextExt(TfEditCookie, ITfRange*, RECT*, BOOL*) override { return E_NOTIMPL; }
+    STDMETHODIMP GetScreenExt(RECT*) override { return E_NOTIMPL; }
+    STDMETHODIMP GetWnd(HWND* phwnd) override {
+        if (!phwnd) return E_POINTER;
+        *phwnd = m_hwnd;
+        return S_OK;
+    }
+private:
+    LONG m_cRef = 1;
+    HWND m_hwnd = nullptr;
+};
+
 class MockContext : public ITfContext, public ITfContextComposition, public ITfInsertAtSelection, public ITfSource {
 public:
     MockContext() : m_cRef(1) {}
@@ -417,6 +449,8 @@ public:
     bool m_fireOnEndEditAfterDoEditSession = false;
     HRESULT m_startCompositionHr = E_FAIL;
     DWORD m_dynamicStatusFlags = 0;
+    HWND m_viewHwnd = nullptr;
+    ITfDocumentMgr* m_docMgr = nullptr;
     int m_editSessionRequestCount = 0;
     int m_asyncRequestCount = 0;
     ITfEditSession* m_pDeferredSession = nullptr;
@@ -537,7 +571,12 @@ public:
 
     STDMETHODIMP GetStart(TfEditCookie ec, ITfRange **ppStart) override { return E_NOTIMPL; }
     STDMETHODIMP GetEnd(TfEditCookie ec, ITfRange **ppEnd) override { return E_NOTIMPL; }
-    STDMETHODIMP GetActiveView(ITfContextView** ppView) override { return E_NOTIMPL; }
+    STDMETHODIMP GetActiveView(ITfContextView** ppView) override {
+        if (!ppView) return E_POINTER;
+        if (!m_viewHwnd) return E_NOTIMPL;
+        *ppView = new MockContextView(m_viewHwnd);
+        return S_OK;
+    }
     STDMETHODIMP EnumViews(IEnumTfContextViews **ppEnum) override { return E_NOTIMPL; }
     STDMETHODIMP GetStatus(TF_STATUS* pdcs) override {
         if (!pdcs) return E_POINTER;
@@ -549,7 +588,13 @@ public:
     STDMETHODIMP GetAppProperty(REFGUID guidProp, ITfReadOnlyProperty** ppProp) override { return E_NOTIMPL; }
     STDMETHODIMP TrackProperties(const GUID **prgProp, ULONG cProp, const GUID **prgAppProp, ULONG cAppProp, ITfReadOnlyProperty** ppProperty) override { return E_NOTIMPL; }
     STDMETHODIMP EnumProperties(IEnumTfProperties **ppEnum) override { return E_NOTIMPL; }
-    STDMETHODIMP GetDocumentMgr(ITfDocumentMgr **ppDm) override { return E_NOTIMPL; }
+    STDMETHODIMP GetDocumentMgr(ITfDocumentMgr **ppDm) override {
+        if (!ppDm) return E_POINTER;
+        if (!m_docMgr) return E_NOTIMPL;
+        *ppDm = m_docMgr;
+        m_docMgr->AddRef();
+        return S_OK;
+    }
     STDMETHODIMP CreateRangeBackup(TfEditCookie ec, ITfRange *pRange, ITfRangeBackup **ppBackup) override { return E_NOTIMPL; }
 
     // ITfContextComposition methods
@@ -1451,6 +1496,7 @@ public:
     std::atomic<int> m_commitSuccessCount{0};
     std::atomic<int> m_commitCancelCount{0};
     std::atomic<int> m_commitTerminalCount{0};
+    std::atomic<uint32_t> m_lastTerminalDisp{0};
     std::atomic<int> m_dropNextCommitTerminal{0};
     std::atomic<int> m_queryCommitStatusCount{0};
     std::atomic<int> m_learnedCount{0};
@@ -1736,6 +1782,7 @@ public:
                         resp.handled = 0;
                     } else {
                         IpcCommitDisposition reqDisp = static_cast<IpcCommitDisposition>(req.mode_arg);
+                        pThis->m_lastTerminalDisp.store(static_cast<uint32_t>(reqDisp));
                         auto termIt = pThis->m_terminalDispositions.find(req.event_id);
                         if (termIt != pThis->m_terminalDispositions.end()) {
                             resp.commit_length = static_cast<uint32_t>(termIt->second);
@@ -3415,6 +3462,189 @@ int TestStage71dUnicodeInjectionChannel() {
         CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctx)) == CompositionState::None,
                    L"Quarantine lifted after V2_RES(ClosedUnknown) -> V2_ACK converged");
         tip.Deactivate();
+    }
+
+    cleanupWals();
+
+    // 5. Real window & TSF focus ownership (NO bypass):
+    //    Same top-level window A -> B switch without edit/selection notifications on A:
+    //    old async commit completes -> MUST NOT inject into B, MUST settle CancelDiscard!
+    {
+        class MockDocMgr : public ITfDocumentMgr {
+        public:
+            explicit MockDocMgr(ITfContext* topCtx) : m_top(topCtx) { if (m_top) m_top->AddRef(); }
+            ~MockDocMgr() { if (m_top) m_top->Release(); }
+            STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
+                if (!ppvObj) return E_POINTER;
+                if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfDocumentMgr)) {
+                    *ppvObj = static_cast<ITfDocumentMgr*>(this);
+                    AddRef();
+                    return S_OK;
+                }
+                *ppvObj = nullptr;
+                return E_NOINTERFACE;
+            }
+            STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_cRef); }
+            STDMETHODIMP_(ULONG) Release() override {
+                LONG cr = InterlockedDecrement(&m_cRef);
+                if (cr == 0) delete this;
+                return cr;
+            }
+            STDMETHODIMP CreateContext(TfClientId, DWORD, IUnknown*, ITfContext**, TfEditCookie*) override { return E_NOTIMPL; }
+            STDMETHODIMP Push(ITfContext*) override { return E_NOTIMPL; }
+            STDMETHODIMP Pop(DWORD) override { return E_NOTIMPL; }
+            STDMETHODIMP GetTop(ITfContext** ppCtx) override {
+                if (!ppCtx) return E_POINTER;
+                *ppCtx = m_top;
+                if (m_top) m_top->AddRef();
+                return m_top ? S_OK : S_FALSE;
+            }
+            STDMETHODIMP GetBase(ITfContext** ppCtx) override { return GetTop(ppCtx); }
+            STDMETHODIMP EnumContexts(IEnumTfContexts**) override { return E_NOTIMPL; }
+        private:
+            LONG m_cRef = 1;
+            ITfContext* m_top = nullptr;
+        };
+
+        class MockThreadMgr : public ITfThreadMgr {
+        public:
+            STDMETHODIMP QueryInterface(REFIID riid, void** ppvObj) override {
+                if (!ppvObj) return E_POINTER;
+                if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITfThreadMgr)) {
+                    *ppvObj = static_cast<ITfThreadMgr*>(this);
+                    AddRef();
+                    return S_OK;
+                }
+                *ppvObj = nullptr;
+                return E_NOINTERFACE;
+            }
+            STDMETHODIMP_(ULONG) AddRef() override { return InterlockedIncrement(&m_cRef); }
+            STDMETHODIMP_(ULONG) Release() override {
+                LONG cr = InterlockedDecrement(&m_cRef);
+                if (cr == 0) delete this;
+                return cr;
+            }
+            STDMETHODIMP Activate(TfClientId*) override { return E_NOTIMPL; }
+            STDMETHODIMP Deactivate() override { return E_NOTIMPL; }
+            STDMETHODIMP CreateDocumentMgr(ITfDocumentMgr**) override { return E_NOTIMPL; }
+            STDMETHODIMP EnumDocumentMgrs(IEnumTfDocumentMgrs**) override { return E_NOTIMPL; }
+            STDMETHODIMP GetFocus(ITfDocumentMgr** ppDocMgr) override {
+                if (!ppDocMgr) return E_POINTER;
+                *ppDocMgr = m_focusDoc;
+                if (m_focusDoc) m_focusDoc->AddRef();
+                return m_focusDoc ? S_OK : S_FALSE;
+            }
+            STDMETHODIMP SetFocus(ITfDocumentMgr* pDocMgr) override {
+                m_focusDoc = pDocMgr;
+                return S_OK;
+            }
+            STDMETHODIMP AssociateFocus(HWND, ITfDocumentMgr*, ITfDocumentMgr**) override { return E_NOTIMPL; }
+            STDMETHODIMP IsThreadFocus(BOOL* pfThreadFocus) override {
+                if (pfThreadFocus) *pfThreadFocus = TRUE;
+                return S_OK;
+            }
+            STDMETHODIMP GetFunctionProvider(REFCLSID, ITfFunctionProvider**) override { return E_NOTIMPL; }
+            STDMETHODIMP EnumFunctionProviders(IEnumTfFunctionProviders**) override { return E_NOTIMPL; }
+            STDMETHODIMP GetGlobalCompartment(ITfCompartmentMgr**) override { return E_NOTIMPL; }
+        private:
+            LONG m_cRef = 1;
+            ITfDocumentMgr* m_focusDoc = nullptr;
+        };
+
+        HWND topWnd = CreateWindowExW(
+            0, L"STATIC", L"Stage71dTestTop", WS_POPUP | WS_VISIBLE,
+            0, 0, 200, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND hwndA = CreateWindowExW(
+            0, L"EDIT", L"", WS_CHILD | WS_VISIBLE,
+            10, 10, 80, 24, topWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND hwndB = CreateWindowExW(
+            0, L"EDIT", L"", WS_CHILD | WS_VISIBLE,
+            10, 50, 80, 24, topWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetForegroundWindow(topWnd);
+        SetFocus(hwndA);
+
+        MockContext ctxA;
+        MockContext ctxB;
+        ctxA.m_failStartComposition = true;
+        ctxA.m_failGetSelection = true;
+        ctxA.m_failInsertAtSelection = true;
+        ctxA.m_viewHwnd = hwndA;
+        ctxB.m_viewHwnd = hwndB;
+
+        MockDocMgr docA(&ctxA);
+        MockDocMgr docB(&ctxB);
+        ctxA.m_docMgr = &docA;
+        ctxB.m_docMgr = &docB;
+        MockThreadMgr tm;
+        tm.SetFocus(&docA);
+
+        CTextInputProcessor tip;
+        tip.SetClientIdForTest(1);
+        tip.SetThreadMgrForTest(&tm);
+        CHECK_TRUE(tip.NegotiateStage7ForTest(), L"NegotiateStage7");
+        tip.SetUnicodeInjectionEnabled(true);
+        tip.SetWindowForegroundBypassForTest(false); // Real verification enabled!
+
+        int sendCalls = 0;
+        tip.SetSendInputOverrideForTest([&](UINT cInputs, LPINPUT, int) -> UINT {
+            ++sendCalls;
+            return cInputs;
+        });
+
+        BOOL eaten = FALSE;
+        tip.OnKeyDown(&ctxA, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxA entered CompositionlessComposing");
+
+        // Queue async commit on ctxA
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctxA, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async commit queued on ctxA");
+
+        // Switch focus to sibling control B in the SAME top-level window WITHOUT notifying ctxA!
+        SetFocus(hwndB);
+        tm.SetFocus(&docB);
+
+        server.m_lastTerminalDisp.store(0);
+        ctxA.m_forceSyncBlocked = false;
+        ctxA.m_deferAsyncSession = false;
+        ctxA.ExecuteDeferredSession();
+        tip.DrainPendingUnicodeInjections();
+
+        CHECK_EQUAL(sendCalls, 0, L"A->B switch in same top-level window MUST block SendInput into B");
+        CHECK_EQUAL(server.m_lastTerminalDisp.load(), static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard),
+                    L"Target mismatch settles as CancelDiscard");
+        CHECK_TRUE(tip.GetContextState(reinterpret_cast<uint64_t>(&ctxA)) == CompositionState::None,
+                   L"ctxA exited compositionless mode");
+
+        // Also test shared-HWND host (ctxA.m_viewHwnd == topWnd, e.g. browser/Electron) where only TSF doc changes A -> B
+        SetFocus(topWnd);
+        ctxA.m_viewHwnd = topWnd;
+        tm.SetFocus(&docA);
+        tip.OnKeyDown(&ctxA, 'A', 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"ctxA re-entered CompositionlessComposing");
+        ctxA.m_forceSyncBlocked = true;
+        ctxA.m_deferAsyncSession = true;
+        tip.OnKeyDown(&ctxA, VK_SPACE, 0, &eaten);
+        CHECK_EQUAL(eaten, TRUE, L"Async commit queued on shared-HWND ctxA");
+
+        // Only TSF focus moves to docB (HWND remains topWnd, no edit/selection notification on ctxA)
+        tm.SetFocus(&docB);
+        server.m_lastTerminalDisp.store(0);
+        ctxA.m_forceSyncBlocked = false;
+        ctxA.m_deferAsyncSession = false;
+        ctxA.ExecuteDeferredSession();
+        tip.DrainPendingUnicodeInjections();
+
+        CHECK_EQUAL(sendCalls, 0, L"Shared-HWND TSF doc A->B switch MUST block SendInput");
+        CHECK_EQUAL(server.m_lastTerminalDisp.load(), static_cast<uint32_t>(IpcCommitDisposition::CancelDiscard),
+                    L"Shared-HWND target mismatch settles as CancelDiscard");
+
+        tip.SetThreadMgrForTest(nullptr);
+        tip.Deactivate();
+        DestroyWindow(hwndA);
+        DestroyWindow(hwndB);
+        DestroyWindow(topWnd);
     }
 
     cleanupWals();

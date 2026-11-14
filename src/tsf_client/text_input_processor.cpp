@@ -930,8 +930,15 @@ bool CTextInputProcessor::IsUnicodeInjectionEligiblePrecheck(
 }
 
 InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
-    const PendingUnicodeInjection& item)
+    const PendingUnicodeInjection& item,
+    bool* outTargetInvalidated)
 {
+    if (outTargetInvalidated) *outTargetInvalidated = false;
+    auto markInvalidated = [&]() {
+        if (outTargetInvalidated) *outTargetInvalidated = true;
+        return InjectionOutcome::NotAttempted;
+    };
+
     const auto& cb = item.controlBlock;
     ITfContext* pContext = item.pContext.Get();
     // 0. Must NEVER execute SendInput while inside DoEditSession.
@@ -952,11 +959,14 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
         return InjectionOutcome::NotAttempted;
     }
     // 3. No prior side effects, no revocation, no prior injection attempt, and WAL barrier healthy.
-    if (cb->revoked || cb->crossed_side_effect || cb->injection_attempted || IsWalBarrierFaulted()) {
+    if (cb->revoked) {
+        return markInvalidated();
+    }
+    if (cb->crossed_side_effect || cb->injection_attempted || IsWalBarrierFaulted()) {
         return InjectionOutcome::NotAttempted;
     }
     if (item.uiSuppressed || item.terminateAfterEdit) {
-        return InjectionOutcome::NotAttempted;
+        return markInvalidated();
     }
     // 4. All TSF write requests for this context must have returned or been revoked before write.
     if (HasQueuedEditSession(cb->context_id) || HasPotentialWriterForContext(cb->context_id)) {
@@ -965,49 +975,94 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
     // 5. Focus, context, epoch, generation, read-only, and modifier state checks.
     if (m_isDeactivated || !m_hasFocus || m_activeContextId != cb->context_id ||
         !pContext || IsContextReadOnly(pContext)) {
-        return InjectionOutcome::NotAttempted;
+        return markInvalidated();
     }
     if (GetContextEpoch(cb->context_id) != cb->context_epoch ||
         GetContextInputGeneration(cb->context_id) != cb->input_generation) {
-        return InjectionOutcome::NotAttempted;
+        return markInvalidated();
     }
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
         (GetKeyState(VK_MENU) & 0x8000) != 0 ||
         ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0) {
         return InjectionOutcome::NotAttempted;
     }
-    // 6. Window, foreground root, and GUI focus control verification (unless bypassed in headless unit test).
-    HWND origHwnd = nullptr;
-    HWND origRoot = nullptr;
-    HWND origGuiFocus = nullptr;
-    Microsoft::WRL::ComPtr<ITfDocumentMgr> origFocusDoc;
-    if (!m_bypassWindowCheckForTest) {
+
+    // 6. Window, foreground root, GUI focus control, and TSF focus document/context ownership verification.
+    struct VerifiedTarget {
+        HWND viewHwnd = nullptr;
+        HWND rootHwnd = nullptr;
+        HWND guiFocusHwnd = nullptr;
+        Microsoft::WRL::ComPtr<ITfDocumentMgr> focusDoc;
+    };
+    auto verifyRealTargetOwnership = [&](const VerifiedTarget* expected, VerifiedTarget* out) -> bool {
+        if (m_bypassWindowCheckForTest) {
+            return true;
+        }
         ITfContextView* pView = nullptr;
+        HWND hwnd = nullptr;
         if (SUCCEEDED(pContext->GetActiveView(&pView)) && pView) {
-            pView->GetWnd(&origHwnd);
+            pView->GetWnd(&hwnd);
             pView->Release();
         }
-        if (!origHwnd || !IsWindow(origHwnd)) {
-            return InjectionOutcome::NotAttempted;
+        if (!hwnd || !IsWindow(hwnd)) {
+            return false;
         }
-        origRoot = GetAncestor(origHwnd, GA_ROOT);
+        HWND rootWnd = GetAncestor(hwnd, GA_ROOT);
         HWND fgWnd = GetForegroundWindow();
-        if (!origRoot || origRoot != fgWnd) {
-            return InjectionOutcome::NotAttempted;
+        if (!rootWnd || rootWnd != fgWnd) {
+            return false;
         }
         GUITHREADINFO gti{};
         gti.cbSize = sizeof(gti);
         DWORD fgTid = GetWindowThreadProcessId(fgWnd, nullptr);
         if (!fgTid || !GetGUIThreadInfo(fgTid, &gti) || !gti.hwndFocus) {
-            return InjectionOutcome::NotAttempted;
+            return false;
         }
-        if (gti.hwndFocus != origHwnd && !IsChild(origRoot, gti.hwndFocus)) {
-            return InjectionOutcome::NotAttempted;
+        // If context has a child control HWND, focus must stay on that HWND (or its descendant),
+        // never on a sibling control under the same top-level window.
+        if (hwnd != rootWnd) {
+            if (gti.hwndFocus != hwnd && !IsChild(hwnd, gti.hwndFocus)) {
+                return false;
+            }
+        } else if (gti.hwndFocus != hwnd && !IsChild(rootWnd, gti.hwndFocus)) {
+            return false;
         }
-        origGuiFocus = gti.hwndFocus;
-        if (m_pThreadMgr) {
-            m_pThreadMgr->GetFocus(&origFocusDoc);
+        // Must prove TSF focus document and top context still belong to this exact pContext.
+        if (!m_pThreadMgr) {
+            return false;
         }
+        Microsoft::WRL::ComPtr<ITfDocumentMgr> focusDoc;
+        if (FAILED(m_pThreadMgr->GetFocus(&focusDoc)) || !focusDoc) {
+            return false;
+        }
+        Microsoft::WRL::ComPtr<ITfContext> topCtx;
+        if (FAILED(focusDoc->GetTop(&topCtx)) || topCtx.Get() != pContext) {
+            return false;
+        }
+        Microsoft::WRL::ComPtr<ITfDocumentMgr> targetDoc;
+        if (SUCCEEDED(pContext->GetDocumentMgr(&targetDoc)) && targetDoc && targetDoc.Get() != focusDoc.Get()) {
+            return false;
+        }
+        if (expected) {
+            if (hwnd != expected->viewHwnd ||
+                rootWnd != expected->rootHwnd ||
+                gti.hwndFocus != expected->guiFocusHwnd ||
+                focusDoc.Get() != expected->focusDoc.Get()) {
+                return false;
+            }
+        }
+        if (out) {
+            out->viewHwnd = hwnd;
+            out->rootHwnd = rootWnd;
+            out->guiFocusHwnd = gti.hwndFocus;
+            out->focusDoc = focusDoc;
+        }
+        return true;
+    };
+
+    VerifiedTarget origTarget{};
+    if (!verifyRealTargetOwnership(nullptr, &origTarget)) {
+        return markInvalidated();
     }
     // 7. Ensure no prior InjectionAttempt or terminal frame exists in v2 WAL for this commit_event_id.
     {
@@ -1051,39 +1106,18 @@ InjectionOutcome CTextInputProcessor::TryUnicodeInjectionFallback(
         cb->revoked ||
         GetContextEpoch(cb->context_id) != cb->context_epoch ||
         GetContextInputGeneration(cb->context_id) != cb->input_generation) {
-        return InjectionOutcome::NotAttempted;
+        return markInvalidated();
     }
     if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 ||
         (GetKeyState(VK_MENU) & 0x8000) != 0 ||
         ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0) {
         return InjectionOutcome::NotAttempted;
     }
-    if (!m_bypassWindowCheckForTest) {
-        ITfContextView* pViewNow = nullptr;
-        HWND hwndNow = nullptr;
-        if (SUCCEEDED(pContext->GetActiveView(&pViewNow)) && pViewNow) {
-            pViewNow->GetWnd(&hwndNow);
-            pViewNow->Release();
-        }
-        HWND fgNow = GetForegroundWindow();
-        if (!hwndNow || hwndNow != origHwnd || !IsWindow(hwndNow) || !fgNow || fgNow != origRoot) {
-            return InjectionOutcome::NotAttempted;
-        }
-        GUITHREADINFO gtiNow{};
-        gtiNow.cbSize = sizeof(gtiNow);
-        DWORD fgTidNow = GetWindowThreadProcessId(fgNow, nullptr);
-        if (!fgTidNow || !GetGUIThreadInfo(fgTidNow, &gtiNow) || gtiNow.hwndFocus != origGuiFocus) {
-            return InjectionOutcome::NotAttempted;
-        }
-        if (m_pThreadMgr && origFocusDoc) {
-            Microsoft::WRL::ComPtr<ITfDocumentMgr> nowFocusDoc;
-            if (FAILED(m_pThreadMgr->GetFocus(&nowFocusDoc)) || nowFocusDoc.Get() != origFocusDoc.Get()) {
-                return InjectionOutcome::NotAttempted;
-            }
-        }
+    if (!verifyRealTargetOwnership(&origTarget, nullptr)) {
+        return markInvalidated();
     }
     if (m_targetReverifyHookForTest && !m_targetReverifyHookForTest()) {
-        return InjectionOutcome::NotAttempted;
+        return markInvalidated();
     }
 
     UINT cInputs = static_cast<UINT>(inputs.size());
@@ -1116,7 +1150,8 @@ InjectionOutcome CTextInputProcessor::ExecutePendingUnicodeInjection(const Pendi
         }
     };
 
-    InjectionOutcome injOutcome = TryUnicodeInjectionFallback(item);
+    bool targetInvalidated = false;
+    InjectionOutcome injOutcome = TryUnicodeInjectionFallback(item, &targetInvalidated);
     if (injOutcome == InjectionOutcome::DispatchedUnverified) {
         FinalizeStage7CommitForBlock(cb, IpcCommitDisposition::DispatchedUnverified, S_OK, 1, nullptr);
         clearSnapshotState();
@@ -1134,7 +1169,7 @@ InjectionOutcome CTextInputProcessor::ExecutePendingUnicodeInjection(const Pendi
         }
     } else {
         IpcCommitDisposition disp =
-            (item.uiSuppressed || item.terminateAfterEdit ||
+            (targetInvalidated || item.uiSuppressed || item.terminateAfterEdit ||
              cb->revoked || IsContextQuarantined(contextId))
             ? IpcCommitDisposition::CancelDiscard
             : IpcCommitDisposition::CancelRestore;

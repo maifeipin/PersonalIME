@@ -352,6 +352,7 @@ public:
     bool WasLastPluginsQueryTruncatedForTest() const { return m_lastPluginsTruncated; }
 
     void SetClientIdForTest(TfClientId id) { m_tfClientId = id; }
+    void SetThreadMgrForTest(ITfThreadMgr* pTm) { m_pThreadMgr = pTm; }
     IpcClient& GetIpcClient() { return m_ipcClient; }
 
     // Verification branch hit counters
@@ -543,7 +544,8 @@ private:
     InjectionOutcome ExecutePendingUnicodeInjection(const PendingUnicodeInjection& item);
     bool ProcessPendingUnicodeInjectionForRequest(uint64_t editRequestId, InjectionOutcome* outOutcome = nullptr);
     InjectionOutcome TryUnicodeInjectionFallback(
-        const PendingUnicodeInjection& item);
+        const PendingUnicodeInjection& item,
+        bool* outTargetInvalidated = nullptr);
 
     struct TextEditSinkBinding {
         Microsoft::WRL::ComPtr<ITfContext> context;
