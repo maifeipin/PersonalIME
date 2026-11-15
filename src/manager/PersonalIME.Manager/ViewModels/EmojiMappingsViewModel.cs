@@ -18,6 +18,10 @@ public class EmojiMappingsViewModel : ViewModelBase
     private int _editPriority = 200;
     private bool _editEnabled = true;
     private bool _isAssociationEnabled = true;
+    private bool _confirmedAssociationEnabled = true;
+    private bool? _pendingAssociationTarget;
+    private Task? _associationSaveLoopTask;
+    private bool _isSavingAssociationEnabled;
     private bool _suppressToggleCallback;
     private bool _isLoading;
 
@@ -100,10 +104,18 @@ public class EmojiMappingsViewModel : ViewModelBase
         {
             if (SetProperty(ref _isAssociationEnabled, value) && !_suppressToggleCallback)
             {
-                _ = SaveAssociationEnabledAsync(value);
+                EnqueueAssociationEnabledSave(value);
             }
         }
     }
+
+    public bool IsSavingAssociationEnabled
+    {
+        get => _isSavingAssociationEnabled;
+        private set => SetProperty(ref _isSavingAssociationEnabled, value);
+    }
+
+    public Task PendingAssociationSaveTask => _associationSaveLoopTask ?? Task.CompletedTask;
 
     public bool IsLoading
     {
@@ -123,9 +135,8 @@ public class EmojiMappingsViewModel : ViewModelBase
         try
         {
             var res = await _client.GetEmojiMappingsAsync();
-            _suppressToggleCallback = true;
-            IsAssociationEnabled = res.AssociationEnabled;
-            _suppressToggleCallback = false;
+            _confirmedAssociationEnabled = res.AssociationEnabled;
+            SetAssociationEnabledSilently(res.AssociationEnabled);
             Mappings.Clear();
             foreach (var item in res.Mappings)
             {
@@ -210,17 +221,92 @@ public class EmojiMappingsViewModel : ViewModelBase
         }
     }
 
-    private async Task SaveAssociationEnabledAsync(bool enabled)
+    private void SetAssociationEnabledSilently(bool value)
     {
-        if (!_client.IsConnected) return;
+        _suppressToggleCallback = true;
         try
         {
-            await _client.SetEmojiAssociationEnabledAsync(enabled);
-            _banner.ShowSuccess(enabled ? "已开启打字流末尾表情联想。" : "已关闭打字流末尾表情联想。");
+            IsAssociationEnabled = value;
         }
-        catch (Exception ex)
+        finally
         {
-            _banner.ShowError($"更新表情联想开关失败: {ex.Message}");
+            _suppressToggleCallback = false;
+        }
+    }
+
+    private void EnqueueAssociationEnabledSave(bool target)
+    {
+        if (!_client.IsConnected)
+        {
+            _pendingAssociationTarget = null;
+            SetAssociationEnabledSilently(_confirmedAssociationEnabled);
+            _banner.ShowWarning("未连接到输入法服务，无法保存表情联想开关。");
+            return;
+        }
+
+        _pendingAssociationTarget = target;
+        if (_associationSaveLoopTask == null || _associationSaveLoopTask.IsCompleted)
+        {
+            _associationSaveLoopTask = DrainAssociationSaveQueueAsync();
+        }
+    }
+
+    private async Task DrainAssociationSaveQueueAsync()
+    {
+        IsSavingAssociationEnabled = true;
+        try
+        {
+            while (_pendingAssociationTarget is bool target)
+            {
+                _pendingAssociationTarget = null;
+                if (!_client.IsConnected)
+                {
+                    SetAssociationEnabledSilently(_confirmedAssociationEnabled);
+                    _banner.ShowWarning("与输入法服务断开连接，表情联想开关已恢复为已确认状态。");
+                    break;
+                }
+
+                try
+                {
+                    await _client.SetEmojiAssociationEnabledAsync(target);
+                    _confirmedAssociationEnabled = target;
+                    if (_pendingAssociationTarget == null)
+                    {
+                        SetAssociationEnabledSilently(target);
+                        _banner.ShowSuccess(target ? "已开启打字流末尾表情联想。" : "已关闭打字流末尾表情联想。");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _pendingAssociationTarget = null;
+                    SetAssociationEnabledSilently(_confirmedAssociationEnabled);
+                    _banner.ShowError($"更新表情联想开关失败: {ex.Message}");
+                    await ReconcileAssociationStateFromServerAsync();
+                    break;
+                }
+            }
+        }
+        finally
+        {
+            IsSavingAssociationEnabled = false;
+        }
+    }
+
+    private async Task ReconcileAssociationStateFromServerAsync()
+    {
+        if (!_client.IsConnected)
+        {
+            return;
+        }
+        try
+        {
+            var res = await _client.GetEmojiMappingsAsync();
+            _confirmedAssociationEnabled = res.AssociationEnabled;
+            SetAssociationEnabledSilently(res.AssociationEnabled);
+        }
+        catch
+        {
+            // Already reverted to last confirmed state and reported the primary failure.
         }
     }
 }

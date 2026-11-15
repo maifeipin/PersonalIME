@@ -16,8 +16,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         g_hInst = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-        (void)lpvReserved;
-        ShutdownTsfDebugLoggerAsync();
+        ShutdownTsfDebugLoggerAsync(lpvReserved != nullptr);
     }
     return TRUE;
 }

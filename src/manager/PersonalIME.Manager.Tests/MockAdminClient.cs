@@ -221,14 +221,14 @@ public class MockAdminClient : IAdminClient
 
     public bool MockEmojiAssociationEnabled { get; set; } = true;
     public List<EmojiMappingModel> MockEmojiMappings { get; } = [];
-    public Task<EmojiMappingsResult> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+    public virtual Task<EmojiMappingsResult> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
         => Task.FromResult(new EmojiMappingsResult
         {
             AssociationEnabled = MockEmojiAssociationEnabled,
             Mappings = onlyEnabled ? MockEmojiMappings.Where(m => m.Enabled).ToList() : MockEmojiMappings.ToList()
         });
 
-    public Task SetEmojiAssociationEnabledAsync(bool enabled, CancellationToken ct = default)
+    public virtual Task SetEmojiAssociationEnabledAsync(bool enabled, CancellationToken ct = default)
     {
         MockEmojiAssociationEnabled = enabled;
         return Task.CompletedTask;

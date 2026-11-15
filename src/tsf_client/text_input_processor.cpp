@@ -64,22 +64,24 @@ public:
                 } else {
                     ++m_count;
                 }
-                if (m_wakeEvent != nullptr) {
-                    SetEvent(m_wakeEvent);
+                HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
+                if (wake != nullptr) {
+                    SetEvent(wake);
                 }
             }
         }
         ReleaseSRWLockExclusive(&m_lock);
     }
 
-    void RequestShutdownAsync() noexcept {
+    void RequestShutdownAsync(bool processTerminating = false) noexcept {
         m_shuttingDown.store(true, std::memory_order_release);
-        AcquireSRWLockShared(&m_lock);
-        HANDLE wake = m_wakeEvent;
+        if (processTerminating) {
+            return;
+        }
+        HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
         if (wake != nullptr) {
             SetEvent(wake);
         }
-        ReleaseSRWLockShared(&m_lock);
     }
 
     bool IsHoldingDllRef() const noexcept {
@@ -89,25 +91,22 @@ public:
 private:
     BoundedTsfLogger() = default;
     ~BoundedTsfLogger() {
-        // Never wait/join on a background thread during static destruction / DLL unload (loader lock hazard).
-        RequestShutdownAsync();
-        AcquireSRWLockExclusive(&m_lock);
-        if (!m_workerRunning && m_wakeEvent != nullptr) {
-            CloseHandle(m_wakeEvent);
-            m_wakeEvent = nullptr;
-        }
-        ReleaseSRWLockExclusive(&m_lock);
+        // Strictly lock-free and non-blocking during static destruction / DLL unload:
+        // another thread may have been terminated while holding m_lock during process exit.
+        m_shuttingDown.store(true, std::memory_order_release);
     }
 
     void EnsureStartedLocked() {
         if (m_workerRunning || m_shuttingDown.load(std::memory_order_relaxed)) {
             return;
         }
-        if (m_wakeEvent == nullptr) {
-            m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (m_wakeEvent == nullptr) {
+        HANDLE wake = m_wakeEvent.load(std::memory_order_relaxed);
+        if (wake == nullptr) {
+            wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (wake == nullptr) {
                 return;
             }
+            m_wakeEvent.store(wake, std::memory_order_release);
         }
 
         HMODULE hKeepAlive = nullptr;
@@ -117,6 +116,10 @@ private:
                     reinterpret_cast<LPCWSTR>(&WriterThreadProc),
                     &hKeepAlive) ||
                 hKeepAlive == nullptr) {
+                HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
+                if (hClose != nullptr) {
+                    CloseHandle(hClose);
+                }
                 return;
             }
             DllAddRef();
@@ -129,6 +132,10 @@ private:
             CloseHandle(hThread);
         } else {
             m_workerRunning = false;
+            HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
+            if (hClose != nullptr) {
+                CloseHandle(hClose);
+            }
             if (hKeepAlive != nullptr) {
                 m_holdingDllRef.store(false, std::memory_order_release);
                 DllRelease();
@@ -170,8 +177,7 @@ private:
             }
             if (n == 0 && m_shuttingDown.load(std::memory_order_acquire)) {
                 m_workerRunning = false;
-                HANDLE hClose = m_wakeEvent;
-                m_wakeEvent = nullptr;
+                HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
                 ReleaseSRWLockExclusive(&m_lock);
                 if (hClose != nullptr) {
                     CloseHandle(hClose);
@@ -202,13 +208,13 @@ private:
                 continue;
             }
 
-            DWORD waitRes = WaitForSingleObject(m_wakeEvent, 200);
+            HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
+            DWORD waitRes = wake != nullptr ? WaitForSingleObject(wake, 200) : WAIT_TIMEOUT;
             if (waitRes == WAIT_TIMEOUT) {
                 AcquireSRWLockExclusive(&m_lock);
                 if (m_count == 0) {
                     m_workerRunning = false;
-                    HANDLE hClose = m_wakeEvent;
-                    m_wakeEvent = nullptr;
+                    HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
                     ReleaseSRWLockExclusive(&m_lock);
                     if (hClose != nullptr) {
                         CloseHandle(hClose);
@@ -221,7 +227,7 @@ private:
     }
 
     SRWLOCK m_lock = SRWLOCK_INIT;
-    HANDLE m_wakeEvent = nullptr;
+    std::atomic<HANDLE> m_wakeEvent{nullptr};
     char m_ring[kSlots][kSlotBytes]{};
     size_t m_head = 0;
     size_t m_tail = 0;
@@ -231,8 +237,8 @@ private:
     std::atomic<bool> m_holdingDllRef{false};
 };
 } // namespace
-void ShutdownTsfDebugLoggerAsync() noexcept {
-    BoundedTsfLogger::Instance().RequestShutdownAsync();
+void ShutdownTsfDebugLoggerAsync(bool processTerminating) noexcept {
+    BoundedTsfLogger::Instance().RequestShutdownAsync(processTerminating);
 }
 bool IsTsfDebugLoggerHoldingDllRef() noexcept {
     return BoundedTsfLogger::Instance().IsHoldingDllRef();
@@ -241,7 +247,7 @@ bool IsTsfDebugLoggerHoldingDllRef() noexcept {
 #define TSF_DBG_TIMER_START() auto tsfDbgStart = std::chrono::steady_clock::now()
 #define TSF_DBG_ELAPSED_US() static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tsfDbgStart).count())
 #else
-void ShutdownTsfDebugLoggerAsync() noexcept {}
+void ShutdownTsfDebugLoggerAsync(bool) noexcept {}
 bool IsTsfDebugLoggerHoldingDllRef() noexcept { return false; }
 #define TSF_DBG(...) ((void)0)
 #define TSF_DBG_TIMER_START() ((void)0)

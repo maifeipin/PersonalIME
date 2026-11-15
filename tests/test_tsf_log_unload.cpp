@@ -5,21 +5,74 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <cstring>
+#include <thread>
+#include <atomic>
 #include "../src/common/ime_guids.h"
 
 typedef HRESULT(STDAPICALLTYPE* FnDllGetClassObject)(REFCLSID, REFIID, LPVOID*);
 typedef HRESULT(STDAPICALLTYPE* FnDllCanUnloadNow)();
 
-int main() {
+static int RunChildExitWithActiveLogger(const std::filesystem::path& dllPath) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HMODULE hMod = LoadLibraryW(dllPath.c_str());
+    if (!hMod) {
+        return 2;
+    }
+    auto pGetClassObj = reinterpret_cast<FnDllGetClassObject>(GetProcAddress(hMod, "DllGetClassObject"));
+    if (!pGetClassObj) {
+        return 3;
+    }
+    IClassFactory* pFactory = nullptr;
+    if (FAILED(pGetClassObj(CLSID_PersonalIME, IID_IClassFactory, reinterpret_cast<void**>(&pFactory))) || !pFactory) {
+        return 4;
+    }
+    ITfTextInputProcessor* pTip = nullptr;
+    HRESULT hr = pFactory->CreateInstance(nullptr, IID_ITfTextInputProcessor, reinterpret_cast<void**>(&pTip));
+    pFactory->Release();
+    if (FAILED(hr) || !pTip) {
+        return 5;
+    }
+    ITfKeyEventSink* pKeySink = nullptr;
+    if (FAILED(pTip->QueryInterface(IID_ITfKeyEventSink, reinterpret_cast<void**>(&pKeySink))) || !pKeySink) {
+        return 6;
+    }
+
+    // Hammer the logger from multiple threads so m_lock is actively contended when ExitProcess terminates them.
+    std::atomic<bool> started{false};
+    for (int t = 0; t < 4; ++t) {
+        std::thread([pKeySink, &started]() {
+            started.store(true, std::memory_order_release);
+            for (;;) {
+                pKeySink->OnSetFocus(FALSE);
+            }
+        }).detach();
+    }
+    while (!started.load(std::memory_order_acquire)) {
+        Sleep(1);
+    }
+    Sleep(50);
+
+    // Intentionally exit without FreeLibrary or stopping logger threads:
+    // OS terminates worker threads mid-flight and invokes DllMain(DLL_PROCESS_DETACH, lpvReserved != nullptr) + static dtors.
+    ExitProcess(0);
+}
+
+int main(int argc, char* argv[]) {
+    wchar_t exePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::filesystem::path dllPath = std::filesystem::path(exePath).parent_path() / L"PersonalIME_LogTest.dll";
+
+    if (argc >= 2 && std::strcmp(argv[1], "--child-exit-with-active-logger") == 0) {
+        return RunChildExitWithActiveLogger(dllPath);
+    }
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) {
         std::wcerr << L"[FAIL] CoInitializeEx failed: 0x" << std::hex << hr << std::endl;
         return 1;
     }
 
-    wchar_t exePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::filesystem::path dllPath = std::filesystem::path(exePath).parent_path() / L"PersonalIME_LogTest.dll";
     if (!std::filesystem::exists(dllPath)) {
         std::wcerr << L"[FAIL] Missing test DLL: " << dllPath.wstring() << std::endl;
         CoUninitialize();
@@ -145,6 +198,45 @@ int main() {
     }
 
     CoUninitialize();
-    std::wcout << L"[PASS] Repeated DLL load/log/unload with PERSONALIME_DEBUG_TSF_LOG=1 succeeded (5/5)!" << std::endl;
+
+    std::wcout << L"[TEST] Child process exit timeout with contended/active TSF logger..." << std::endl;
+    for (int run = 0; run < 3; ++run) {
+        std::wstring cmdLine = std::wstring(L"\"") + exePath + L"\" --child-exit-with-active-logger";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(
+                exePath,
+                cmdLine.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                0,
+                nullptr,
+                nullptr,
+                &si,
+                &pi)) {
+            std::wcerr << L"[FAIL] CreateProcessW failed err=" << GetLastError() << std::endl;
+            return 1;
+        }
+        DWORD waitRes = WaitForSingleObject(pi.hProcess, 3000);
+        if (waitRes != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            std::wcerr << L"[FAIL] Child process hung during exit with active TSF logger (run=" << run << L")" << std::endl;
+            return 1;
+        }
+        DWORD exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (exitCode != 0) {
+            std::wcerr << L"[FAIL] Child process exited with code " << exitCode << L" (run=" << run << L")" << std::endl;
+            return 1;
+        }
+    }
+
+    std::wcout << L"[PASS] Repeated DLL load/log/unload & child exit timeout with PERSONALIME_DEBUG_TSF_LOG=1 succeeded!" << std::endl;
     return 0;
 }
