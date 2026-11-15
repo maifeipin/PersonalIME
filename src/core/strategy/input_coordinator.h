@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <functional>
 #include "../types.h"
 #include "input_policy.h"
 #include "../encoding/shuangpin_decoder.h"
@@ -129,9 +130,18 @@ public:
                                       InputScheme targetScheme,
                                       ShuangpinLayout spLayout = ShuangpinLayout::Natural) const;
 
+    using BuiltinDictProvider = std::function<std::shared_ptr<const BuiltinDictionary>()>;
+    void SetBuiltinDictProvider(BuiltinDictProvider provider) { m_builtinDictProvider = std::move(provider); }
+
 private:
+    std::shared_ptr<const BuiltinDictionary> AcquireBuiltinDict() const {
+        if (m_builtinDictProvider) return m_builtinDictProvider();
+        return std::shared_ptr<const BuiltinDictionary>(&m_builtinDict, [](const BuiltinDictionary*) {});
+    }
+
     EntryRepository& m_repo;
     const BuiltinDictionary& m_builtinDict;
+    BuiltinDictProvider m_builtinDictProvider;
     std::shared_ptr<IClock> m_clock;
     Ranker m_ranker;
     PinyinSegmenter m_pinyinSegmenter;

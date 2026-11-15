@@ -7,6 +7,8 @@
 #include <map>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <filesystem>
 #include <algorithm>
 #include <chrono>
@@ -21,6 +23,27 @@
 #include "admin_server.h"
 
 static ime::ImeEngine g_engine;
+static std::mutex g_dictWarmupMutex;
+static std::condition_variable g_dictWarmupCv;
+static std::atomic<bool> g_dictWarmupDone{false};
+static std::atomic<bool> g_dictWarmupOk{false};
+
+static bool IsDictionariesReady() {
+    return g_dictWarmupDone.load(std::memory_order_acquire) &&
+           g_dictWarmupOk.load(std::memory_order_acquire);
+}
+
+static bool WaitForDictionariesReady(uint32_t timeoutMs) {
+    if (g_dictWarmupDone.load(std::memory_order_acquire)) {
+        return g_dictWarmupOk.load(std::memory_order_acquire);
+    }
+    std::unique_lock<std::mutex> lock(g_dictWarmupMutex);
+    g_dictWarmupCv.wait_for(lock, std::chrono::milliseconds(timeoutMs), []() {
+        return g_dictWarmupDone.load(std::memory_order_acquire);
+    });
+    return g_dictWarmupDone.load(std::memory_order_acquire) &&
+           g_dictWarmupOk.load(std::memory_order_acquire);
+}
 
 // High-precision monotonically unique 64-bit event counter across restarts
 static std::atomic<uint64_t> g_nextEventId{0};
@@ -308,7 +331,7 @@ static void PopulateCandidates(ContextState& st, IpcKeyResponse& resp) {
         }
     }
 
-    if (g_engine.GetCoordinator()) {
+    if (g_engine.GetCoordinator() && IsDictionariesReady()) {
         st.cached_coord_query = g_engine.GetCoordinator()->Query(
             code,
             st.policy_snapshot,
@@ -460,7 +483,7 @@ void HandleClient(HANDLE hPipe) {
         }
 
         if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
-            resp.handled = 1;
+            resp.handled = IsDictionariesReady() ? 1 : 0;
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::Reset) ||
                  req.msg_type == static_cast<uint32_t>(IpcMsgType::ContextLost)) {
@@ -1241,7 +1264,7 @@ void HandleClient(HANDLE hPipe) {
             else if (state.is_chinese) {
                 if (state.composition.empty()) {
                     if ((vk >= 'A' && vk <= 'Z') || vk == VK_OEM_1) {
-                        resp.handled = 1;
+                        resp.handled = IsDictionariesReady() ? 1 : 0;
                     } else if (state.full_width && !MapFullWidthChar(vk, mods).empty()) {
                         resp.handled = 1;
                     } else if (state.chinese_punctuation && !MapChinesePunctuation(vk, mods).empty()) {
@@ -1457,22 +1480,32 @@ void HandleClient(HANDLE hPipe) {
             else {
                 if (state.composition.empty()) {
                     if (vk >= 'A' && vk <= 'Z') {
-                        state.prev_composition = state.composition;
-                        wchar_t ch = static_cast<wchar_t>(L'a' + (vk - 'A'));
-                        state.composition.push_back(ch);
-                        state.current_page = 0;
-                        state.AdvanceGeneration();
-                        PopulateCandidates(state, resp);
-                        resp.handled = 1;
+                        if (!IsDictionariesReady()) {
+                            resp.status_flags = ComputeModeFlags(state);
+                            resp.handled = 0;
+                        } else {
+                            state.prev_composition = state.composition;
+                            wchar_t ch = static_cast<wchar_t>(L'a' + (vk - 'A'));
+                            state.composition.push_back(ch);
+                            state.current_page = 0;
+                            state.AdvanceGeneration();
+                            PopulateCandidates(state, resp);
+                            resp.handled = 1;
+                        }
                     }
                     else if (vk == VK_OEM_1) {
-                        // Semicolon ';' starts custom phrase (e.g. ;dz)
-                        state.prev_composition = state.composition;
-                        state.composition.push_back(L';');
-                        state.current_page = 0;
-                        state.AdvanceGeneration();
-                        PopulateCandidates(state, resp);
-                        resp.handled = 1;
+                        if (!IsDictionariesReady()) {
+                            resp.status_flags = ComputeModeFlags(state);
+                            resp.handled = 0;
+                        } else {
+                            // Semicolon ';' starts custom phrase (e.g. ;dz)
+                            state.prev_composition = state.composition;
+                            state.composition.push_back(L';');
+                            state.current_page = 0;
+                            state.AdvanceGeneration();
+                            PopulateCandidates(state, resp);
+                            resp.handled = 1;
+                        }
                     }
                     else if (state.full_width && !MapFullWidthChar(vk, mods).empty()) {
                         SafeCopyCommitText(resp, MapFullWidthChar(vk, mods));
@@ -1894,7 +1927,7 @@ void HandleClient(HANDLE hPipe) {
 }
 
 static std::string ResolveDictDir(const std::string& overrideDir) {
-    if (!overrideDir.empty() && std::filesystem::exists(overrideDir + "/wubi86.dict")) {
+    if (!overrideDir.empty()) {
         return overrideDir;
     }
     char envBuf[MAX_PATH];
@@ -1953,6 +1986,8 @@ int main(int argc, char* argv[]) {
     std::string overrideDict;
     std::string overridePipe;
     std::string overrideAdminPipe;
+    uint32_t delayDictLoadMs = 0;
+    bool failEarlyInitForTest = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
             overrideDb = argv[++i];
@@ -1962,6 +1997,10 @@ int main(int argc, char* argv[]) {
             overridePipe = argv[++i];
         } else if (strcmp(argv[i], "--admin-pipe") == 0 && i + 1 < argc) {
             overrideAdminPipe = argv[++i];
+        } else if (strcmp(argv[i], "--delay-dict-load-ms") == 0 && i + 1 < argc) {
+            delayDictLoadMs = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (strcmp(argv[i], "--fail-early-init-for-test") == 0) {
+            failEarlyInitForTest = true;
         }
     }
 
@@ -1972,14 +2011,12 @@ int main(int argc, char* argv[]) {
     std::wcout << L"[ime-service] Database Path: " << ime::Utf8ToWide(dbPath) << L"\n";
     std::wcout << L"[ime-service] Dictionary Dir: " << ime::Utf8ToWide(dictDir) << L"\n";
 
-    if (!g_engine.Initialize(dbPath, dictDir)) {
-        std::wcerr << L"[ime-service] [FATAL] Failed to initialize IME Engine!\n";
+    if (!g_engine.InitializeCore(dbPath)) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to initialize IME Engine core!\n";
         return 1;
     }
 
-    std::wcout << L"[ime-service] Engine initialized successfully: "
-               << g_engine.GetBuiltinDict().WubiEntryCount() << L" wubi, "
-               << g_engine.GetBuiltinDict().PinyinEntryCount() << L" pinyin entries.\n";
+    std::wcout << L"[ime-service] Engine core initialized (SQLite + policy ready).\n";
 
     // Restore uncompleted pending commits across service restart
     std::vector<ime::EntryRepository::PendingCommitRecord> loadedPending;
@@ -2029,6 +2066,116 @@ int main(int argc, char* argv[]) {
         }
     }
     std::wcout << L"[ime-service] Restored " << loadedPending.size() << L" uncompleted pending commits from database.\n";
+
+    g_hServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_hServiceStopEvent) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to create service stop event!\n";
+        return 1;
+    }
+
+    // Strictly scoped security descriptor using actual Current User SID at runtime (before starting background threads):
+    std::wstring userSid = GetCurrentUserSidString();
+    if (userSid.empty()) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to query user SID. Aborting to fail closed.\n";
+        CloseHandle(g_hServiceStopEvent);
+        g_hServiceStopEvent = nullptr;
+        return 1;
+    }
+
+    std::wstring sddl = L"D:(A;;GA;;;" + userSid + L")(A;;GA;;;AC)(A;;GA;;;BA)(A;;GA;;;SY)";
+
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(),
+            SDDL_REVISION_1,
+            &pSD,
+            nullptr)) {
+        std::wcout << L"[ime-service] Failed to create security descriptor! Error: "
+                   << GetLastError() << L"\n";
+        CloseHandle(g_hServiceStopEvent);
+        g_hServiceStopEvent = nullptr;
+        return 1;
+    }
+
+    OVERLAPPED ol{};
+    ol.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ol.hEvent) {
+        std::wcerr << L"[ime-service] [FATAL] Failed to create overlapped pipe event!\n";
+        LocalFree(pSD);
+        CloseHandle(g_hServiceStopEvent);
+        g_hServiceStopEvent = nullptr;
+        return 1;
+    }
+
+    struct ServiceStartupGuard {
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        HANDLE hPipeEvent = nullptr;
+        std::thread dictWarmupThread;
+        ime::AdminServer* adminServer = nullptr;
+
+        ~ServiceStartupGuard() {
+            g_serviceStopping.store(true);
+            if (g_hServiceStopEvent) {
+                SetEvent(g_hServiceStopEvent);
+            }
+            if (adminServer) {
+                adminServer->Stop();
+            }
+            if (dictWarmupThread.joinable()) {
+                dictWarmupThread.join();
+            }
+            if (hPipeEvent) {
+                CloseHandle(hPipeEvent);
+            }
+            if (g_hServiceStopEvent) {
+                CloseHandle(g_hServiceStopEvent);
+                g_hServiceStopEvent = nullptr;
+            }
+            if (pSD) {
+                LocalFree(pSD);
+            }
+        }
+    } startupGuard;
+    startupGuard.pSD = pSD;
+    startupGuard.hPipeEvent = ol.hEvent;
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = pSD;
+    sa.bInheritHandle = FALSE;
+
+    g_dictWarmupDone.store(false, std::memory_order_release);
+    g_dictWarmupOk.store(false, std::memory_order_release);
+    startupGuard.dictWarmupThread = std::thread([dictDir, delayDictLoadMs]() {
+        if (delayDictLoadMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayDictLoadMs));
+        }
+        bool ok = g_engine.LoadDictionaries(dictDir);
+        {
+            std::lock_guard<std::mutex> lock(g_dictWarmupMutex);
+            g_dictWarmupOk.store(ok, std::memory_order_release);
+            g_dictWarmupDone.store(true, std::memory_order_release);
+        }
+        g_dictWarmupCv.notify_all();
+        if (ok) {
+            auto dictSnap = g_engine.GetBuiltinDictSnapshot();
+            std::wcout << L"[ime-service] Builtin dictionaries warmed up: "
+                       << (dictSnap ? dictSnap->WubiEntryCount() : 0) << L" wubi, "
+                       << (dictSnap ? dictSnap->PinyinEntryCount() : 0) << L" pinyin entries.\n";
+        } else {
+            std::wcerr << L"[ime-service] [FATAL] Failed to load builtin dictionaries!\n";
+            g_serviceStopping.store(true);
+            if (g_hServiceStopEvent) {
+                SetEvent(g_hServiceStopEvent);
+            }
+        }
+    });
+
+    if (failEarlyInitForTest) {
+        std::wcerr << L"[ime-service] Simulated early initialization failure after warmup thread start.\n";
+        return 1;
+    }
+
     std::wstring pipeName = overridePipe.empty() ? IME_PIPE_NAME : ime::Utf8ToWide(overridePipe);
     if (!pipeName.starts_with(L"\\\\.\\pipe\\")) {
         pipeName = L"\\\\.\\pipe\\" + pipeName;
@@ -2041,12 +2188,7 @@ int main(int argc, char* argv[]) {
         adminPipeName = L"\\\\.\\pipe\\" + adminPipeName;
     }
     ime::AdminServer adminServer(g_engine, adminPipeName);
-
-    g_hServiceStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_hServiceStopEvent) {
-        std::wcerr << L"[ime-service] [FATAL] Failed to create service stop event!\n";
-        return 1;
-    }
+    startupGuard.adminServer = &adminServer;
 
     adminServer.SetShutdownHandler([]() {
         std::wcout << L"[ime-service] Graceful shutdown requested via Admin IPC.\n";
@@ -2062,39 +2204,7 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[ime-service] Admin Pipe started: " << adminServer.GetPipeName() << L"\n";
     }
 
-    // Strictly scoped security descriptor using actual Current User SID at runtime:
-    std::wstring userSid = GetCurrentUserSidString();
-    if (userSid.empty()) {
-        std::wcerr << L"[ime-service] [FATAL] Failed to query user SID. Aborting to fail closed.\n";
-        return 1;
-    }
-
-    std::wstring sddl = L"D:(A;;GA;;;" + userSid + L")(A;;GA;;;AC)(A;;GA;;;BA)(A;;GA;;;SY)";
-
-    PSECURITY_DESCRIPTOR pSD = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.c_str(),
-            SDDL_REVISION_1,
-            &pSD,
-            nullptr)) {
-        std::wcout << L"[ime-service] Failed to create security descriptor! Error: "
-                   << GetLastError() << L"\n";
-        return 1;
-    }
-
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = pSD;
-    sa.bInheritHandle = FALSE;
-
     std::wcout << L"[ime-service] Listening for TSF Client connections (PIPE_REJECT_REMOTE_CLIENTS enabled)...\n";
-
-    OVERLAPPED ol{};
-    ol.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ol.hEvent) {
-        std::wcerr << L"[ime-service] [FATAL] Failed to create overlapped pipe event!\n";
-        return 1;
-    }
 
     while (!g_serviceStopping.load() && WaitForSingleObject(g_hServiceStopEvent, 0) != WAIT_OBJECT_0) {
         HANDLE hPipe = CreateNamedPipeW(
@@ -2150,10 +2260,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    CloseHandle(ol.hEvent);
-
     std::wcout << L"[ime-service] Stopping Admin Server...\n";
     adminServer.Stop();
+    startupGuard.adminServer = nullptr;
 
     // Disconnect active client pipes and bounded drain
     {
@@ -2165,19 +2274,15 @@ int main(int argc, char* argv[]) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
+    if (startupGuard.dictWarmupThread.joinable()) {
+        startupGuard.dictWarmupThread.join();
+    }
+
     std::wcout << L"[ime-service] Checkpointing SQLite database...\n";
     g_engine.GetDb().Execute("PRAGMA wal_checkpoint(PASSIVE);");
 
     std::wcout << L"[ime-service] Graceful shutdown completed cleanly.\n";
 
-    if (g_hServiceStopEvent) {
-        CloseHandle(g_hServiceStopEvent);
-        g_hServiceStopEvent = nullptr;
-    }
-
-    if (pSD) {
-        LocalFree(pSD);
-    }
-
-    return 0;
+    return (g_dictWarmupDone.load(std::memory_order_acquire) &&
+            !g_dictWarmupOk.load(std::memory_order_acquire)) ? 1 : 0;
 }

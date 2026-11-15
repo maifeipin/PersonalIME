@@ -28,6 +28,11 @@ public:
     bool Initialize(const std::string& dbPath,
                     const std::string& dictDir,
                     std::shared_ptr<IClock> clock = nullptr);
+    bool InitializeCore(const std::string& dbPath,
+                        std::shared_ptr<IClock> clock = nullptr);
+    bool LoadDictionaries(const std::string& dictDir);
+    bool IsCoreInitialized() const { return m_coreInitialized; }
+    bool IsInitialized() const { return m_initialized; }
 
     QueryResult Query(InputScheme scheme, const std::string& code);
 
@@ -90,7 +95,7 @@ public:
     std::vector<std::string> ExplainCandidates(InputScheme scheme, const std::string& code);
 
     std::shared_ptr<IClock> GetClock() const { return m_clock; }
-    const BuiltinDictionary& GetBuiltinDict() const { return m_builtinDict; }
+    std::shared_ptr<const BuiltinDictionary> GetBuiltinDictSnapshot() const;
     EntryRepository* GetRepo() { return m_repo.get(); }
     PluginRepository* GetPluginRepo() { return m_pluginRepo.get(); }
     InputCoordinator* GetCoordinator() { return m_coordinator.get(); }
@@ -107,14 +112,17 @@ public:
 
 private:
     mutable std::mutex m_policySaveMutex;
+    mutable std::mutex m_dictSnapshotMutex;
     std::shared_ptr<IClock> m_clock;
     SqliteDb m_db;
     std::unique_ptr<EntryRepository> m_repo;
     std::unique_ptr<PluginRepository> m_pluginRepo;
     PinyinSegmenter m_pinyinSegmenter;
-    BuiltinDictionary m_builtinDict;
+    std::shared_ptr<const BuiltinDictionary> m_initialEmptyDict;
+    std::shared_ptr<const BuiltinDictionary> m_builtinDictSnapshot;
     std::unique_ptr<Ranker> m_ranker;
     std::unique_ptr<InputCoordinator> m_coordinator;
+    bool m_coreInitialized = false;
     bool m_initialized = false;
 };
 

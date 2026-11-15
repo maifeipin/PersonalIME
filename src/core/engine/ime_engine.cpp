@@ -6,15 +6,25 @@
 
 namespace ime {
 
-ImeEngine::ImeEngine() {}
+ImeEngine::ImeEngine()
+    : m_initialEmptyDict(std::make_shared<const BuiltinDictionary>())
+    , m_builtinDictSnapshot(m_initialEmptyDict) {}
 
 ImeEngine::~ImeEngine() {}
 
-bool ImeEngine::Initialize(const std::string& dbPath,
-                           const std::string& dictDir,
-                           std::shared_ptr<IClock> clock) {
+std::shared_ptr<const BuiltinDictionary> ImeEngine::GetBuiltinDictSnapshot() const {
+    std::lock_guard<std::mutex> lock(m_dictSnapshotMutex);
+    return m_builtinDictSnapshot;
+}
+
+bool ImeEngine::InitializeCore(const std::string& dbPath,
+                               std::shared_ptr<IClock> clock) {
+    m_coreInitialized = false;
     m_initialized = false;
-    m_builtinDict = BuiltinDictionary();
+    {
+        std::lock_guard<std::mutex> lock(m_dictSnapshotMutex);
+        m_builtinDictSnapshot = m_initialEmptyDict;
+    }
     m_clock = clock ? clock : std::make_shared<SystemClock>();
     m_ranker = std::make_unique<Ranker>(m_clock);
 
@@ -27,16 +37,10 @@ bool ImeEngine::Initialize(const std::string& dbPath,
     }
 
     m_repo = std::make_unique<EntryRepository>(m_db, m_clock);
-    m_repo->SetBuiltinDictionary(&m_builtinDict);
+    m_repo->SetBuiltinDictProvider([this]() { return GetBuiltinDictSnapshot(); });
     m_pluginRepo = std::make_unique<PluginRepository>(m_db);
-
-    if (!dictDir.empty()) {
-        if (!m_builtinDict.Load(dictDir)) {
-            return false;
-        }
-    }
-
-    m_coordinator = std::make_unique<InputCoordinator>(*m_repo, m_builtinDict, m_clock);
+    m_coordinator = std::make_unique<InputCoordinator>(*m_repo, *m_initialEmptyDict, m_clock);
+    m_coordinator->SetBuiltinDictProvider([this]() { return GetBuiltinDictSnapshot(); });
 
     // Load persisted input policy if present
     auto savedPolicyJson = m_repo->GetMetaSetting("input_policy");
@@ -50,8 +54,33 @@ bool ImeEngine::Initialize(const std::string& dbPath,
         } catch (...) {}
     }
 
+    m_coreInitialized = true;
+    return true;
+}
+
+bool ImeEngine::LoadDictionaries(const std::string& dictDir) {
+    if (!m_coreInitialized) {
+        return false;
+    }
+    if (!dictDir.empty()) {
+        auto loadedDict = std::make_shared<BuiltinDictionary>();
+        if (!loadedDict->Load(dictDir)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(m_dictSnapshotMutex);
+        m_builtinDictSnapshot = std::move(loadedDict);
+    }
     m_initialized = true;
     return true;
+}
+
+bool ImeEngine::Initialize(const std::string& dbPath,
+                           const std::string& dictDir,
+                           std::shared_ptr<IClock> clock) {
+    if (!InitializeCore(dbPath, clock)) {
+        return false;
+    }
+    return LoadDictionaries(dictDir);
 }
 
 QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
@@ -63,16 +92,19 @@ QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
 
+    auto dictSnap = GetBuiltinDictSnapshot();
+    const BuiltinDictionary& dict = *dictSnap;
+
     std::vector<Candidate> candidates;
 
     if (scheme == InputScheme::Wubi86) {
-        auto builtinCands = m_builtinDict.QueryWubi(clean);
+        auto builtinCands = dict.QueryWubi(clean);
         auto userCands = m_repo->QueryUserCandidates(InputScheme::Wubi86, clean);
 
         candidates.insert(candidates.end(), std::make_move_iterator(builtinCands.begin()), std::make_move_iterator(builtinCands.end()));
         candidates.insert(candidates.end(), std::make_move_iterator(userCands.begin()), std::make_move_iterator(userCands.end()));
     } else if (scheme == InputScheme::Pinyin) {
-        auto builtinCands = m_builtinDict.QueryPinyin(clean, m_pinyinSegmenter);
+        auto builtinCands = dict.QueryPinyin(clean, m_pinyinSegmenter);
         auto userCands = m_repo->QueryUserCandidates(InputScheme::Pinyin, clean);
 
         candidates.insert(candidates.end(), std::make_move_iterator(builtinCands.begin()), std::make_move_iterator(builtinCands.end()));
@@ -92,7 +124,7 @@ QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
     for (const auto& pref : pinnedPrefs) {
         if (seenIds.count(pref.entry_id) == 0) {
             if (pref.entry_id.rfind("b_", 0) == 0) {
-                auto cand = m_builtinDict.GetCandidateById(scheme, clean, pref.entry_id);
+                auto cand = dict.GetCandidateById(scheme, clean, pref.entry_id);
                 if (cand.has_value()) {
                     seenIds.insert(pref.entry_id);
                     candidates.push_back(std::move(*cand));
@@ -124,7 +156,7 @@ QueryResult ImeEngine::Query(InputScheme scheme, const std::string& code) {
     for (const auto& stat : activeStats) {
         if (seenIds.count(stat.entry_id) == 0) {
             if (stat.entry_id.rfind("b_", 0) == 0) {
-                auto cand = m_builtinDict.GetCandidateById(scheme, clean, stat.entry_id);
+                auto cand = dict.GetCandidateById(scheme, clean, stat.entry_id);
                 if (cand.has_value()) {
                     seenIds.insert(stat.entry_id);
                     candidates.push_back(std::move(*cand));
@@ -195,7 +227,8 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
 
     // If this is a builtin entry, ensure an entry row exists in SQLite for foreign key integrity
     if (entryId.rfind("b_", 0) == 0) {
-        auto builtinCand = m_builtinDict.GetCandidateById(scheme, clean, entryId);
+        auto dictSnap = GetBuiltinDictSnapshot();
+        auto builtinCand = dictSnap->GetCandidateById(scheme, clean, entryId);
         if (!builtinCand.has_value()) {
             return false;
         }
@@ -206,17 +239,17 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
 }
 
 bool ImeEngine::RecordCancel(const std::string& eventId, uint64_t sessionId, uint64_t contextId) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->RecordCancel(eventId, sessionId, contextId);
 }
 
 EntryRepository::CommitEventRecord ImeEngine::GetCommitEventInfo(const std::string& eventId) {
-    if (!m_initialized || !m_repo) return {};
+    if (!m_coreInitialized || !m_repo) return {};
     return m_repo->GetCommitEventRecord(eventId);
 }
 
 bool ImeEngine::IsCommitRecorded(const std::string& eventId) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->HasCommitEvent(eventId);
 }
 
@@ -234,7 +267,7 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
                                   uint64_t contextEpoch,
                                   uint64_t inputGeneration,
                                   uint64_t ownerInstanceId) {
-    if (!m_initialized || !m_repo || eventId.empty()) return false;
+    if (!m_coreInitialized || !m_repo || eventId.empty()) return false;
     EntryRepository::PendingCommitRecord rec;
     rec.event_id = eventId;
     rec.session_id = sessionId;
@@ -255,12 +288,12 @@ bool ImeEngine::SavePendingCommit(const std::string& eventId,
 }
 
 bool ImeEngine::RemovePendingCommit(const std::string& eventId) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->RemovePendingCommit(eventId);
 }
 
 bool ImeEngine::LoadAllPendingCommits(std::vector<EntryRepository::PendingCommitRecord>& outRecords) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->LoadAllPendingCommits(outRecords);
 }
 
@@ -313,7 +346,8 @@ bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const 
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
 
     if (entryId.rfind("b_", 0) == 0) {
-        auto builtinCand = m_builtinDict.GetCandidateById(scheme, clean, entryId);
+        auto dictSnap = GetBuiltinDictSnapshot();
+        auto builtinCand = dictSnap->GetCandidateById(scheme, clean, entryId);
         if (!builtinCand.has_value()) {
             return false;
         }
@@ -346,7 +380,8 @@ bool ImeEngine::ExportData(const std::string& jsonFilePath, std::string* errorOu
 
 bool ImeEngine::ImportData(const std::string& jsonFilePath, bool replaceMode, std::string* errorOut) {
     if (!m_initialized) return false;
-    return JsonBackup::ImportFromFile(*m_repo, m_db, jsonFilePath, replaceMode, errorOut, &m_builtinDict);
+    auto dictSnap = GetBuiltinDictSnapshot();
+    return JsonBackup::ImportFromFile(*m_repo, m_db, jsonFilePath, replaceMode, errorOut, dictSnap.get());
 }
 
 std::vector<std::string> ImeEngine::ExplainCandidates(InputScheme scheme, const std::string& code) {
@@ -367,7 +402,7 @@ bool ImeEngine::SavePolicy(const InputPolicy& policy,
                            bool* outConflict) {
     if (outConflict) *outConflict = false;
     std::lock_guard<std::mutex> lock(m_policySaveMutex);
-    if (!m_initialized || !m_coordinator || !m_repo) {
+    if (!m_coreInitialized || !m_coordinator || !m_repo) {
         if (errorOut) *errorOut = "Engine not initialized";
         return false;
     }

@@ -136,7 +136,16 @@ public:
     bool HasAnyPendingCommits();
 
     // Utility: ensure a builtin entry has a row in entries if needed for stats/pinning
+    using BuiltinDictProvider = std::function<std::shared_ptr<const BuiltinDictionary>()>;
     void SetBuiltinDictionary(const BuiltinDictionary* dict) { m_builtinDict = dict; }
+    void SetBuiltinDictProvider(BuiltinDictProvider provider) { m_builtinDictProvider = std::move(provider); }
+    std::shared_ptr<const BuiltinDictionary> AcquireBuiltinDict() const {
+        if (m_builtinDictProvider) return m_builtinDictProvider();
+        if (m_builtinDict) {
+            return std::shared_ptr<const BuiltinDictionary>(m_builtinDict, [](const BuiltinDictionary*) {});
+        }
+        return nullptr;
+    }
     bool EnsureBuiltinEntryExists(const std::string& entryId, const std::wstring& text);
 
     // Persistent Pending Commits across service crashes / restarts
@@ -172,6 +181,7 @@ private:
     SqliteDb& m_db;
     std::shared_ptr<IClock> m_clock;
     const BuiltinDictionary* m_builtinDict = nullptr;
+    BuiltinDictProvider m_builtinDictProvider;
 
     std::string GenerateUniqueId();
 };

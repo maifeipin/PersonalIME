@@ -1034,11 +1034,12 @@ bool EntryRepository::SetPinPreference(InputScheme scheme, const std::string& co
 
     // Builtin entry materialization inside transaction
     if (isPinned && entryId.rfind("b_", 0) == 0) {
-        if (!m_builtinDict) {
+        auto dictSnap = AcquireBuiltinDict();
+        if (!dictSnap) {
             tx.Rollback();
             return false;
         }
-        auto textOpt = m_builtinDict->GetTextById(entryId);
+        auto textOpt = dictSnap->GetTextById(entryId);
         if (!textOpt || textOpt->empty()) {
             tx.Rollback();
             return false;
@@ -2107,11 +2108,12 @@ bool EntryRepository::ReorderPinnedEntries(InputScheme scheme, const std::string
     // Builtin entry materialization inside transaction
     for (const auto& eid : entryIds) {
         if (eid.rfind("b_", 0) == 0) {
-            if (!m_builtinDict) {
+            auto dictSnap = AcquireBuiltinDict();
+            if (!dictSnap) {
                 tx.Rollback();
                 return false;
             }
-            auto textOpt = m_builtinDict->GetTextById(eid);
+            auto textOpt = dictSnap->GetTextById(eid);
             if (!textOpt || textOpt->empty()) {
                 tx.Rollback();
                 return false;

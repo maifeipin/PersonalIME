@@ -787,8 +787,9 @@ static int TestReviewRound2Probes() {
 static int TestStage4C2ReverseLookupCore(ImeEngine& engine) {
     std::cout << "[TEST] Running Stage 4C-2 Reverse Lookup Core & Decomposition Suite..." << std::endl;
 
-    const auto& dict = engine.GetBuiltinDict();
-    TEST_ASSERT(dict.IsLoaded(), "Builtin dictionary must be loaded");
+    auto dictSnap = engine.GetBuiltinDictSnapshot();
+    TEST_ASSERT(dictSnap && dictSnap->IsLoaded(), "Builtin dictionary must be loaded");
+    const auto& dict = *dictSnap;
 
     // 1. Built-in Dictionary Text-to-Code Reverse Lookup
     {
@@ -1169,9 +1170,10 @@ int main() {
         std::cerr << "[FATAL] Failed to initialize in-memory test engine!" << std::endl;
         return 1;
     }
+    auto initDictSnap = engine.GetBuiltinDictSnapshot();
     std::cout << "Step 1: ImeEngine initialized successfully! (Wubi: "
-              << engine.GetBuiltinDict().WubiEntryCount() << ", Pinyin: "
-              << engine.GetBuiltinDict().PinyinEntryCount() << ")" << std::endl;
+              << (initDictSnap ? initDictSnap->WubiEntryCount() : 0) << ", Pinyin: "
+              << (initDictSnap ? initDictSnap->PinyinEntryCount() : 0) << ")" << std::endl;
 
     std::cout << "Step 2: Starting TestPinyinAmbiguityAndSeparators..." << std::endl;
     if (TestPinyinAmbiguityAndSeparators(engine) != 0) return 1;

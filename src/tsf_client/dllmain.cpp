@@ -15,11 +15,17 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_hInst = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
+    } else if (fdwReason == DLL_PROCESS_DETACH) {
+        (void)lpvReserved;
+        ShutdownTsfDebugLoggerAsync();
     }
     return TRUE;
 }
 
 STDAPI DllCanUnloadNow() {
+    if (g_cDllRef == 1 && IsTsfDebugLoggerHoldingDllRef()) {
+        ShutdownTsfDebugLoggerAsync();
+    }
     return (g_cDllRef == 0) ? S_OK : S_FALSE;
 }
 

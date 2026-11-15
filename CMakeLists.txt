@@ -203,6 +203,24 @@ target_link_libraries(test_receipt_durability PRIVATE user32)
 
 add_executable(test_tip_candidate_snapshot tests/test_tip_candidate_snapshot.cpp tests/tip_snapshot_driver.cpp src/tsf_client/candidate_window.cpp src/tsf_client/lang_bar_item.cpp src/tsf_client/ipc_client.cpp)
 target_link_libraries(test_tip_candidate_snapshot PRIVATE ole32 oleaut32 advapi32 user32 gdi32 shell32)
+
+# 7. TSF Debug Log DLL Load/Unload Deadlock Safety Test (PERSONALIME_DEBUG_TSF_LOG=1)
+add_library(PersonalIME_LogTest SHARED
+    src/tsf_client/dllmain.cpp
+    src/tsf_client/class_factory.cpp
+    src/tsf_client/text_input_processor.cpp
+    src/tsf_client/candidate_window.cpp
+    src/tsf_client/lang_bar_item.cpp
+    src/tsf_client/ipc_client.cpp
+    src/tsf_client/PersonalIME.def
+    src/tsf_client/PersonalIME.rc
+)
+target_compile_definitions(PersonalIME_LogTest PRIVATE PERSONALIME_DEBUG_TSF_LOG=1)
+target_link_libraries(PersonalIME_LogTest PRIVATE ole32 oleaut32 advapi32 user32 gdi32 shell32)
+
+add_executable(test_tsf_log_unload tests/test_tsf_log_unload.cpp)
+target_link_libraries(test_tsf_log_unload PRIVATE ole32)
+add_dependencies(test_tsf_log_unload PersonalIME_LogTest)
 endif() # WIN32
 
 # Stage 4A: Input Policy & Shuangpin Test

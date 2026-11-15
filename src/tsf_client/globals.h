@@ -12,3 +12,6 @@ inline void DllRelease() {
     InterlockedDecrement(&g_cDllRef);
 }
 
+void ShutdownTsfDebugLoggerAsync() noexcept;
+bool IsTsfDebugLoggerHoldingDllRef() noexcept;
+

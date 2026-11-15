@@ -11,6 +11,7 @@
 #include <cassert>
 #include "../src/common/ime_guids.h"
 #include "../src/common/ipc_protocol.h"
+#include "../src/common/admin_protocol.h"
 #include "../src/common/stage7_settings_codec.h"
 #include "../src/tsf_client/ipc_client.h"
 #include "../src/core/engine/ime_engine.h"
@@ -2549,8 +2550,304 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[PASS] Real-Service 80-Host Whitelist Pagination & Candidate Boundary Flag Fidelity verified!" << std::endl;
     }
 
+    // ---------------------------------------------------------
+    // TEST 22: Delayed & Failed Dictionary Warmup (Pipe Ready, Mode/Receipt Live, Safe Passthrough)
+    // ---------------------------------------------------------
+    {
+        std::wcout << L"\n[TEST 22] Delayed & Failed Dictionary Warmup, Mode Toggle & Pending Recovery..." << std::endl;
+        auto resolveSvcExe = []() -> std::wstring {
+            if (const char* envExe = std::getenv("PERSONALIME_TEST_SERVICE_EXE")) {
+                if (*envExe) return ime::Utf8ToWide(envExe);
+            }
+            if (std::filesystem::exists(L"build\\Release\\ime-service.exe")) return L"build\\Release\\ime-service.exe";
+            return L"ime-service.exe";
+        };
+        std::wstring svcExe = resolveSvcExe();
+
+        std::string wDb = (std::filesystem::temp_directory_path() / ("PersonalIME_warmup_" + std::to_string(GetCurrentProcessId()) + ".db")).string();
+        std::error_code ec;
+        std::filesystem::remove(wDb, ec);
+
+        // Seed a pending commit to verify WAL recovery works even during dict warmup
+        const uint64_t seededEvId = 999888777ULL;
+        const uint64_t seededSentenceEvId = 999888778ULL;
+        const uint64_t wSess = 2200ULL;
+        const uint64_t wCtx = 1ULL;
+        {
+            ime::ImeEngine seeder;
+            CHECK_TRUE(seeder.InitializeCore(wDb), L"Seeder InitializeCore succeeds");
+            CHECK_TRUE(seeder.SavePendingCommit(
+                std::to_string(seededEvId),
+                wSess, wCtx,
+                ime::InputScheme::Wubi86,
+                "aaaa", "b_test_warmup", L"工",
+                false, "", "aaaa", "aaaa",
+                1, 1, wSess),
+                L"Seeded pending commit saved before warmup test");
+            CHECK_TRUE(seeder.SavePendingCommit(
+                std::to_string(seededSentenceEvId),
+                wSess, wCtx,
+                ime::InputScheme::Pinyin,
+                "women", "__sentence__", L"我们",
+                true, "",
+                "women", "women",
+                1, 2, wSess),
+                L"Seeded sentence pending commit saved before warmup test");
+        }
+
+        std::string wPipe = "PersonalIME_Test_Warmup_" + std::to_string(GetCurrentProcessId());
+        std::string wAdminPipe = wPipe + "_Admin";
+        std::wstring wPipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(wPipe);
+        IpcClient::SetPipeNameForTest(wPipeW.c_str());
+
+        std::wstring cmdLine = svcExe + L" --db " + ime::Utf8ToWide(wDb) +
+                               L" --dict " + ime::Utf8ToWide(dictDir) +
+                               L" --pipe " + ime::Utf8ToWide(wPipe) +
+                               L" --admin-pipe " + ime::Utf8ToWide(wAdminPipe) +
+                               L" --delay-dict-load-ms 600";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        std::vector<wchar_t> cmdBuf(cmdLine.begin(), cmdLine.end());
+        cmdBuf.push_back(L'\0');
+        CHECK_TRUE(CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi),
+                   L"Launch delayed-warmup ime-service");
+
+        IpcClient wClient;
+        bool pipeReadyEarly = false;
+        for (int i = 0; i < 40; ++i) {
+            Sleep(15);
+            IpcKeyRequest gm{};
+            gm.msg_type = static_cast<uint32_t>(IpcMsgType::GetMode);
+            gm.session_id = wSess;
+            gm.context_id = wCtx;
+            gm.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+            IpcKeyResponse gmr{};
+            if (wClient.SendRequest(gm, gmr, 60) && gmr.handled == 1) {
+                pipeReadyEarly = true;
+                break;
+            }
+        }
+        CHECK_TRUE(pipeReadyEarly, L"Pipe accepts GetMode immediately before 600ms dict warmup finishes");
+
+        // Confirm Ping still reports not-ready (handled == 0) while dict warmup is sleeping
+        IpcKeyRequest pingReq{};
+        pingReq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+        pingReq.session_id = wSess;
+        pingReq.context_id = wCtx;
+        pingReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+        IpcKeyResponse pingResp{};
+        CHECK_TRUE(wClient.SendRequest(pingReq, pingResp, 60), L"Ping IPC succeeds during warmup");
+        CHECK_EQUAL(pingResp.handled, 0u, L"Ping reports handled=0 while dict warmup is in progress");
+
+        // 22.1: Character keys pass through safely without mutating composition during warmup
+        IpcKeyRequest tkReq{};
+        tkReq.msg_type = static_cast<uint32_t>(IpcMsgType::TestKeyDown);
+        tkReq.session_id = wSess;
+        tkReq.context_id = wCtx;
+        tkReq.vk_code = 'A';
+        tkReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse tkResp{};
+        CHECK_TRUE(wClient.SendRequest(tkReq, tkResp, 60), L"TestKeyDown('A') IPC returns fast during warmup");
+        CHECK_EQUAL(tkResp.handled, 0u, L"TestKeyDown('A') passes through (handled=0) during warmup");
+
+        IpcKeyRequest kdReq = tkReq;
+        kdReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        IpcKeyResponse kdResp{};
+        CHECK_TRUE(wClient.SendRequest(kdReq, kdResp, 60), L"KeyDown('A') IPC returns fast during warmup");
+        CHECK_EQUAL(kdResp.handled, 0u, L"KeyDown('A') passes through (handled=0) without mutating composition");
+        CHECK_EQUAL(kdResp.has_composition, 0u, L"KeyDown('A') during warmup has no composition");
+
+        // 22.2: Mode toggle (Shift-tap) works immediately during warmup
+        IpcKeyRequest shReq{};
+        shReq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        shReq.session_id = wSess;
+        shReq.context_id = wCtx;
+        shReq.vk_code = VK_SHIFT;
+        shReq.mode_arg = IPC_KEYDOWN_SHIFT_TAP;
+        shReq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse shResp{};
+        CHECK_TRUE(wClient.SendRequest(shReq, shResp, 60) && shResp.handled == 1,
+                   L"Shift-tap succeeds during warmup");
+        CHECK_TRUE((shResp.status_flags & IPC_MODE_CHINESE) == 0,
+                   L"Shift-tap toggled to English during warmup");
+        CHECK_TRUE(wClient.SetMode(wSess, wCtx, IPC_MODE_CHINESE, IPC_PROTOCOL_VERSION_STAGE7, IPC_UPDATE_CHINESE),
+                   L"SetMode back to Chinese succeeds during warmup");
+
+        // 22.3: Pre-existing pending commit & sentence commit terminal recovery work during warmup
+        IpcCommitDisposition outWarmupDisp = IpcCommitDisposition::ConfirmedWritten;
+        bool outWarmupConflict = false;
+        CHECK_TRUE(wClient.NotifyCommitTerminal(
+                       wSess, wCtx, seededEvId,
+                       IpcCommitDisposition::ConfirmedWritten,
+                       1, 1, wSess, outWarmupDisp, outWarmupConflict),
+                   L"CommitTerminal recovers pre-existing pending commit during warmup");
+        CHECK_TRUE(!outWarmupConflict, L"Recovered pending commit has no conflict");
+
+        CHECK_TRUE(wClient.NotifyCommitTerminal(
+                       wSess, wCtx, seededSentenceEvId,
+                       IpcCommitDisposition::ConfirmedWritten,
+                       1, 2, wSess, outWarmupDisp, outWarmupConflict),
+                   L"CommitTerminal recovers pre-existing sentence pending commit during warmup");
+        CHECK_TRUE(!outWarmupConflict, L"Recovered sentence pending commit has no conflict");
+
+        // 22.4: Concurrent Admin GetStatus queries across warmup & snapshot publish, then verify normal query works
+        std::atomic<bool> adminPollStop{false};
+        std::atomic<int> adminPollSuccess{0};
+        std::atomic<int> adminPollFail{0};
+        std::atomic<bool> sawZeroThenPositive{false};
+        std::thread adminPollThread([&]() {
+            std::wstring adminPipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(wAdminPipe);
+            HANDLE hAdmin = INVALID_HANDLE_VALUE;
+            for (int a = 0; a < 40 && !adminPollStop.load(); ++a) {
+                hAdmin = CreateFileW(adminPipeW.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hAdmin != INVALID_HANDLE_VALUE) break;
+                Sleep(15);
+            }
+            if (hAdmin == INVALID_HANDLE_VALUE) {
+                adminPollFail.fetch_add(1);
+                return;
+            }
+            bool sawZero = false;
+            bool sawPos = false;
+            uint32_t reqId = 1;
+            while (!adminPollStop.load()) {
+                std::string payload = R"({"action":"GetStatus","protocol_version":1})";
+                ime::AdminHeader hdr{};
+                hdr.magic[0] = 'P'; hdr.magic[1] = 'I'; hdr.magic[2] = 'M'; hdr.magic[3] = 'A';
+                hdr.version = ime::ADMIN_PROTOCOL_VERSION_1;
+                hdr.payload_length = static_cast<uint32_t>(payload.size());
+                hdr.request_id = reqId++;
+                std::vector<uint8_t> frame(sizeof(hdr) + payload.size());
+                std::memcpy(frame.data(), &hdr, sizeof(hdr));
+                std::memcpy(frame.data() + sizeof(hdr), payload.data(), payload.size());
+                DWORD written = 0;
+                if (!WriteFile(hAdmin, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr) || written != frame.size()) {
+                    adminPollFail.fetch_add(1);
+                    break;
+                }
+                ime::AdminHeader respHdr{};
+                DWORD readBytes = 0, totalRead = 0;
+                while (totalRead < sizeof(respHdr)) {
+                    if (!ReadFile(hAdmin, reinterpret_cast<BYTE*>(&respHdr) + totalRead, sizeof(respHdr) - totalRead, &readBytes, nullptr) || readBytes == 0) {
+                        break;
+                    }
+                    totalRead += readBytes;
+                }
+                if (totalRead != sizeof(respHdr) || respHdr.payload_length > 1048576) {
+                    adminPollFail.fetch_add(1);
+                    break;
+                }
+                std::string respJson(respHdr.payload_length, '\0');
+                totalRead = 0;
+                while (totalRead < respHdr.payload_length) {
+                    if (!ReadFile(hAdmin, &respJson[totalRead], respHdr.payload_length - totalRead, &readBytes, nullptr) || readBytes == 0) {
+                        break;
+                    }
+                    totalRead += readBytes;
+                }
+                if (totalRead != respHdr.payload_length || respJson.find("\"success\":true") == std::string::npos) {
+                    adminPollFail.fetch_add(1);
+                    break;
+                }
+                if (respJson.find("\"wubi_entry_count\":0") != std::string::npos) {
+                    sawZero = true;
+                } else {
+                    sawPos = true;
+                }
+                adminPollSuccess.fetch_add(1);
+                Sleep(10);
+            }
+            if (sawZero && sawPos) {
+                sawZeroThenPositive.store(true);
+            }
+            CloseHandle(hAdmin);
+        });
+
+        bool dictReady = false;
+        for (int i = 0; i < 60; ++i) {
+            Sleep(50);
+            pingResp = {};
+            if (wClient.SendRequest(pingReq, pingResp, 80) && pingResp.handled == 1) {
+                dictReady = true;
+                break;
+            }
+        }
+        adminPollStop.store(true);
+        adminPollThread.join();
+        CHECK_TRUE(dictReady, L"Delayed dictionary warmup completes cleanly");
+        CHECK_TRUE(adminPollSuccess.load() >= 5 && adminPollFail.load() == 0,
+                   L"Concurrent Admin GetStatus polling during warmup & publish succeeded with zero errors");
+        CHECK_TRUE(sawZeroThenPositive.load(),
+                   L"Admin GetStatus observed wubi_entry_count transition cleanly from 0 to >0");
+
+        kdResp = {};
+        CHECK_TRUE(wClient.SendRequest(kdReq, kdResp, 100) && kdResp.handled == 1,
+                   L"KeyDown('A') handled after warmup completes");
+        CHECK_TRUE(std::wstring(kdResp.composition) == L"a",
+                   L"Composition is 'a' (no cached/replayed earlier 'A')");
+        CHECK_TRUE(kdResp.candidate_count >= 1, L"Candidates returned after warmup completes");
+
+        wClient.Disconnect();
+        TerminateProcess(pi.hProcess, 0);
+        WaitForSingleObject(pi.hProcess, 3000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        std::filesystem::remove(wDb, ec);
+
+        // 22.5: Failed dictionary warmup exits cleanly with non-zero exit code
+        std::string failDb = (std::filesystem::temp_directory_path() / ("PersonalIME_faildict_" + std::to_string(GetCurrentProcessId()) + ".db")).string();
+        std::string failPipe = "PersonalIME_Test_FailDict_" + std::to_string(GetCurrentProcessId());
+        std::wstring failCmd = svcExe + L" --db " + ime::Utf8ToWide(failDb) +
+                               L" --dict C:\\NonExistent_PersonalIME_DictDir_12345" +
+                               L" --pipe " + ime::Utf8ToWide(failPipe) +
+                               L" --admin-pipe " + ime::Utf8ToWide(failPipe + "_Admin");
+        STARTUPINFOW fsi{};
+        fsi.cb = sizeof(fsi);
+        PROCESS_INFORMATION fpi{};
+        std::vector<wchar_t> failBuf(failCmd.begin(), failCmd.end());
+        failBuf.push_back(L'\0');
+        CHECK_TRUE(CreateProcessW(nullptr, failBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &fsi, &fpi),
+                   L"Launch failed-dict ime-service");
+        DWORD waitFail = WaitForSingleObject(fpi.hProcess, 5000);
+        CHECK_EQUAL(waitFail, WAIT_OBJECT_0, L"Failed dictionary warmup causes service to exit cleanly");
+        DWORD failExitCode = 0;
+        GetExitCodeProcess(fpi.hProcess, &failExitCode);
+        CHECK_TRUE(failExitCode != 0, L"Failed dictionary warmup exits with non-zero status");
+        CloseHandle(fpi.hProcess);
+        CloseHandle(fpi.hThread);
+        std::filesystem::remove(failDb, ec);
+
+        // 22.6: Early init failure after warmup thread start exits cleanly with code 1 (no std::terminate)
+        std::string earlyFailDb = (std::filesystem::temp_directory_path() / ("PersonalIME_earlyfail_" + std::to_string(GetCurrentProcessId()) + ".db")).string();
+        std::string earlyFailPipe = "PersonalIME_Test_EarlyFail_" + std::to_string(GetCurrentProcessId());
+        std::wstring earlyFailCmd = svcExe + L" --db " + ime::Utf8ToWide(earlyFailDb) +
+                                    L" --dict " + ime::Utf8ToWide(dictDir) +
+                                    L" --pipe " + ime::Utf8ToWide(earlyFailPipe) +
+                                    L" --admin-pipe " + ime::Utf8ToWide(earlyFailPipe + "_Admin") +
+                                    L" --delay-dict-load-ms 300 --fail-early-init-for-test";
+        STARTUPINFOW efsi{};
+        efsi.cb = sizeof(efsi);
+        PROCESS_INFORMATION efpi{};
+        std::vector<wchar_t> earlyFailBuf(earlyFailCmd.begin(), earlyFailCmd.end());
+        earlyFailBuf.push_back(L'\0');
+        CHECK_TRUE(CreateProcessW(nullptr, earlyFailBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &efsi, &efpi),
+                   L"Launch early-fail-after-warmup ime-service");
+        DWORD waitEarlyFail = WaitForSingleObject(efpi.hProcess, 5000);
+        CHECK_EQUAL(waitEarlyFail, WAIT_OBJECT_0, L"Early init failure after warmup thread start exits cleanly");
+        DWORD earlyFailExitCode = 0;
+        GetExitCodeProcess(efpi.hProcess, &earlyFailExitCode);
+        CHECK_EQUAL(earlyFailExitCode, 1u, L"Early init failure exits with clean code 1 (not std::terminate)");
+        CloseHandle(efpi.hProcess);
+        CloseHandle(efpi.hThread);
+        std::filesystem::remove(earlyFailDb, ec);
+
+        IpcClient::SetPipeNameForTest(nullptr);
+        std::wcout << L"[PASS] Delayed & Failed Dictionary Warmup, Mode Toggle & Pending Recovery verified!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (21/21)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (22/22)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

@@ -371,6 +371,8 @@ std::vector<Candidate>
 InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                                        const MethodResolution& res,
                                        bool exactOnly) const {
+    auto dictSnap = AcquireBuiltinDict();
+    const BuiltinDictionary& dict = *dictSnap;
     std::vector<Candidate> candidates;
     const std::string segDisplayCode = BuildSegmentedDisplayCode(res.spaced_code, res.resolved_code);
 
@@ -512,7 +514,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
         }
     } else if (dictId == DICT_ID_BUILTIN_WUBI) {
         if (res.scheme == InputScheme::Wubi86) {
-            auto wubiCands = m_builtinDict.QueryWubi(res.resolved_code);
+            auto wubiCands = dict.QueryWubi(res.resolved_code);
             std::unordered_set<std::string> seenIds;
             for (auto& c : wubiCands) {
                 if (exactOnly && c.quality != MatchQuality::ExactFull) continue;
@@ -532,7 +534,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
             auto pinnedPrefs = m_repo.GetPinnedPreferences(InputScheme::Wubi86, scopedRecallKey);
             for (const auto& pref : pinnedPrefs) {
                 if (seenIds.count(pref.entry_id) == 0 && pref.entry_id.rfind("b_", 0) == 0) {
-                    auto cand = m_builtinDict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, pref.entry_id);
+                    auto cand = dict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, pref.entry_id);
                     if (cand) {
                         if (exactOnly && cand->quality != MatchQuality::ExactFull) continue;
                         cand->dict_id = DICT_ID_BUILTIN_WUBI;
@@ -552,7 +554,7 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
             auto activeStats = m_repo.GetActiveStats(InputScheme::Wubi86, scopedRecallKey);
             for (const auto& stat : activeStats) {
                 if (seenIds.count(stat.entry_id) == 0 && stat.entry_id.rfind("b_", 0) == 0) {
-                    auto cand = m_builtinDict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, stat.entry_id);
+                    auto cand = dict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, stat.entry_id);
                     if (cand) {
                         if (exactOnly && cand->quality != MatchQuality::ExactFull) continue;
                         cand->dict_id = DICT_ID_BUILTIN_WUBI;
@@ -578,9 +580,9 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
                 dictionaryQueryCode.begin(), [](unsigned char c) { return std::tolower(c); });
             std::vector<Candidate> pinyinCands;
             if (res.scheme == InputScheme::Shuangpin) {
-                pinyinCands = m_builtinDict.QueryPinyinExplicit(res.syllables, res.trailing_initial, res.is_complete);
+                pinyinCands = dict.QueryPinyinExplicit(res.syllables, res.trailing_initial, res.is_complete);
             } else {
-                pinyinCands = m_builtinDict.QueryPinyin(dictionaryQueryCode, m_pinyinSegmenter);
+                pinyinCands = dict.QueryPinyin(dictionaryQueryCode, m_pinyinSegmenter);
             }
             std::unordered_set<std::string> seenIds;
             for (auto& c : pinyinCands) {
@@ -602,14 +604,14 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
             auto pinnedPrefs = m_repo.GetPinnedPreferences(recallScheme, scopedRecallKey);
             for (const auto& pref : pinnedPrefs) {
                 if (seenIds.count(pref.entry_id) == 0 && pref.entry_id.rfind("b_", 0) == 0) {
-                    auto cand = m_builtinDict.GetCandidateById(InputScheme::Pinyin, dictionaryQueryCode, pref.entry_id);
+                    auto cand = dict.GetCandidateById(InputScheme::Pinyin, dictionaryQueryCode, pref.entry_id);
                     if (cand) {
                         if (!res.is_complete && cand->quality == MatchQuality::ExactFull) {
                             cand->quality = MatchQuality::PrefixCompletion;
                         }
                         if (exactOnly && cand->quality != MatchQuality::ExactFull) continue;
                         if (res.scheme == InputScheme::Shuangpin && !res.syllables.empty()) {
-                            if (!m_builtinDict.CheckPinyinItemMatchesSyllables(cand->entry_id, res.syllables, res.trailing_initial, res.is_complete)) {
+                            if (!dict.CheckPinyinItemMatchesSyllables(cand->entry_id, res.syllables, res.trailing_initial, res.is_complete)) {
                                 continue;
                             }
                         }
@@ -630,14 +632,14 @@ InputCoordinator::QuerySingleDictionary(const std::string& dictId,
             auto activeStats = m_repo.GetActiveStats(recallScheme, scopedRecallKey);
             for (const auto& stat : activeStats) {
                 if (seenIds.count(stat.entry_id) == 0 && stat.entry_id.rfind("b_", 0) == 0) {
-                    auto cand = m_builtinDict.GetCandidateById(InputScheme::Pinyin, dictionaryQueryCode, stat.entry_id);
+                    auto cand = dict.GetCandidateById(InputScheme::Pinyin, dictionaryQueryCode, stat.entry_id);
                     if (cand) {
                         if (!res.is_complete && cand->quality == MatchQuality::ExactFull) {
                             cand->quality = MatchQuality::PrefixCompletion;
                         }
                         if (exactOnly && cand->quality != MatchQuality::ExactFull) continue;
                         if (res.scheme == InputScheme::Shuangpin && !res.syllables.empty()) {
-                            if (!m_builtinDict.CheckPinyinItemMatchesSyllables(cand->entry_id, res.syllables, res.trailing_initial, res.is_complete)) {
+                            if (!dict.CheckPinyinItemMatchesSyllables(cand->entry_id, res.syllables, res.trailing_initial, res.is_complete)) {
                                 continue;
                             }
                         }
@@ -752,16 +754,18 @@ bool InputCoordinator::IsEntryValidForScope(InputScheme scheme,
 
     // 1. Check builtin dictionary candidates (identified by stable b_ prefix)
     if (entryId.rfind("b_", 0) == 0) {
+        auto dictSnap = AcquireBuiltinDict();
+        const BuiltinDictionary& dict = *dictSnap;
         for (const auto& res : resolutions) {
             if (res.scheme == InputScheme::Wubi86) {
-                auto bCand = m_builtinDict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, entryId);
+                auto bCand = dict.GetCandidateById(InputScheme::Wubi86, res.resolved_code, entryId);
                 if (bCand.has_value()) return true;
             } else if (res.scheme == InputScheme::Pinyin || res.scheme == InputScheme::Shuangpin) {
                 std::string dictCode = (res.scheme == InputScheme::Pinyin) ? res.raw_code : res.resolved_code;
-                auto bCand = m_builtinDict.GetCandidateById(InputScheme::Pinyin, dictCode, entryId);
+                auto bCand = dict.GetCandidateById(InputScheme::Pinyin, dictCode, entryId);
                 if (bCand.has_value()) {
                     if (res.scheme == InputScheme::Shuangpin && !res.syllables.empty()) {
-                        if (!m_builtinDict.CheckPinyinItemMatchesSyllables(entryId, res.syllables, res.trailing_initial, res.is_complete)) {
+                        if (!dict.CheckPinyinItemMatchesSyllables(entryId, res.syllables, res.trailing_initial, res.is_complete)) {
                             continue;
                         }
                     }
@@ -883,12 +887,15 @@ InputCoordinator::Query(const std::string& rawCode,
         if (m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) needsPinyin = true;
     }
 
-    if (policySnapshot->IsDictEnabled(DICT_ID_BUILTIN_WUBI) && needsWubi && m_builtinDict.WubiEntryCount() == 0) {
+    auto dictSnap = AcquireBuiltinDict();
+    const BuiltinDictionary& dict = *dictSnap;
+
+    if (policySnapshot->IsDictEnabled(DICT_ID_BUILTIN_WUBI) && needsWubi && dict.WubiEntryCount() == 0) {
         result.status = CoordinatorStatus::DictLoadError;
         result.error_message = "Builtin wubi dictionary is enabled but not loaded";
         return result;
     }
-    if (policySnapshot->IsDictEnabled(DICT_ID_BUILTIN_PINYIN) && needsPinyin && m_builtinDict.PinyinEntryCount() == 0) {
+    if (policySnapshot->IsDictEnabled(DICT_ID_BUILTIN_PINYIN) && needsPinyin && dict.PinyinEntryCount() == 0) {
         result.status = CoordinatorStatus::DictLoadError;
         result.error_message = "Builtin pinyin dictionary is enabled but not loaded";
         return result;
@@ -1074,7 +1081,7 @@ InputCoordinator::Query(const std::string& rawCode,
             if (canUseBuiltinPinyin || canUseCustom) {
                 for (const auto& m : methods) {
                     if ((m.scheme == InputScheme::Pinyin || m.scheme == InputScheme::Shuangpin) && m.syllables.size() >= 2) {
-                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, m_repo, m_clock,
+                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, dict, m_repo, m_clock,
                                                                    canUseBuiltinPinyin, canUseCustom, freqEnabled);
                         if (dec.has_value()) {
                             std::string sentenceDictId = canUseBuiltinPinyin ? DICT_ID_BUILTIN_PINYIN : DICT_ID_CUSTOM;
@@ -1208,7 +1215,7 @@ InputCoordinator::Query(const std::string& rawCode,
                          result.candidates[0].text.length() >= m.syllables.size());
 
                     if (!hasFullExact) {
-                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, m_builtinDict, m_repo, m_clock,
+                        auto dec = SentenceDecoder::DecodeSentence(m.syllables, dict, m_repo, m_clock,
                                                                    canUseBuiltinPinyin, canUseCustom, freqEnabled);
                         if (dec.has_value()) {
                             std::string sentenceDictId = canUseBuiltinPinyin ? DICT_ID_BUILTIN_PINYIN : DICT_ID_CUSTOM;
@@ -1375,7 +1382,8 @@ bool InputCoordinator::CommitCandidate(const Candidate& candidate,
         if (candidate.scheme == InputScheme::Pinyin && cleanCode.find('\'') != std::string::npos) {
             allCodes.push_back({ InputScheme::Pinyin, cleanCode });
         }
-        auto wubiCodes = m_builtinDict.ReverseLookupWubi(candidate.text);
+        auto dictSnap = AcquireBuiltinDict();
+        auto wubiCodes = dictSnap->ReverseLookupWubi(candidate.text);
         if (!wubiCodes.empty()) {
             allCodes.push_back({ InputScheme::Wubi86, wubiCodes[0] });
         }
@@ -1503,8 +1511,10 @@ InputCoordinator::ReverseLookup(const std::wstring& text,
     }
 
     // 2. Check BuiltinDictionary for whole-word (整词) match
+    auto dictSnap = AcquireBuiltinDict();
+    const BuiltinDictionary& dict = *dictSnap;
     if (targetScheme == InputScheme::Wubi86) {
-        auto wubiCodes = m_builtinDict.ReverseLookupWubi(text);
+        auto wubiCodes = dict.ReverseLookupWubi(text);
         if (!wubiCodes.empty()) {
             result.found = true;
             result.is_phrase = true;
@@ -1513,7 +1523,7 @@ InputCoordinator::ReverseLookup(const std::wstring& text,
             return result;
         }
     } else if (targetScheme == InputScheme::Pinyin) {
-        auto pyCodes = m_builtinDict.ReverseLookupPinyin(text);
+        auto pyCodes = dict.ReverseLookupPinyin(text);
         if (!pyCodes.empty()) {
             result.found = true;
             result.is_phrase = true;
@@ -1523,7 +1533,7 @@ InputCoordinator::ReverseLookup(const std::wstring& text,
         }
     } else if (targetScheme == InputScheme::Shuangpin) {
         const auto& decoder = GetShuangpinDecoder(spLayout);
-        auto spCodes = m_builtinDict.ReverseLookupShuangpin(text, decoder);
+        auto spCodes = dict.ReverseLookupShuangpin(text, decoder);
         if (!spCodes.empty()) {
             result.found = true;
             result.is_phrase = true;

@@ -611,8 +611,9 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             data["active_policy_revision"] = p ? p->revision : 1;
             data["db_path"] = m_engine.GetDb().GetPath();
             data["user_entry_count"] = m_engine.GetRepo() ? m_engine.GetRepo()->GetAllEntries().size() : 0;
-            data["wubi_entry_count"] = m_engine.GetBuiltinDict().WubiEntryCount();
-            data["pinyin_entry_count"] = m_engine.GetBuiltinDict().PinyinEntryCount();
+            auto dictSnap = m_engine.GetBuiltinDictSnapshot();
+            data["wubi_entry_count"] = dictSnap ? dictSnap->WubiEntryCount() : 0;
+            data["pinyin_entry_count"] = dictSnap ? dictSnap->PinyinEntryCount() : 0;
             data["has_pending_commits"] = m_engine.GetRepo() ? m_engine.GetRepo()->HasAnyPendingCommits() : false;
 
             {
@@ -737,9 +738,10 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             }
 
             // Include matching system built-in entries when searching with a keyword
-            if (!keyword.empty() && m_engine.GetBuiltinDict().IsLoaded()) {
+            auto dictSnap = m_engine.GetBuiltinDictSnapshot();
+            if (!keyword.empty() && dictSnap && dictSnap->IsLoaded()) {
                 std::wstring wKw = Utf8ToWide(keyword);
-                auto builtinMatches = m_engine.GetBuiltinDict().SearchEntries(wKw, keyword, 100);
+                auto builtinMatches = dictSnap->SearchEntries(wKw, keyword, 100);
                 for (const auto& be : builtinMatches) {
                     bool alreadyIn = false;
                     for (const auto& fe : filtered) {
@@ -1004,7 +1006,8 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
                 if (userEntry && !userEntry->text.empty()) {
                     textUtf8 = WideToUtf8(userEntry->text);
                 } else {
-                    auto textOpt = m_engine.GetBuiltinDict().GetTextById(pref.entry_id);
+                    auto dictSnap = m_engine.GetBuiltinDictSnapshot();
+                    auto textOpt = dictSnap ? dictSnap->GetTextById(pref.entry_id) : std::nullopt;
                     if (textOpt) {
                         textUtf8 = WideToUtf8(*textOpt);
                     }

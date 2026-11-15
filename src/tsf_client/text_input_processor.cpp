@@ -14,56 +14,228 @@
 #include "receipt_retry.h"
 #include <cstdarg>
 #include <cstdio>
+#include <atomic>
 
-// [DEBUG-SHIFT-LOG] Set to 0 (or remove) to disable Shift-tap diagnostics
-#define PERSONALIME_DEBUG_SHIFT_LOG 0
-#if PERSONALIME_DEBUG_SHIFT_LOG
-static void ShiftDebugLog(const char* fmt, ...) {
-    char msg[512];
-    va_list args;
-    va_start(args, fmt);
-    int n = std::vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-    if (n <= 0) return;
+// [DEBUG-TSF-LOG] Set to 1 to enable bounded non-blocking TSF diagnostics (%TEMP%\personalime_tsf_debug.log)
+#ifndef PERSONALIME_DEBUG_TSF_LOG
+#define PERSONALIME_DEBUG_TSF_LOG 0
+#endif
+#if PERSONALIME_DEBUG_TSF_LOG
+namespace {
+class BoundedTsfLogger {
+public:
+    static constexpr size_t kSlots = 512;
+    static constexpr size_t kSlotBytes = 256;
 
-    SYSTEMTIME st{};
-    GetLocalTime(&st);
-    char line[640];
-    int len = std::snprintf(
-        line, sizeof(line),
-        "[%02u:%02u:%02u.%03u][pid=%lu tid=%lu] %s\r\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-        static_cast<unsigned long>(GetCurrentProcessId()),
-        static_cast<unsigned long>(GetCurrentThreadId()),
-        msg);
-    if (len <= 0) return;
+    static BoundedTsfLogger& Instance() {
+        static BoundedTsfLogger inst;
+        return inst;
+    }
 
-    OutputDebugStringA(line);
-    char tempDir[MAX_PATH]{};
-    DWORD dirLen = GetTempPathA(MAX_PATH, tempDir);
-    if (dirLen > 0 && dirLen < MAX_PATH - 32) {
-        char logPath[MAX_PATH]{};
-        std::snprintf(logPath, sizeof(logPath), "%spersonalime_shift_debug.log", tempDir);
-        HANDLE hFile = CreateFileA(
-            logPath,
-            FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            nullptr,
-            OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD written = 0;
-            WriteFile(hFile, line, static_cast<DWORD>(len), &written, nullptr);
-            CloseHandle(hFile);
+    void Push(const char* fmt, ...) noexcept {
+        if (m_shuttingDown.load(std::memory_order_acquire)) {
+            return;
+        }
+        char msg[180];
+        va_list args;
+        va_start(args, fmt);
+        int n = std::vsnprintf(msg, sizeof(msg), fmt, args);
+        va_end(args);
+        if (n <= 0) return;
+
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+
+        AcquireSRWLockExclusive(&m_lock);
+        if (!m_shuttingDown.load(std::memory_order_relaxed)) {
+            EnsureStartedLocked();
+            char* slot = m_ring[m_tail];
+            int len = std::snprintf(
+                slot, kSlotBytes,
+                "[%02u:%02u:%02u.%03u][pid=%lu tid=%lu] %s\r\n",
+                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                static_cast<unsigned long>(GetCurrentProcessId()),
+                static_cast<unsigned long>(GetCurrentThreadId()),
+                msg);
+            if (len > 0) {
+                m_tail = (m_tail + 1) % kSlots;
+                if (m_count == kSlots) {
+                    m_head = (m_head + 1) % kSlots; // Bounded ring: drop oldest, never block input thread
+                } else {
+                    ++m_count;
+                }
+                if (m_wakeEvent != nullptr) {
+                    SetEvent(m_wakeEvent);
+                }
+            }
+        }
+        ReleaseSRWLockExclusive(&m_lock);
+    }
+
+    void RequestShutdownAsync() noexcept {
+        m_shuttingDown.store(true, std::memory_order_release);
+        HANDLE wake = m_wakeEvent;
+        if (wake != nullptr) {
+            SetEvent(wake);
         }
     }
+
+    bool IsHoldingDllRef() const noexcept {
+        return m_holdingDllRef.load(std::memory_order_acquire);
+    }
+
+private:
+    BoundedTsfLogger() = default;
+    ~BoundedTsfLogger() {
+        // Never wait/join on a background thread during static destruction / DLL unload (loader lock hazard).
+        RequestShutdownAsync();
+    }
+
+    void EnsureStartedLocked() {
+        if (m_workerRunning || m_shuttingDown.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (m_wakeEvent == nullptr) {
+            m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (m_wakeEvent == nullptr) {
+                return;
+            }
+        }
+
+        HMODULE hKeepAlive = nullptr;
+        if (g_hInst != nullptr) {
+            if (!GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                    reinterpret_cast<LPCWSTR>(&WriterThreadProc),
+                    &hKeepAlive) ||
+                hKeepAlive == nullptr) {
+                return;
+            }
+            DllAddRef();
+            m_holdingDllRef.store(true, std::memory_order_release);
+        }
+
+        m_workerRunning = true;
+        HANDLE hThread = CreateThread(nullptr, 0, &WriterThreadProc, hKeepAlive, 0, nullptr);
+        if (hThread != nullptr) {
+            CloseHandle(hThread);
+        } else {
+            m_workerRunning = false;
+            if (hKeepAlive != nullptr) {
+                m_holdingDllRef.store(false, std::memory_order_release);
+                DllRelease();
+                FreeLibrary(hKeepAlive);
+            }
+        }
+    }
+
+    static DWORD WINAPI WriterThreadProc(LPVOID param) {
+        HMODULE hKeepAlive = static_cast<HMODULE>(param);
+        Instance().WriterLoop();
+        if (hKeepAlive != nullptr) {
+            Instance().m_holdingDllRef.store(false, std::memory_order_release);
+            DllRelease();
+            FreeLibraryAndExitThread(hKeepAlive, 0);
+        }
+        return 0;
+    }
+
+    void WriterLoop() {
+        char tempDir[MAX_PATH]{};
+        char logPath[MAX_PATH]{};
+        DWORD dirLen = GetTempPathA(MAX_PATH, tempDir);
+        if (dirLen > 0 && dirLen < MAX_PATH - 32) {
+            std::snprintf(logPath, sizeof(logPath), "%spersonalime_tsf_debug.log", tempDir);
+        }
+
+        char batch[64][kSlotBytes];
+        for (;;) {
+            size_t n = 0;
+            bool shouldExit = false;
+
+            AcquireSRWLockExclusive(&m_lock);
+            while (m_count > 0 && n < 64) {
+                std::memcpy(batch[n], m_ring[m_head], kSlotBytes);
+                m_head = (m_head + 1) % kSlots;
+                --m_count;
+                ++n;
+            }
+            if (n == 0 && m_shuttingDown.load(std::memory_order_acquire)) {
+                m_workerRunning = false;
+                shouldExit = true;
+            }
+            ReleaseSRWLockExclusive(&m_lock);
+
+            if (shouldExit) {
+                break;
+            }
+
+            if (n > 0) {
+                if (logPath[0] != '\0') {
+                    HANDLE hFile = CreateFileA(
+                        logPath,
+                        FILE_APPEND_DATA,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr,
+                        OPEN_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        nullptr);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        for (size_t i = 0; i < n; ++i) {
+                            DWORD len = static_cast<DWORD>(std::strlen(batch[i]));
+                            DWORD written = 0;
+                            WriteFile(hFile, batch[i], len, &written, nullptr);
+                        }
+                        CloseHandle(hFile);
+                    }
+                }
+                continue;
+            }
+
+            DWORD waitRes = WaitForSingleObject(m_wakeEvent, 200);
+            if (waitRes == WAIT_TIMEOUT) {
+                AcquireSRWLockExclusive(&m_lock);
+                if (m_count == 0) {
+                    m_workerRunning = false;
+                    shouldExit = true;
+                }
+                ReleaseSRWLockExclusive(&m_lock);
+                if (shouldExit) {
+                    break;
+                }
+            }
+        }
+    }
+
+    SRWLOCK m_lock = SRWLOCK_INIT;
+    HANDLE m_wakeEvent = nullptr;
+    char m_ring[kSlots][kSlotBytes]{};
+    size_t m_head = 0;
+    size_t m_tail = 0;
+    size_t m_count = 0;
+    bool m_workerRunning = false;
+    std::atomic<bool> m_shuttingDown{false};
+    std::atomic<bool> m_holdingDllRef{false};
+};
+} // namespace
+void ShutdownTsfDebugLoggerAsync() noexcept {
+    BoundedTsfLogger::Instance().RequestShutdownAsync();
 }
-#define SHIFT_DBG(...) ShiftDebugLog(__VA_ARGS__)
+bool IsTsfDebugLoggerHoldingDllRef() noexcept {
+    return BoundedTsfLogger::Instance().IsHoldingDllRef();
+}
+#define TSF_DBG(...) BoundedTsfLogger::Instance().Push(__VA_ARGS__)
+#define TSF_DBG_TIMER_START() auto tsfDbgStart = std::chrono::steady_clock::now()
+#define TSF_DBG_ELAPSED_US() static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tsfDbgStart).count())
 #else
-#define SHIFT_DBG(...) ((void)0)
+void ShutdownTsfDebugLoggerAsync() noexcept {}
+bool IsTsfDebugLoggerHoldingDllRef() noexcept { return false; }
+#define TSF_DBG(...) ((void)0)
+#define TSF_DBG_TIMER_START() ((void)0)
+#define TSF_DBG_ELAPSED_US() 0LL
 #endif
-// [/DEBUG-SHIFT-LOG]
+#define SHIFT_DBG(...) TSF_DBG(__VA_ARGS__)
+// [/DEBUG-TSF-LOG]
 
 static LONG64 s_sessionCounter = 0;
 static std::mutex s_liveOwnersMutex;
@@ -2153,6 +2325,10 @@ void CTextInputProcessor::UpdateShiftKeyState(WPARAM wParam, LPARAM lParam, bool
 
 STDMETHODIMP CTextInputProcessor::OnSetFocus(BOOL fForeground) {
     m_hasFocus = (fForeground != FALSE);
+    TSF_DBG("OnSetFocus fg=%d activeCtx=0x%llX compCtx=0x%llX",
+            fForeground ? 1 : 0,
+            static_cast<unsigned long long>(m_activeContextId),
+            static_cast<unsigned long long>(m_compositionContextId));
     if (!fForeground) {
         ResetShiftTapState();
         if (m_activeContextId != 0) {
@@ -2758,6 +2934,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
     }
     req.candidate_version = currentCandVer;
 
+    TSF_DBG_TIMER_START();
     IpcKeyResponse resp{};
     bool sentOk = m_ipcClient.SendRequest(req, resp, 80);
     if (sentOk && !resp.handled &&
@@ -2769,8 +2946,15 @@ bool CTextInputProcessor::ProcessKeyInternal(
         sentOk = m_ipcClient.SendRequest(req, resp, 80);
     }
     if (isShiftTap) {
-        SHIFT_DBG("ProcessKeyInternal SHIFT_TAP sentOk=%d handled=%u flags=0x%X hasCommit=%u hasComp=%u",
-                  sentOk ? 1 : 0, resp.handled, resp.status_flags, resp.has_commit, resp.has_composition);
+        TSF_DBG("ProcessKeyInternal SHIFT_TAP ctx=0x%llX gen=%llu us=%lld sentOk=%d handled=%u flags=0x%X hr=0x%08lX",
+                static_cast<unsigned long long>(contextId),
+                static_cast<unsigned long long>(GetContextInputGeneration(contextId)),
+                TSF_DBG_ELAPSED_US(),
+                sentOk ? 1 : 0, resp.handled, resp.status_flags, static_cast<unsigned long>(S_OK));
+    } else if (!sentOk) {
+        TSF_DBG("ProcessKeyInternal IPC_FAIL vk=0x%X ctx=0x%llX us=%lld hr=0x%08lX",
+                static_cast<unsigned>(wParam), static_cast<unsigned long long>(contextId),
+                TSF_DBG_ELAPSED_US(), static_cast<unsigned long>(E_FAIL));
     }
     if (sentOk) {
         if (!resp.handled) {
