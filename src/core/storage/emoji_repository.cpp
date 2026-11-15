@@ -14,17 +14,63 @@ std::string NormalizeCodeKey(const std::string& s) {
     return out;
 }
 
+bool CountUtf16UnitsStrict(const std::string& utf8, size_t& outUnits) {
+    outUnits = 0;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8.data());
+    size_t i = 0, n = utf8.size();
+    while (i < n) {
+        unsigned char c = p[i];
+        uint32_t cp = 0;
+        size_t seqLen = 0;
+        if (c == 0) {
+            return false; // Embedded NUL forbidden
+        } else if (c < 0x80) {
+            cp = c;
+            seqLen = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            if (i + 1 >= n || (p[i + 1] & 0xC0) != 0x80) return false;
+            cp = ((c & 0x1F) << 6) | (p[i + 1] & 0x3F);
+            if (cp < 0x80) return false;
+            seqLen = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            if (i + 2 >= n || (p[i + 1] & 0xC0) != 0x80 || (p[i + 2] & 0xC0) != 0x80) return false;
+            cp = ((c & 0x0F) << 12) | ((p[i + 1] & 0x3F) << 6) | (p[i + 2] & 0x3F);
+            if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+            seqLen = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            if (i + 3 >= n || (p[i + 1] & 0xC0) != 0x80 || (p[i + 2] & 0xC0) != 0x80 || (p[i + 3] & 0xC0) != 0x80) return false;
+            cp = ((c & 0x07) << 18) | ((p[i + 1] & 0x3F) << 12) | ((p[i + 2] & 0x3F) << 6) | (p[i + 3] & 0x3F);
+            if (cp < 0x10000 || cp > 0x10FFFF) return false;
+            seqLen = 4;
+        } else {
+            return false;
+        }
+        outUnits += (cp > 0xFFFF) ? 2 : 1;
+        i += seqLen;
+    }
+    return true;
+}
+
 bool ValidateRecord(const EmojiMappingRecord& rec, std::string& normKey, std::string* errorOut) {
     if (rec.trigger_type != "code" && rec.trigger_type != "text") {
         if (errorOut) *errorOut = "trigger_type must be 'code' or 'text'";
         return false;
     }
-    if (rec.trigger_key.empty()) {
-        if (errorOut) *errorOut = "trigger_key cannot be empty";
+    if (rec.trigger_key.empty() || rec.trigger_key.find('\0') != std::string::npos) {
+        if (errorOut) *errorOut = "trigger_key cannot be empty or contain NUL";
         return false;
     }
-    if (rec.emoji.empty()) {
-        if (errorOut) *errorOut = "emoji cannot be empty";
+    if (rec.emoji.empty() || rec.emoji.find('\0') != std::string::npos) {
+        if (errorOut) *errorOut = "emoji cannot be empty or contain NUL";
+        return false;
+    }
+    size_t utf16Units = 0;
+    if (!CountUtf16UnitsStrict(rec.emoji, utf16Units) || utf16Units == 0 ||
+        utf16Units > EmojiRepository::kMaxEmojiUtf16Units) {
+        if (errorOut) {
+            *errorOut = "emoji must be valid UTF-8 and at most " +
+                        std::to_string(EmojiRepository::kMaxEmojiUtf16Units) + " UTF-16 code units";
+        }
         return false;
     }
     normKey = (rec.trigger_type == "code") ? NormalizeCodeKey(rec.trigger_key) : rec.trigger_key;
@@ -47,6 +93,24 @@ EmojiMappingRecord ReadRow(Statement& stmt) {
 } // namespace
 
 EmojiRepository::EmojiRepository(SqliteDb& db) : m_db(db) {}
+
+bool EmojiRepository::IsAssociationEnabled() {
+    auto stmt = m_db.Prepare("SELECT value FROM meta_settings WHERE key = 'emoji_association_enabled';");
+    if (!stmt) return true;
+    if (stmt->Step()) {
+        return stmt->ColumnText(0) != "0";
+    }
+    return true;
+}
+
+bool EmojiRepository::SetAssociationEnabled(bool enabled) {
+    auto stmt = m_db.Prepare("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('emoji_association_enabled', ?);");
+    if (!stmt) return false;
+    stmt->BindText(1, enabled ? "1" : "0");
+    if (!stmt->Execute()) return false;
+    BumpRevision();
+    return true;
+}
 
 bool EmojiRepository::GetAllMappings(std::vector<EmojiMappingRecord>& outMappings, bool onlyEnabled) {
     outMappings.clear();

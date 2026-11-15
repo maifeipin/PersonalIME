@@ -458,15 +458,16 @@ public class AdminIpcClient : IAdminClient
         await SendRequestAsync("ClearPluginLogs", p, ct);
     }
 
-    public async Task<List<EmojiMappingModel>> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+    public async Task<EmojiMappingsResult> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
     {
         var p = new JsonObject { ["only_enabled"] = onlyEnabled };
         var data = await SendRequestAsync("GetEmojiMappings", p, ct);
-        if (data.TryGetProperty("mappings", out var prop))
-        {
-            return JsonSerializer.Deserialize<List<EmojiMappingModel>>(prop.GetRawText()) ?? [];
-        }
-        return [];
+        return JsonSerializer.Deserialize<EmojiMappingsResult>(data.GetRawText()) ?? new();
+    }
+
+    public async Task SetEmojiAssociationEnabledAsync(bool enabled, CancellationToken ct = default)
+    {
+        await SendRequestAsync("SetEmojiAssociationEnabled", new { enabled }, ct);
     }
 
     public async Task<long> AddEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default)

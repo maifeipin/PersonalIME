@@ -31,7 +31,8 @@ public interface IAdminClient
     Task ExecutePluginAsync(long id, CancellationToken ct = default);
     Task<List<PluginLogModel>> GetPluginLogsAsync(long? pluginId = null, int limit = 50, CancellationToken ct = default);
     Task ClearPluginLogsAsync(long? pluginId = null, CancellationToken ct = default);
-    Task<List<EmojiMappingModel>> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default);
+    Task<EmojiMappingsResult> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default);
+    Task SetEmojiAssociationEnabledAsync(bool enabled, CancellationToken ct = default);
     Task<long> AddEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default);
     Task UpdateEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default);
     Task DeleteEmojiMappingAsync(long id, CancellationToken ct = default);

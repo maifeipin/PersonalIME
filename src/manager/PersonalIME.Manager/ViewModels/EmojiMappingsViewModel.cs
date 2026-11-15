@@ -17,6 +17,8 @@ public class EmojiMappingsViewModel : ViewModelBase
     private string _editLabel = string.Empty;
     private int _editPriority = 200;
     private bool _editEnabled = true;
+    private bool _isAssociationEnabled = true;
+    private bool _suppressToggleCallback;
     private bool _isLoading;
 
     public EmojiMappingsViewModel(IAdminClient client, NotificationBanner banner)
@@ -91,6 +93,18 @@ public class EmojiMappingsViewModel : ViewModelBase
         set => SetProperty(ref _editEnabled, value);
     }
 
+    public bool IsAssociationEnabled
+    {
+        get => _isAssociationEnabled;
+        set
+        {
+            if (SetProperty(ref _isAssociationEnabled, value) && !_suppressToggleCallback)
+            {
+                _ = SaveAssociationEnabledAsync(value);
+            }
+        }
+    }
+
     public bool IsLoading
     {
         get => _isLoading;
@@ -108,9 +122,12 @@ public class EmojiMappingsViewModel : ViewModelBase
         IsLoading = true;
         try
         {
-            var list = await _client.GetEmojiMappingsAsync();
+            var res = await _client.GetEmojiMappingsAsync();
+            _suppressToggleCallback = true;
+            IsAssociationEnabled = res.AssociationEnabled;
+            _suppressToggleCallback = false;
             Mappings.Clear();
-            foreach (var item in list)
+            foreach (var item in res.Mappings)
             {
                 Mappings.Add(item);
             }
@@ -190,6 +207,20 @@ public class EmojiMappingsViewModel : ViewModelBase
         catch (Exception ex)
         {
             _banner.ShowError($"删除表情联想规则失败: {ex.Message}");
+        }
+    }
+
+    private async Task SaveAssociationEnabledAsync(bool enabled)
+    {
+        if (!_client.IsConnected) return;
+        try
+        {
+            await _client.SetEmojiAssociationEnabledAsync(enabled);
+            _banner.ShowSuccess(enabled ? "已开启打字流末尾表情联想。" : "已关闭打字流末尾表情联想。");
+        }
+        catch (Exception ex)
+        {
+            _banner.ShowError($"更新表情联想开关失败: {ex.Message}");
         }
     }
 }

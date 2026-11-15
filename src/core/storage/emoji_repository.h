@@ -21,10 +21,15 @@ struct EmojiMappingRecord {
 
 class EmojiRepository {
 public:
+    static constexpr size_t kMaxEmojiUtf16Units = 120;
+
     explicit EmojiRepository(SqliteDb& db);
 
     uint64_t GetRevision() const { return m_revision.load(std::memory_order_acquire); }
     void BumpRevision() { m_revision.fetch_add(1, std::memory_order_acq_rel); }
+
+    bool IsAssociationEnabled();
+    bool SetAssociationEnabled(bool enabled);
 
     bool GetAllMappings(std::vector<EmojiMappingRecord>& outMappings, bool onlyEnabled = false);
     bool GetMappingById(int64_t id, EmojiMappingRecord& outMapping);

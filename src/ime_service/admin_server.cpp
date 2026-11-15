@@ -1578,6 +1578,26 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             }
             nlohmann::json data;
             data["mappings"] = arr;
+            data["association_enabled"] = m_engine.GetEmojiRepo()->IsAssociationEnabled();
+            data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        if (action == "SetEmojiAssociationEnabled" || action == "set_emoji_association_enabled") {
+            if (!m_engine.GetEmojiRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Emoji repository unavailable");
+            }
+            bool enabled = true;
+            std::string err;
+            if (!CheckBoolField(params, "enabled", enabled, true, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            if (!m_engine.GetEmojiRepo()->SetAssociationEnabled(enabled)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to save emoji association setting");
+            }
+            nlohmann::json data;
+            data["success"] = true;
+            data["association_enabled"] = m_engine.GetEmojiRepo()->IsAssociationEnabled();
             data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
             return MakeSuccessResponse(action, requestId, data);
         }

@@ -14,6 +14,7 @@
                 <DockPanel DockPanel.Dock="Top" Margin="0,0,0,12">
                     <TextBlock Text="候选框末尾表情联想规则（每页 5 项时为 4 词 + 1 表情）" FontSize="14" FontWeight="SemiBold" Foreground="#111827" VerticalAlignment="Center"/>
                     <Button Content="刷新" Command="{Binding RefreshCommand}" DockPanel.Dock="Right" Padding="12,5" Margin="8,0,0,0"/>
+                    <CheckBox Content="启用表情联想" IsChecked="{Binding IsAssociationEnabled}" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0"/>
                 </DockPanel>
 
                 <DataGrid ItemsSource="{Binding Mappings}"

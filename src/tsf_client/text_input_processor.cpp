@@ -74,10 +74,12 @@ public:
 
     void RequestShutdownAsync() noexcept {
         m_shuttingDown.store(true, std::memory_order_release);
+        AcquireSRWLockShared(&m_lock);
         HANDLE wake = m_wakeEvent;
         if (wake != nullptr) {
             SetEvent(wake);
         }
+        ReleaseSRWLockShared(&m_lock);
     }
 
     bool IsHoldingDllRef() const noexcept {
@@ -89,6 +91,12 @@ private:
     ~BoundedTsfLogger() {
         // Never wait/join on a background thread during static destruction / DLL unload (loader lock hazard).
         RequestShutdownAsync();
+        AcquireSRWLockExclusive(&m_lock);
+        if (!m_workerRunning && m_wakeEvent != nullptr) {
+            CloseHandle(m_wakeEvent);
+            m_wakeEvent = nullptr;
+        }
+        ReleaseSRWLockExclusive(&m_lock);
     }
 
     void EnsureStartedLocked() {
@@ -162,13 +170,15 @@ private:
             }
             if (n == 0 && m_shuttingDown.load(std::memory_order_acquire)) {
                 m_workerRunning = false;
-                shouldExit = true;
-            }
-            ReleaseSRWLockExclusive(&m_lock);
-
-            if (shouldExit) {
+                HANDLE hClose = m_wakeEvent;
+                m_wakeEvent = nullptr;
+                ReleaseSRWLockExclusive(&m_lock);
+                if (hClose != nullptr) {
+                    CloseHandle(hClose);
+                }
                 break;
             }
+            ReleaseSRWLockExclusive(&m_lock);
 
             if (n > 0) {
                 if (logPath[0] != '\0') {
@@ -197,12 +207,15 @@ private:
                 AcquireSRWLockExclusive(&m_lock);
                 if (m_count == 0) {
                     m_workerRunning = false;
-                    shouldExit = true;
-                }
-                ReleaseSRWLockExclusive(&m_lock);
-                if (shouldExit) {
+                    HANDLE hClose = m_wakeEvent;
+                    m_wakeEvent = nullptr;
+                    ReleaseSRWLockExclusive(&m_lock);
+                    if (hClose != nullptr) {
+                        CloseHandle(hClose);
+                    }
                     break;
                 }
+                ReleaseSRWLockExclusive(&m_lock);
             }
         }
     }
@@ -3095,6 +3108,7 @@ bool CTextInputProcessor::ProcessKeyInternal(
             if ((resp.status_flags & IPC_STATUS_HAS_CAND_CORES) != 0) {
                 constexpr size_t kCandCap = sizeof(resp.candidates[0]) / sizeof(wchar_t);
                 snap.candidate_core_texts.reserve(cands.size());
+                snap.candidate_types.reserve(cands.size());
                 for (uint32_t i = 0; i < resp.candidate_count && i < 9; ++i) {
                     size_t labelLen = wcsnlen(resp.candidates[i], kCandCap);
                     size_t prefixLen = 0;
@@ -3123,7 +3137,12 @@ bool CTextInputProcessor::ProcessKeyInternal(
                         // Boundary metadata omitted due to item length: strip only index prefix, do NOT guess-strip [...]
                         core = cands[i].substr(prefixLen);
                     }
+                    IpcCandidateType candType = IpcCandidateType::Normal;
+                    if (labelLen + 3 < kCandCap && resp.candidates[i][labelLen + 2] >= 1) {
+                        candType = static_cast<IpcCandidateType>(resp.candidates[i][labelLen + 2] - 1);
+                    }
                     snap.candidate_core_texts.push_back(std::move(core));
+                    snap.candidate_types.push_back(candType);
                 }
                 if (!snap.candidate_core_texts.empty() &&
                     snap.initial_selected_index >= 0 &&

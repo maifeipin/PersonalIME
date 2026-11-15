@@ -267,7 +267,7 @@ static uint32_t ComputeCandidatePageCount(const ContextState& st, uint32_t pageS
 static void RefreshEmojiMatches(ContextState& st) {
     st.matched_emojis.clear();
     st.emoji_mapping_revision = g_engine.GetEmojiRepo() ? g_engine.GetEmojiRepo()->GetRevision() : 0;
-    if (!g_engine.GetEmojiRepo() || st.current_query_code.empty()) {
+    if (!g_engine.GetEmojiRepo() || !g_engine.GetEmojiRepo()->IsAssociationEnabled() || st.current_query_code.empty()) {
         return;
     }
     std::string topCandUtf8;
@@ -1694,18 +1694,21 @@ void HandleClient(HANDLE hPipe) {
                         resp.handled = 1;
                     }
                     else if (vk >= '1' && vk <= static_cast<uint32_t>('0' + GetEffectivePageSize(state))) {
-                        bool staleSnapshot = false;
-                        if (!state.published_page_slots.empty()) {
-                            if (req.candidate_version != state.candidate_version) {
-                                staleSnapshot = true;
-                            } else if (g_engine.GetEmojiRepo() &&
-                                       state.emoji_mapping_revision != g_engine.GetEmojiRepo()->GetRevision()) {
-                                staleSnapshot = true;
-                            }
-                        }
+                        bool staleVersion = (!state.published_page_slots.empty() && req.candidate_version != state.candidate_version);
+                        bool emojiRevChanged = (!state.published_page_slots.empty() && g_engine.GetEmojiRepo() &&
+                                                state.emoji_mapping_revision != g_engine.GetEmojiRepo()->GetRevision());
 
-                        if (staleSnapshot) {
-                            resp.handled = 0; // Reject stale candidate or emoji-mapping snapshot selection
+                        if (staleVersion) {
+                            resp.handled = 0; // Reject stale candidate snapshot selection
+                        } else if (emojiRevChanged) {
+                            // Consume confirmation key, reject old selection, and publish refreshed page snapshot
+                            RefreshEmojiMatches(state);
+                            state.candidate_version++;
+                            resp.candidate_version = state.candidate_version;
+                            resp.has_composition = 1;
+                            wcsncpy_s(resp.composition, state.composition.c_str(), _TRUNCATE);
+                            PopulateCandidatesPage(resp, state);
+                            resp.handled = 1;
                         } else {
                             uint32_t slotIdx = (vk - '1');
                             if (slotIdx < state.published_page_slots.size()) {
@@ -1723,6 +1726,9 @@ void HandleClient(HANDLE hPipe) {
                                     cand.resolved_code = state.current_query_code;
                                 }
 
+                                bool payloadValid = (!cand.text.empty() &&
+                                                     cand.text.length() <= 1023 &&
+                                                     cand.text.find(L'\0') == std::wstring::npos);
                                 bool learningOn = isEmojiSlot
                                     ? false
                                     : (state.policy_snapshot ? state.policy_snapshot->learning_enabled : true);
@@ -1730,7 +1736,8 @@ void HandleClient(HANDLE hPipe) {
                                 uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
                                 bool stage7Req = (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
                                 uint64_t ownerId = stage7Req ? reqOwnerId : (reqOwnerId != 0 ? reqOwnerId : req.session_id);
-                                bool saved = (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
+                                bool saved = payloadValid &&
+                                             (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
                                              g_engine.SavePendingCommit(
                                                  std::to_string(evId),
                                                  req.session_id,
@@ -1796,18 +1803,20 @@ void HandleClient(HANDLE hPipe) {
                         }
                     }
                     else if (vk == VK_SPACE) {
-                        bool staleSnapshot = false;
-                        if (!state.published_page_slots.empty()) {
-                            if (req.candidate_version != state.candidate_version) {
-                                staleSnapshot = true;
-                            } else if (g_engine.GetEmojiRepo() &&
-                                       state.emoji_mapping_revision != g_engine.GetEmojiRepo()->GetRevision()) {
-                                staleSnapshot = true;
-                            }
-                        }
+                        bool staleVersion = (!state.published_page_slots.empty() && req.candidate_version != state.candidate_version);
+                        bool emojiRevChanged = (!state.published_page_slots.empty() && g_engine.GetEmojiRepo() &&
+                                                state.emoji_mapping_revision != g_engine.GetEmojiRepo()->GetRevision());
 
-                        if (staleSnapshot) {
-                            resp.handled = 0; // Reject stale candidate or emoji-mapping snapshot selection
+                        if (staleVersion) {
+                            resp.handled = 0; // Reject stale candidate snapshot selection
+                        } else if (emojiRevChanged) {
+                            RefreshEmojiMatches(state);
+                            state.candidate_version++;
+                            resp.candidate_version = state.candidate_version;
+                            resp.has_composition = 1;
+                            wcsncpy_s(resp.composition, state.composition.c_str(), _TRUNCATE);
+                            PopulateCandidatesPage(resp, state);
+                            resp.handled = 1;
                         } else {
                             if (!state.published_page_slots.empty()) {
                                 const auto& slot = state.published_page_slots[0];
@@ -1826,6 +1835,9 @@ void HandleClient(HANDLE hPipe) {
                                     }
                                     uint64_t evId = NextEventId();
 
+                                    bool payloadValid = (!cand.text.empty() &&
+                                                         cand.text.length() <= 1023 &&
+                                                         cand.text.find(L'\0') == std::wstring::npos);
                                     bool learningOn = isEmojiSlot
                                         ? false
                                         : (state.policy_snapshot ? state.policy_snapshot->learning_enabled : true);
@@ -1833,7 +1845,8 @@ void HandleClient(HANDLE hPipe) {
                                     uint64_t reqOwnerId = GetIpcRequestOwnerInstanceId(req);
                                     bool stage7Req = (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7);
                                     uint64_t ownerId = stage7Req ? reqOwnerId : (reqOwnerId != 0 ? reqOwnerId : req.session_id);
-                                    bool saved = (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
+                                    bool saved = payloadValid &&
+                                                 (!stage7Req || (req.context_epoch != 0 && ownerId != 0)) &&
                                                  g_engine.SavePendingCommit(
                                                      std::to_string(evId),
                                                      req.session_id,

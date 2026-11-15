@@ -4,6 +4,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include "../common/ipc_protocol.h"
 
 struct ITfContext;
 
@@ -70,6 +71,7 @@ struct CandidateDisplaySnapshot {
     std::wstring query_code;            // Normalized/segmented code (e.g. "da'jia")
     std::wstring preview_text;          // Currently highlighted candidate preview text (e.g. "大家")
     std::vector<std::wstring> candidate_core_texts; // Optional explicit core texts without index/hint
+    std::vector<IpcCandidateType> candidate_types;  // Explicit candidate source type per slot
 };
 
 class CCandidateWindow {

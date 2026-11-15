@@ -487,3 +487,12 @@ public class EmojiMappingModel
     public string TriggerTypeDisplay => TriggerType == "code" ? "编码" : "首选词";
 }
 
+public class EmojiMappingsResult
+{
+    [JsonPropertyName("association_enabled")]
+    public bool AssociationEnabled { get; set; } = true;
+
+    [JsonPropertyName("mappings")]
+    public List<EmojiMappingModel> Mappings { get; set; } = [];
+}
+

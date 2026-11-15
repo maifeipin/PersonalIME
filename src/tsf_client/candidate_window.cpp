@@ -1083,7 +1083,17 @@ void CCandidateWindow::LayoutAndShow(const CandidateDisplaySnapshot& snapshot, P
             SelectObject(hdc, hMeasureFont);
             RECT rcText = { 0, 0, 0, 0 };
             DrawTextW(hdc, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_CALCRECT | DT_SINGLELINE);
-            candWidths[i] = static_cast<int>(rcText.right - rcText.left);
+            int width = static_cast<int>(rcText.right - rcText.left);
+            bool isEmojiSlot = (i < m_snapshot.candidate_types.size() &&
+                                m_snapshot.candidate_types[i] == IpcCandidateType::Emoji);
+            if (isEmojiSlot) {
+                SelectObject(hdc, m_hSubFont ? m_hSubFont : m_hFont);
+                RECT rcBadge = { 0, 0, 0, 0 };
+                static constexpr wchar_t kEmojiBadge[] = L"[表情]";
+                DrawTextW(hdc, kEmojiBadge, 4, &rcBadge, DT_CALCRECT | DT_SINGLELINE);
+                width += ScaleDip(4) + static_cast<int>(rcBadge.right - rcBadge.left);
+            }
+            candWidths[i] = width;
             if (rcText.bottom - rcText.top > maxHeight) {
                 maxHeight = static_cast<int>(rcText.bottom - rcText.top);
             }
@@ -1814,9 +1824,29 @@ LRESULT CALLBACK CCandidateWindow::WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, 
                         SelectObject(memDC, hItemFont);
                     }
                 } else {
-                    SetTextColor(memDC, pal.candidateTextColor);
-                    RECT rcText = { curX, textY, textRight, clientRc.bottom };
-                    DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
+                    bool isEmojiSlot = (i < pThis->m_snapshot.candidate_types.size() &&
+                                        pThis->m_snapshot.candidate_types[i] == IpcCandidateType::Emoji);
+                    if (isEmojiSlot) {
+                        SetTextColor(memDC, pal.candidateTextColor);
+                        RECT rcText = { curX, textY, textRight, clientRc.bottom };
+                        DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
+
+                        RECT rcCalc = { 0, 0, 0, 0 };
+                        DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcCalc, DT_CALCRECT | DT_SINGLELINE);
+                        int badgeX = curX + (rcCalc.right - rcCalc.left) + pThis->ScaleDip(4);
+                        if (badgeX < textRight) {
+                            SelectObject(memDC, pThis->m_hSubFont ? pThis->m_hSubFont : pThis->m_hFont);
+                            RECT rcBadge = { badgeX, textY + pThis->ScaleDip(2), textRight, clientRc.bottom };
+                            SetTextColor(memDC, pal.reverseLookupColor);
+                            static constexpr wchar_t kEmojiBadge[] = L"[表情]";
+                            DrawTextW(memDC, kEmojiBadge, 4, &rcBadge, DT_SINGLELINE | DT_END_ELLIPSIS);
+                            SelectObject(memDC, hItemFont);
+                        }
+                    } else {
+                        SetTextColor(memDC, pal.candidateTextColor);
+                        RECT rcText = { curX, textY, textRight, clientRc.bottom };
+                        DrawTextW(memDC, cand.c_str(), static_cast<int>(cand.length()), &rcText, DT_SINGLELINE | DT_END_ELLIPSIS);
+                    }
                 }
             }
         }

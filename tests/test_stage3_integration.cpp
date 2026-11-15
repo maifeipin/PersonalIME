@@ -2930,7 +2930,13 @@ int main(int argc, char* argv[]) {
         // 23.3: Admin IPC AddEmojiMapping + 4+1 pagination carryover + stale snapshot rejection
         auto sendAdmin = [&](const std::string& jsonReq) -> std::string {
             std::wstring adminPipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(eAdminPipe);
-            HANDLE hAdmin = CreateFileW(adminPipeW.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            HANDLE hAdmin = INVALID_HANDLE_VALUE;
+            for (int attempt = 0; attempt < 25; ++attempt) {
+                hAdmin = CreateFileW(adminPipeW.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hAdmin != INVALID_HANDLE_VALUE) break;
+                WaitNamedPipeW(adminPipeW.c_str(), 50);
+                Sleep(10);
+            }
             if (hAdmin == INVALID_HANDLE_VALUE) return "";
             ime::AdminHeader hdr{};
             hdr.magic[0] = 'P'; hdr.magic[1] = 'I'; hdr.magic[2] = 'M'; hdr.magic[3] = 'A';
@@ -2976,24 +2982,73 @@ int main(int argc, char* argv[]) {
         for (char c : std::string("KAIXIN")) {
             CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Re-type kaixin");
         }
-        uint32_t staleVer = kr.candidate_version;
+        uint32_t preMutVer = kr.candidate_version;
         uint32_t kaixinLastSlot = kr.candidate_count - 1;
+
+        // 23.3a: Oversized emoji payload (>120 UTF-16 units) and embedded NUL must be rejected
+        std::string hugeEmoji(130, 'x');
+        std::string hugeAddResp = sendAdmin(
+            std::string(R"({"action":"AddEmojiMapping","protocol_version":1,"params":{"trigger_type":"code","trigger_key":"kaixin","emoji":")") +
+            hugeEmoji + R"(","label":"huge","priority":300,"enabled":true}})");
+        CHECK_TRUE(hugeAddResp.find("\"success\":false") != std::string::npos,
+                   L"Oversized emoji payload (>120 UTF-16 units) MUST be rejected");
+
+        std::string nulAddResp = sendAdmin(
+            R"({"action":"AddEmojiMapping","protocol_version":1,"params":{"trigger_type":"code","trigger_key":"kaixin","emoji":"a\u0000b","label":"nul","priority":300,"enabled":true}})");
+        CHECK_TRUE(nulAddResp.find("\"success\":false") != std::string::npos,
+                   L"Emoji payload with embedded NUL MUST be rejected");
+
+        // 23.3b: Valid AddEmojiMapping consumes confirmation key, rejects old selection, and refreshes page without retyping
         std::string addResp = sendAdmin(R"({"action":"AddEmojiMapping","protocol_version":1,"params":{"trigger_type":"code","trigger_key":"kaixin","emoji":"🤩","label":"star","priority":300,"enabled":true}})");
         CHECK_TRUE(addResp.find("\"success\":true") != std::string::npos, L"Admin AddEmojiMapping succeeds");
 
-        // Old snapshot version MUST be rejected after mapping change
-        IpcKeyResponse staleSel{};
-        CHECK_TRUE(sendKey(static_cast<uint32_t>('1' + kaixinLastSlot), staleVer, staleSel), L"Stale selection IPC returns");
-        CHECK_EQUAL(staleSel.handled, 0u, L"Selection with pre-mutation snapshot MUST be rejected (handled=0)");
+        IpcKeyResponse refreshed{};
+        CHECK_TRUE(sendKey(static_cast<uint32_t>('1' + kaixinLastSlot), preMutVer, refreshed), L"Confirm key after mutation IPC returns");
+        CHECK_EQUAL(refreshed.handled, 1u, L"Confirmation key is consumed (handled=1, not leaked to host)");
+        CHECK_EQUAL(refreshed.has_commit, 0u, L"Old selection is NOT committed (has_commit=0)");
+        CHECK_TRUE(refreshed.candidate_version != preMutVer, L"Server published a new candidate_version");
+        uint32_t refreshedLast = refreshed.candidate_count - 1;
+        CHECK_TRUE(getCandType(refreshed, refreshedLast) == IpcCandidateType::Emoji, L"Refreshed last slot is Emoji");
+        CHECK_TRUE(std::wstring(refreshed.candidates[refreshedLast]).find(L"🤩") != std::wstring::npos,
+                   L"Refreshed page shows higher priority 🤩 without retyping");
+
+        // User can now confirm directly on the refreshed snapshot without retyping!
+        IpcKeyResponse reconfirmResp{};
+        CHECK_TRUE(sendKey(static_cast<uint32_t>('1' + refreshedLast), refreshed.candidate_version, reconfirmResp) &&
+                   reconfirmResp.handled == 1 && reconfirmResp.has_commit == 1,
+                   L"Re-confirming on refreshed snapshot commits without retyping");
+        CHECK_TRUE(std::wstring(reconfirmResp.commit_text) == L"🤩", L"Committed 🤩 from refreshed snapshot");
+
+        // 23.4: Global Emoji Association Master Switch disables/enables matching while preserving existing pending commit
+        // Toggling master switch off while an already-created pending commit is in flight does not alter it
+        IpcCommitDisposition d2 = IpcCommitDisposition::None;
+        bool c2 = false;
+        std::string disableResp = sendAdmin(R"({"action":"SetEmojiAssociationEnabled","protocol_version":1,"params":{"enabled":false}})");
+        CHECK_TRUE(disableResp.find("\"success\":true") != std::string::npos &&
+                   disableResp.find("\"association_enabled\":false") != std::string::npos,
+                   L"SetEmojiAssociationEnabled(false) succeeds");
+        CHECK_TRUE(eClient.NotifyCommitTerminal(sid, cid, reconfirmResp.commit_event_id,
+                                                IpcCommitDisposition::ConfirmedWritten,
+                                                epoch, reconfirmResp.candidate_version, ownerId, d2, c2),
+                   L"Pre-existing pending emoji commit confirms cleanly even after master switch toggled off");
+
+        for (char c : std::string("KAIXIN")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type kaixin while master switch is off");
+        }
+        for (uint32_t i = 0; i < kr.candidate_count; ++i) {
+            CHECK_TRUE(getCandType(kr, i) == IpcCandidateType::Normal, L"No emoji slot appears when master switch is off");
+        }
         CHECK_TRUE(sendKey(VK_ESCAPE, 0, kr), L"Escape clears kaixin");
 
-        // New query picks up higher-priority 🤩 at last slot
+        std::string enableResp = sendAdmin(R"({"action":"SetEmojiAssociationEnabled","protocol_version":1,"params":{"enabled":true}})");
+        CHECK_TRUE(enableResp.find("\"success\":true") != std::string::npos &&
+                   enableResp.find("\"association_enabled\":true") != std::string::npos,
+                   L"SetEmojiAssociationEnabled(true) succeeds");
         for (char c : std::string("KAIXIN")) {
-            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type kaixin after AddEmojiMapping");
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type kaixin after master switch re-enabled");
         }
-        kaixinLastSlot = kr.candidate_count - 1;
-        CHECK_TRUE(getCandType(kr, kaixinLastSlot) == IpcCandidateType::Emoji, L"Last slot is Emoji after mapping update");
-        CHECK_TRUE(std::wstring(kr.candidates[kaixinLastSlot]).find(L"🤩") != std::wstring::npos, L"Higher priority 🤩 appears on Page 0");
+        CHECK_TRUE(getCandType(kr, kr.candidate_count - 1) == IpcCandidateType::Emoji,
+                   L"Emoji slot returns after master switch is re-enabled");
 
         eClient.Disconnect();
         eSvc.Stop();

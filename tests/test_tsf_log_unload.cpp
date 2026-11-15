@@ -37,7 +37,8 @@ int main() {
 
     std::wcout << L"[TEST] Repeated LoadLibrary / OnSetFocus / DllCanUnloadNow / FreeLibrary with PERSONALIME_DEBUG_TSF_LOG=1..." << std::endl;
 
-    for (int iter = 0; iter < 5; ++iter) {
+    DWORD baselineHandles = 0;
+    for (int iter = 0; iter < 15; ++iter) {
         HMODULE hMod = LoadLibraryW(dllPath.c_str());
         if (!hMod) {
             std::wcerr << L"[FAIL] LoadLibraryW failed at iter " << iter << L" err=" << GetLastError() << std::endl;
@@ -120,6 +121,18 @@ int main() {
             std::wcerr << L"[FAIL] DLL still mapped in process after FreeLibrary at iter " << iter << std::endl;
             CoUninitialize();
             return 1;
+        }
+        if (iter == 1) {
+            GetProcessHandleCount(GetCurrentProcess(), &baselineHandles);
+        } else if (iter > 1) {
+            DWORD curHandles = 0;
+            GetProcessHandleCount(GetCurrentProcess(), &curHandles);
+            if (curHandles > baselineHandles + 1) {
+                std::wcerr << L"[FAIL] Process handle count leaked at iter " << iter
+                           << L" (baseline=" << baselineHandles << L", current=" << curHandles << L")" << std::endl;
+                CoUninitialize();
+                return 1;
+            }
         }
     }
 
