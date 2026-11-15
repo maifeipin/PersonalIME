@@ -85,18 +85,7 @@ public class RealWpfUiOperationTests
     public void TestRealWpfFourPagesOperationAndEvidenceCapture()
     {
         string repoRoot = FindRepoRoot();
-        string buildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR") ?? "build";
-        string resolvedBuildDir = Path.IsPathRooted(buildDir) ? buildDir : Path.Combine(repoRoot, buildDir);
-        string serviceExe = Path.Combine(resolvedBuildDir, @"Release\ime-service.exe");
-        if (!File.Exists(serviceExe))
-        {
-            serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
-        }
-        if (!File.Exists(serviceExe))
-        {
-            Assert.Inconclusive("ime-service.exe not found at " + serviceExe);
-            return;
-        }
+        string serviceExe = RealServiceIntegrationTests.ResolveServiceExecutablePath(repoRoot);
 
         string testPipe = $"PersonalIME_WPF_UI_{Environment.ProcessId}_{Guid.NewGuid():N}";
         string testDb = Path.Combine(repoRoot, $"out/wpf_ui_test_{Environment.ProcessId}_{Guid.NewGuid():N}.db");
@@ -182,10 +171,17 @@ public class RealWpfUiOperationTests
                 vm.Sorting.QueryCode = "gh";
                 AwaitWithPump(vm.Sorting.LoadPinnedAsync());
 
-                // Candidate picker search & add builtin candidate
+                // Candidate picker search & add builtin candidate (wait for async dict warmup)
                 vm.Sorting.CandidateSearchText = string.Empty;
                 AwaitWithPump(vm.Sorting.SearchCandidatesAsync());
                 var candToPin = vm.Sorting.AvailableCandidates.FirstOrDefault(c => c.Id.StartsWith("b_wb_gh_"));
+                for (int w = 0; w < 150 && candToPin == null; w++)
+                {
+                    Thread.Sleep(100);
+                    DoEvents();
+                    AwaitWithPump(vm.Sorting.SearchCandidatesAsync());
+                    candToPin = vm.Sorting.AvailableCandidates.FirstOrDefault(c => c.Id.StartsWith("b_wb_gh_"));
+                }
                 Assert.IsNotNull(candToPin, "Must find candidate for wubi86 gh");
                 vm.Sorting.SelectedCandidate = candToPin;
                 vm.Sorting.AddCandidateToPinned();

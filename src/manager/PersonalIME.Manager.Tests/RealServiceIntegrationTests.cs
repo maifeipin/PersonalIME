@@ -29,6 +29,30 @@ public class RealServiceIntegrationTests
         return @"C:\Projects\AITools\PersonalIME";
     }
 
+    internal static string ResolveServiceExecutablePath(string repoRoot)
+    {
+        string? explicitBuildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR");
+        if (!string.IsNullOrWhiteSpace(explicitBuildDir))
+        {
+            string resolvedExplicitDir = Path.IsPathRooted(explicitBuildDir)
+                ? explicitBuildDir
+                : Path.Combine(repoRoot, explicitBuildDir);
+            string explicitExe = Path.Combine(resolvedExplicitDir, @"Release\ime-service.exe");
+            if (!File.Exists(explicitExe))
+            {
+                Assert.Fail($"PERSONALIME_BUILD_DIR is set to '{explicitBuildDir}', but ime-service.exe was not found at '{explicitExe}'.");
+            }
+            return explicitExe;
+        }
+
+        string defaultExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
+        if (!File.Exists(defaultExe))
+        {
+            Assert.Inconclusive("ime-service.exe not found at " + defaultExe);
+        }
+        return defaultExe;
+    }
+
     [ClassInitialize]
     public static void ClassInit(TestContext context)
     {
@@ -42,19 +66,7 @@ public class RealServiceIntegrationTests
         if (File.Exists(s_exportFilePath)) File.Delete(s_exportFilePath);
         Directory.CreateDirectory(Path.Combine(repoRoot, "out"));
 
-        // Locate ime-service.exe (respect PERSONALIME_BUILD_DIR if configured)
-        string buildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR") ?? "build";
-        string resolvedBuildDir = Path.IsPathRooted(buildDir) ? buildDir : Path.Combine(repoRoot, buildDir);
-        string serviceExe = Path.Combine(resolvedBuildDir, @"Release\ime-service.exe");
-        if (!File.Exists(serviceExe))
-        {
-            serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
-        }
-        if (!File.Exists(serviceExe))
-        {
-            Assert.Inconclusive("ime-service.exe not found at " + serviceExe);
-            return;
-        }
+        string serviceExe = ResolveServiceExecutablePath(repoRoot);
 
         string dictDir = Path.Combine(repoRoot, @"data\dictionaries");
 
@@ -290,12 +302,7 @@ public class RealServiceIntegrationTests
     public async Task TestBuiltinEntryPinningAndLifecycleAcrossSchemes()
     {
         string repoRoot = FindRepoRoot();
-        string serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
-        if (!File.Exists(serviceExe))
-        {
-            Assert.Inconclusive("ime-service.exe not found at " + serviceExe);
-            return;
-        }
+        string serviceExe = ResolveServiceExecutablePath(repoRoot);
 
         string testPipe = $"PersonalIME_Admin_Builtin_{Environment.ProcessId}_{Guid.NewGuid():N}";
         string testDb = Path.Combine(repoRoot, $"out/builtin_e2e_{Environment.ProcessId}_{Guid.NewGuid():N}.db");
