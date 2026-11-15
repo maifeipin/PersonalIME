@@ -1864,8 +1864,12 @@ void HandleClient(HANDLE hPipe) {
         uint32_t preservedStageFlags = resp.status_flags & (
             IPC_STATUS_STAGE7_CAPABLE |
             IPC_STATUS_CONFLICT_ERROR |
-            IPC_STATUS_HAS_QUERY_CODE
+            IPC_STATUS_HAS_QUERY_CODE |
+            IPC_STATUS_HAS_CAND_CORES
         );
+        if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
+            preservedStageFlags |= (resp.status_flags & IPC_STATUS_TRUNCATED);
+        }
         resp.status_flags = ComputeModeFlags(state) | preservedStageFlags;
         if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
             req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {

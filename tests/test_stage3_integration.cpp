@@ -11,6 +11,7 @@
 #include <cassert>
 #include "../src/common/ime_guids.h"
 #include "../src/common/ipc_protocol.h"
+#include "../src/common/stage7_settings_codec.h"
 #include "../src/tsf_client/ipc_client.h"
 #include "../src/core/engine/ime_engine.h"
 #include "../src/core/types.h"
@@ -2421,8 +2422,116 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[PASS] Stage 7.1a CommitTerminal E2E & Restart Fidelity verified!" << std::endl;
     }
 
+    if (!stage71aOnly) {
+        std::wcout << L"\n[TEST 21] Real-Service 80-Host Whitelist Pagination & Candidate Boundary Flag Fidelity..." << std::endl;
+        std::string s74Db = "out/stage74_real_service_" + std::to_string(GetCurrentProcessId()) + ".db";
+        std::error_code ec;
+        std::filesystem::create_directories("out", ec);
+        std::filesystem::remove(s74Db, ec);
+
+        std::vector<std::wstring> expectedHosts;
+        expectedHosts.reserve(80);
+        {
+            ime::ImeEngine seeder;
+            CHECK_TRUE(seeder.Initialize(s74Db, dictDir), L"Initialize Stage 7.4 integration DB");
+            auto pol = *seeder.GetPolicy();
+            pol.unicode_injection.enabled = true;
+            pol.unicode_injection.allowed_hosts.clear();
+            for (int i = 0; i < 80; ++i) {
+                std::string h = "host_" + std::to_string(i) + "_long_process_name.exe";
+                expectedHosts.push_back(ime::Utf8ToWide(h));
+                pol.unicode_injection.allowed_hosts.push_back(h);
+            }
+            CHECK_TRUE(seeder.SavePolicy(pol), L"Persist 80-host whitelist policy");
+            CHECK_TRUE(!seeder.AddUserEntry(L"版本 [beta]", { {ime::InputScheme::Custom, ";bb"} }).empty(),
+                       L"Seed custom phrase '版本 [beta]' for boundary flag test");
+        }
+
+        std::string s74Pipe = "PersonalIME_Stage74_Verify_" + std::to_string(GetCurrentProcessId());
+        std::string s74AdminPipe = s74Pipe + "_Admin";
+        std::wstring s74PipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(s74Pipe);
+
+        ServiceProcess s74Service;
+        IpcClient::SetPipeNameForTest(s74PipeW.c_str());
+        CHECK_TRUE(s74Service.Start(s74Db, dictDir, s74Pipe, s74AdminPipe), L"Start isolated service for Test 21");
+
+        IpcClient client;
+        // 21.1: Full 80-host whitelist pagination via GetStage7Settings
+        std::vector<std::wstring> allDecodedHosts;
+        size_t pageOffset = 0;
+        int pageCount = 0;
+        bool sawTruncated = false;
+        for (;;) {
+            IpcKeyRequest req{};
+            req.msg_type = static_cast<uint32_t>(IpcMsgType::GetStage7Settings);
+            req.session_id = 2100;
+            req.context_id = 1;
+            req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+            req.mode_arg = static_cast<uint32_t>(pageOffset);
+            IpcKeyResponse resp{};
+            CHECK_TRUE(client.SendRequest(req, resp, 200), L"GetStage7Settings page request succeeds");
+
+            ime::Stage7SettingsPayload decodedSettings{};
+            CHECK_TRUE(ime::DecodeStage7SettingsFromIpcResponse(resp, decodedSettings),
+                       L"DecodeStage7SettingsFromIpcResponse succeeds");
+            allDecodedHosts.insert(allDecodedHosts.end(),
+                                   decodedSettings.unicode_allowed_hosts.begin(),
+                                   decodedSettings.unicode_allowed_hosts.end());
+            ++pageCount;
+
+            if ((resp.status_flags & IPC_STATUS_TRUNCATED) != 0) {
+                sawTruncated = true;
+                CHECK_TRUE(resp.page_index > pageOffset, L"Paginated GetStage7Settings advances offset");
+                pageOffset = resp.page_index;
+            } else {
+                break;
+            }
+            CHECK_TRUE(pageCount < 20, L"Pagination must terminate within 20 pages");
+        }
+        CHECK_TRUE(sawTruncated && pageCount >= 2, L"80-host whitelist must span multiple pages with IPC_STATUS_TRUNCATED");
+        CHECK_EQUAL(allDecodedHosts.size(), expectedHosts.size(), L"All 80 whitelist hosts decoded across pages");
+        for (size_t i = 0; i < expectedHosts.size(); ++i) {
+            CHECK_TRUE(allDecodedHosts[i] == expectedHosts[i], L"Decoded whitelist host matches seeded host");
+        }
+
+        // 21.2: Candidate boundary flag fidelity for '版本 [beta]'
+        CHECK_TRUE(client.SetMode(2100, 2, IPC_MODE_CHINESE, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE),
+                   L"Set Chinese mode for boundary flag test");
+        IpcKeyRequest kreq{};
+        kreq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+        kreq.session_id = 2100;
+        kreq.context_id = 2;
+        kreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+        IpcKeyResponse kresp{};
+        kreq.vk_code = VK_OEM_1; // ';'
+        CHECK_TRUE(client.SendRequest(kreq, kresp, 200), L"Send ';' succeeds");
+        kreq.vk_code = 'B';
+        CHECK_TRUE(client.SendRequest(kreq, kresp, 200), L"Send 'b' succeeds");
+        CHECK_TRUE(client.SendRequest(kreq, kresp, 200), L"Send second 'b' succeeds");
+        CHECK_TRUE(kresp.candidate_count >= 1, L"Query ';bb' returns candidate");
+        CHECK_TRUE((kresp.status_flags & IPC_STATUS_HAS_CAND_CORES) != 0,
+                   L"Real service must preserve IPC_STATUS_HAS_CAND_CORES");
+
+        constexpr size_t kCandCap = sizeof(kresp.candidates[0]) / sizeof(wchar_t);
+        std::wstring label = kresp.candidates[0];
+        size_t labelLen = wcsnlen(kresp.candidates[0], kCandCap);
+        CHECK_TRUE(labelLen + 2 < kCandCap && kresp.candidates[0][labelLen + 1] >= 1,
+                   L"Candidate[0] carries post-NUL core length metadata");
+        size_t coreLen = static_cast<size_t>(kresp.candidates[0][labelLen + 1] - 1);
+        size_t dotPos = label.find(L". ");
+        CHECK_TRUE(dotPos != std::wstring::npos, L"Candidate label has index prefix");
+        std::wstring extractedCore = label.substr(dotPos + 2, coreLen);
+        CHECK_TRUE(extractedCore == L"版本 [beta]", L"Exact core preserves literal '[beta]' without stripping");
+
+        client.Disconnect();
+        s74Service.Stop();
+        std::filesystem::remove(s74Db, ec);
+        IpcClient::SetPipeNameForTest(nullptr);
+        std::wcout << L"[PASS] Real-Service 80-Host Whitelist Pagination & Candidate Boundary Flag Fidelity verified!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (20/20)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (21/21)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

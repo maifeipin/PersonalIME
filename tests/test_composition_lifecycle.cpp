@@ -4074,6 +4074,34 @@ static int TestShiftTapAndCapsLockDispatchChain() {
     CHECK_TRUE(!isChinese && !lastSetModeChinese, L"Mode switched to English after SetMode retry");
     CHECK_EQUAL(tip.GetPendingV2ReceiptCountForTest(), static_cast<size_t>(0), L"PendingV2Receipt drained after SetMode retry");
 
+    // 13. SetMode fails transiently -> user types new Chinese input -> stale retry must NOT switch to English
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        isChinese = true;
+        lastSetModeChinese = true;
+        comp = L"gh";
+        failSetModeCount = 1;
+    }
+    prevSetMode = setModeCalls;
+    dispatchKeyDown(VK_LSHIFT, 0);
+    dispatchKeyUp(VK_LSHIFT, 0, &tuEaten);
+    CHECK_EQUAL(setModeCalls, prevSetMode, L"Initial SetMode failure leaves mode Chinese");
+    CHECK_TRUE(tip.GetPendingV2ReceiptCountForTest() >= 1, L"PendingV2Receipt retained before new input");
+
+    // User types 'A' in Chinese mode before retry fires
+    dispatchKeyDown('A', 0);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        CHECK_TRUE(isChinese, L"New Chinese input stays in Chinese mode");
+        CHECK_TRUE(comp == L"a", L"New composition 'a' recorded");
+    }
+
+    // Now drain stale receipt -> generation changed, so SetMode MUST NOT be called!
+    tip.DrainPendingV2ReceiptsForTest();
+    CHECK_EQUAL(setModeCalls, prevSetMode, L"Stale SetMode retry must NOT fire after subsequent keystrokes");
+    CHECK_TRUE(isChinese, L"Chinese mode preserved after stale receipt drained");
+    CHECK_EQUAL(tip.GetPendingV2ReceiptCountForTest(), static_cast<size_t>(0), L"Stale PendingV2Receipt retired cleanly");
+
     tip.Deactivate();
     stopServer.store(true);
     HANDLE hWake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);

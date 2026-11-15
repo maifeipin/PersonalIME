@@ -951,6 +951,7 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
         r.context_id = cb->context_id;
         r.context_epoch = cb->context_epoch;
         r.input_generation = cb->server_commit_generation;
+        r.local_input_generation = cb->input_generation;
         r.edit_request_id = cb->edit_request_id;
         r.commit_event_id = cb->commit_event_id;
         r.channel = channel;
@@ -1001,6 +1002,7 @@ bool CTextInputProcessor::FinalizeStage7CommitForBlock(
                 cb->context_id,
                 cb->owner_id,
                 cb->context_epoch,
+                cb->input_generation,
                 finalDisp);
         }
         entry.disposition = static_cast<uint32_t>(finalDisp);
@@ -1027,19 +1029,26 @@ bool CTextInputProcessor::TryCompletePostCommitEnglishToggle(
     uint64_t contextId,
     uint64_t ownerId,
     uint32_t contextEpoch,
+    uint32_t expectedLocalGen,
     IpcCommitDisposition finalDisp)
 {
     if (finalDisp != IpcCommitDisposition::ConfirmedWritten &&
         finalDisp != IpcCommitDisposition::DispatchedUnverified) {
         return true;
     }
-    // Verify original TIP & context epoch ownership before mutating mode
+    // Verify original TIP, context epoch, and local input generation before mutating mode
     if (ownerId != 0 && m_ownerInstanceId != 0 && ownerId != m_ownerInstanceId) {
         return true;
     }
     if (contextEpoch != 0) {
         auto epIt = m_contextEpochs.find(contextId);
         if (epIt == m_contextEpochs.end() || epIt->second != contextEpoch) {
+            return true;
+        }
+    }
+    if (expectedLocalGen != 0) {
+        auto genIt = m_contextInputGenerations.find(contextId);
+        if (genIt != m_contextInputGenerations.end() && genIt->second != expectedLocalGen) {
             return true;
         }
     }
@@ -2278,7 +2287,7 @@ void CTextInputProcessor::EnqueuePendingV2Receipt(const PendingV2Receipt& r) {
     }
     if (m_pendingV2Receipts.size() < 512) {
         PendingV2Receipt copy = r;
-        copy.next_retry = std::chrono::steady_clock::now();
+        copy.next_retry = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
         m_pendingV2Receipts.push_back(copy);
     }
     StartDrainTimer();
@@ -2371,6 +2380,7 @@ void CTextInputProcessor::DrainPendingV2Receipts(bool forceNow) {
                     it->context_id,
                     it->owner_id,
                     it->context_epoch,
+                    it->local_input_generation,
                     it->acked_disp);
             }
             if (!it->has_service_acked_in_wal) {
@@ -2505,14 +2515,20 @@ bool CTextInputProcessor::ProcessKeyInternal(
     if (!pfEaten) return false;
     *pfEaten = FALSE;
 
-    DrainUnconfirmedCommits();
-    if (receipt_retry::Pending()) return false;
-
     if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
+        DrainUnconfirmedCommits();
         return false;
     }
 
     uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+    for (auto& pr : m_pendingV2Receipts) {
+        if (pr.context_id == contextId && pr.toggle_chinese_after_commit && !pr.has_toggled_english) {
+            pr.has_toggled_english = true; // Subsequent keystroke supersedes pending post-commit English toggle
+        }
+    }
+
+    DrainUnconfirmedCommits();
+    if (receipt_retry::Pending()) return false;
     CheckObservationTimeouts();
 
     // Do not overlap new keystrokes while an asynchronous edit session is queued on this context

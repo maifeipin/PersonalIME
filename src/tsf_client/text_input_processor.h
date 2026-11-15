@@ -500,6 +500,7 @@ private:
         uint64_t context_id = 0;
         uint32_t context_epoch = 0;
         uint32_t input_generation = 0;
+        uint32_t local_input_generation = 0;
         uint64_t edit_request_id = 0;
         uint64_t commit_event_id = 0;
         uint32_t channel = 0;
@@ -557,6 +558,7 @@ private:
         uint64_t contextId,
         uint64_t ownerId,
         uint32_t contextEpoch,
+        uint32_t expectedLocalGen,
         IpcCommitDisposition finalDisp);
     bool FinalizeStage7CommitForBlock(
         const std::shared_ptr<EditRequestControlBlock>& cb,
