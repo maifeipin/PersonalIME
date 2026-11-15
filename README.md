@@ -1,4 +1,4 @@
-# 人人 (RenRen IME)
+# 人人输入法 (RenRen IME)
 
 [![Windows 10/11 x64](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D4.svg)](https://microsoft.com/windows)
 [![macOS Universal](https://img.shields.io/badge/Platform-macOS%20Universal-000000.svg)](https://apple.com/macos)
@@ -7,7 +7,7 @@
 [![SQLite WAL](https://img.shields.io/badge/Storage-SQLite3%20WAL-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> **人人输入法 —— 让每个人都能拥有属于自己的输入法，做那个越来越懂你的输入伙伴。**
+> **人人输入法（maifeipin）—— 让每个人都能拥有属于自己的输入法，做那个越来越懂你的输入伙伴。**
 >
 > *智能五笔 · 拼音混输 · 零打扰 · 数据全在本地的现代 Windows 中文输入法*
 
@@ -230,6 +230,7 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1
 - [x] **Stage 4：现代化 WPF 管理中心与高阶特性**（词库 CRUD、内置词条置顶调序、双拼多方案支持、编码反查、系统诊断）
 - [x] **Stage 5：产品化重塑“人人”与轻量插件生态**（全链路品牌升级、SVG 矢量图标、候选栏插件矩阵与日志审计、一键安装包与 `dev.ps1` 工作流）
 - [x] **Stage 6：macOS 原生跨平台支持与自动化发布**（InputMethodKit 协议实现、Swift 暗黑高保真候选窗、C++20 跨平台核心无缝复用、多源瀑布流补全与编码反查、GitHub Actions CI 双平台自动化发布）
+- [x] **Stage 7：无重启版本化升级与安装可靠性加固**（`versions\<ver>\PersonalIME.dll` 隔离部署、COM `InProcServer32` 路径切换与完整注册表快照回退、精确目录归属进程清理、候选框即时预览与通用宿主锚点回退）
 
 ---
 

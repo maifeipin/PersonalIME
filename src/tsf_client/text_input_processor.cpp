@@ -441,10 +441,23 @@ void CTextInputProcessor::OpenManagerFromTray() {
             std::vector<std::filesystem::path> cands = {
                 dir / L"manager" / L"PersonalIME.Manager.exe",
                 dir / L"PersonalIME.Manager.exe",
+                dir.parent_path().parent_path() / L"manager" / L"PersonalIME.Manager.exe",
                 dir / L"../../src/manager/PersonalIME.Manager/bin/Release/net10.0-windows/PersonalIME.Manager.exe",
                 dir / L"../../out/publish/manager/PersonalIME.Manager.exe",
-                L"C:\\Program Files\\PersonalIME\\manager\\PersonalIME.Manager.exe"
             };
+            HKEY hInstallKey = nullptr;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\PersonalIME", 0, KEY_READ, &hInstallKey) == ERROR_SUCCESS) {
+                wchar_t installDir[MAX_PATH] = {0};
+                DWORD type = 0;
+                DWORD bytes = sizeof(installDir);
+                if (RegQueryValueExW(hInstallKey, L"InstallDir", nullptr, &type,
+                                     reinterpret_cast<BYTE*>(installDir), &bytes) == ERROR_SUCCESS &&
+                    (type == REG_SZ || type == REG_EXPAND_SZ) && installDir[0] != L'\0') {
+                    cands.push_back(std::filesystem::path(installDir) / L"manager" / L"PersonalIME.Manager.exe");
+                }
+                RegCloseKey(hInstallKey);
+            }
+            cands.push_back(L"C:\\Program Files\\PersonalIME\\manager\\PersonalIME.Manager.exe");
             for (const auto& c : cands) {
                 std::error_code ec;
                 if (std::filesystem::exists(c, ec)) {
