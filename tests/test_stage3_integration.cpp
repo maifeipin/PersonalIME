@@ -110,7 +110,64 @@ struct ServiceProcess {
             req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
             IpcKeyResponse resp{};
             if (c.SendRequest(req, resp, 80) && resp.handled == 1) {
-                return true;
+                // Wait for background builtin dictionary warmup without altering persistent mode
+                const uint64_t probeSid = 0x7FFF0000ULL;
+                const uint64_t probeCid = 0x7FFF0001ULL;
+                uint32_t origFlags = IPC_MODE_CHINESE;
+                bool hadOrigMode = false;
+                {
+                    IpcKeyRequest mreq{};
+                    mreq.msg_type = static_cast<uint32_t>(IpcMsgType::GetMode);
+                    mreq.session_id = probeSid;
+                    mreq.context_id = probeCid;
+                    mreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+                    IpcKeyResponse mresp{};
+                    if (c.SendRequest(mreq, mresp, 80) && mresp.handled == 1) {
+                        origFlags = mresp.status_flags;
+                        hadOrigMode = true;
+                        if ((origFlags & IPC_MODE_CHINESE) == 0) {
+                            IpcKeyRequest sreq{};
+                            sreq.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+                            sreq.session_id = probeSid;
+                            sreq.context_id = probeCid;
+                            sreq.mode_arg = origFlags | IPC_MODE_CHINESE;
+                            sreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+                            IpcKeyResponse sresp{};
+                            c.SendRequest(sreq, sresp, 80);
+                        }
+                    }
+                }
+                bool warmed = false;
+                for (int w = 0; w < 300; ++w) {
+                    IpcKeyRequest kreq{};
+                    kreq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+                    kreq.session_id = probeSid;
+                    kreq.context_id = probeCid;
+                    kreq.vk_code = 'A';
+                    kreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+                    IpcKeyResponse kresp{};
+                    if (c.SendRequest(kreq, kresp, 150) && kresp.handled == 1) {
+                        kreq.vk_code = VK_ESCAPE;
+                        c.SendRequest(kreq, kresp, 150);
+                        warmed = true;
+                        break;
+                    }
+                    Sleep(50);
+                }
+                if (hadOrigMode && (origFlags & IPC_MODE_CHINESE) == 0) {
+                    IpcKeyRequest sreq{};
+                    sreq.msg_type = static_cast<uint32_t>(IpcMsgType::SetMode);
+                    sreq.session_id = probeSid;
+                    sreq.context_id = probeCid;
+                    sreq.mode_arg = origFlags;
+                    sreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
+                    IpcKeyResponse sresp{};
+                    c.SendRequest(sreq, sresp, 80);
+                }
+                if (warmed) {
+                    return true;
+                }
+                break;
             }
         }
         Stop();
