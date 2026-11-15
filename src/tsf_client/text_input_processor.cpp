@@ -2089,6 +2089,12 @@ void CTextInputProcessor::UpdateShiftKeyState(WPARAM wParam, LPARAM lParam, bool
             m_rightShiftDown = false;
         } else {
             m_genericShiftDown = false;
+            if ((GetKeyState(VK_LSHIFT) & 0x8000) == 0) {
+                m_leftShiftDown = false;
+            }
+            if ((GetKeyState(VK_RSHIFT) & 0x8000) == 0) {
+                m_rightShiftDown = false;
+            }
         }
     }
 }
