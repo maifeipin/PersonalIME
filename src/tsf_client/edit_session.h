@@ -642,34 +642,25 @@ public:
                 bool canShowUI = (m_generation == 0) ||
                                  (m_pTip && m_pTip->CanShowCandidateWindow(m_contextId, m_generation));
                 if (m_pCandWnd && canShowUI && m_pCandWnd->ShouldShowWindow(m_snapshot)) {
-                    ITfContextView* pView = nullptr;
-                    HRESULT hrView = m_pContext->GetActiveView(&pView);
-                    if (SUCCEEDED(hrView) && pView) {
-                        RECT rc{};
-                        BOOL fClipped = FALSE;
-                        if (SUCCEEDED(pView->GetTextExt(ec, pRange, &rc, &fClipped))) {
-                            if (rc.right >= rc.left && rc.bottom > rc.top) {
-                                POINT pt = { rc.left, rc.bottom + 2 };
-                                m_pTip->CacheContextAnchorPoint(
-                                    m_contextId,
-                                    m_pTip->EnsureContextEpoch(m_contextId),
-                                    reinterpret_cast<uint64_t>(pView),
-                                    pt);
-                                m_pCandWnd->Show(m_snapshot, pt);
-                            } else {
-                                hideOwnedWindow();
+                    POINT pt{};
+                    bool gotAnchor = false;
+                    if (m_pTip) {
+                        gotAnchor = m_pTip->ResolveAnchorPointForContext(m_pContext, ec, pRange, true, &pt);
+                    } else {
+                        ITfContextView* pView = nullptr;
+                        if (SUCCEEDED(m_pContext->GetActiveView(&pView)) && pView) {
+                            RECT rc{};
+                            BOOL fClipped = FALSE;
+                            if (SUCCEEDED(pView->GetTextExt(ec, pRange, &rc, &fClipped)) &&
+                                rc.right >= rc.left && rc.bottom > rc.top) {
+                                pt = { rc.left, rc.bottom + 2 };
+                                gotAnchor = true;
                             }
-                        } else {
-                            hideOwnedWindow();
+                            pView->Release();
                         }
-                        pView->Release();
-                    } else if (hrView == E_NOTIMPL) {
-                        POINT pt{};
-                        if (m_pTip->ResolveAnchorPointForContext(m_pContext, ec, pRange, true, &pt)) {
-                            m_pCandWnd->Show(m_snapshot, pt);
-                        } else {
-                            hideOwnedWindow();
-                        }
+                    }
+                    if (gotAnchor) {
+                        m_pCandWnd->Show(m_snapshot, pt);
                     } else {
                         hideOwnedWindow();
                     }
