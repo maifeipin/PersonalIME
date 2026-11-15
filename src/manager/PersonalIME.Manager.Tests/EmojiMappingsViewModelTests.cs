@@ -127,4 +127,62 @@ public class EmojiMappingsViewModelTests
         Assert.AreEqual(true, mock.SaveCalls[^1]);
         Assert.IsFalse(vm.IsSavingAssociationEnabled);
     }
+
+    [TestMethod]
+    public async Task TestAssociationToggleDuringReconcileIsNotLostAndNotOverwritten()
+    {
+        var reconcileEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowReconcileFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int saveAttempt = 0;
+        bool initialLoadDone = false;
+
+        var mock = new InterceptingMockAdminClient { MockEmojiAssociationEnabled = true };
+        mock.GetOverride = async () =>
+        {
+            if (initialLoadDone)
+            {
+                reconcileEntered.TrySetResult();
+                await allowReconcileFinish.Task;
+            }
+            return new EmojiMappingsResult
+            {
+                AssociationEnabled = mock.MockEmojiAssociationEnabled,
+                Mappings = []
+            };
+        };
+        mock.SaveOverride = enabled =>
+        {
+            int attempt = Interlocked.Increment(ref saveAttempt);
+            if (attempt == 1)
+            {
+                throw new InvalidOperationException("transient failure");
+            }
+            mock.MockEmojiAssociationEnabled = enabled;
+            return Task.CompletedTask;
+        };
+
+        var banner = new NotificationBanner();
+        var vm = new EmojiMappingsViewModel(mock, banner);
+        await vm.LoadDataAsync();
+        initialLoadDone = true;
+
+        // First toggle fails and suspends inside ReconcileAssociationStateFromServerAsync
+        vm.IsAssociationEnabled = false;
+        await reconcileEntered.Task;
+
+        // User toggles again while reconcile is still in flight
+        vm.IsAssociationEnabled = false;
+        Assert.IsFalse(vm.IsAssociationEnabled);
+
+        // Reconcile returns stale server state (true), must not overwrite user's pending false
+        allowReconcileFinish.TrySetResult();
+        await vm.PendingAssociationSaveTask;
+
+        Assert.AreEqual(2, mock.SaveCalls.Count);
+        Assert.IsFalse(mock.SaveCalls[0]);
+        Assert.IsFalse(mock.SaveCalls[1]);
+        Assert.IsFalse(vm.IsAssociationEnabled);
+        Assert.IsFalse(mock.MockEmojiAssociationEnabled);
+        Assert.IsFalse(vm.IsSavingAssociationEnabled);
+    }
 }

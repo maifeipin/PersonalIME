@@ -374,8 +374,11 @@ int main(int argc, char* argv[]) {
     // Interactive REPL Mode
     std::cout << "PersonalIME Interactive CLI Debugger\n";
     std::cout << "Database: " << dbPath << "\n";
-    std::cout << "Builtin Dictionaries: " << engine.GetBuiltinDict().WubiEntryCount() << " wubi, "
-              << engine.GetBuiltinDict().PinyinEntryCount() << " pinyin entries loaded in " << initMs << " ms.\n";
+    auto dictSnapshot = engine.GetBuiltinDictSnapshot();
+    size_t wubiCount = dictSnapshot ? dictSnapshot->WubiEntryCount() : 0;
+    size_t pinyinCount = dictSnapshot ? dictSnapshot->PinyinEntryCount() : 0;
+    std::cout << "Builtin Dictionaries: " << wubiCount << " wubi, "
+              << pinyinCount << " pinyin entries loaded in " << initMs << " ms.\n";
     std::cout << "Type 'help' for command list, 'exit' to quit.\n\n";
 
     std::string line;

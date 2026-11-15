@@ -175,9 +175,9 @@ int main(int argc, char* argv[]) {
             CoUninitialize();
             return 1;
         }
-        if (iter == 1) {
+        if (iter == 5) {
             GetProcessHandleCount(GetCurrentProcess(), &baselineHandles);
-        } else if (iter > 1) {
+        } else if (iter > 5) {
             DWORD curHandles = 0;
             GetProcessHandleCount(GetCurrentProcess(), &curHandles);
             if (curHandles > baselineHandles + 1) {

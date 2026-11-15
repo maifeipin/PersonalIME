@@ -278,11 +278,12 @@ public class EmojiMappingsViewModel : ViewModelBase
                 }
                 catch (Exception ex)
                 {
-                    _pendingAssociationTarget = null;
-                    SetAssociationEnabledSilently(_confirmedAssociationEnabled);
+                    if (_pendingAssociationTarget == null)
+                    {
+                        SetAssociationEnabledSilently(_confirmedAssociationEnabled);
+                    }
                     _banner.ShowError($"更新表情联想开关失败: {ex.Message}");
                     await ReconcileAssociationStateFromServerAsync();
-                    break;
                 }
             }
         }
@@ -302,7 +303,10 @@ public class EmojiMappingsViewModel : ViewModelBase
         {
             var res = await _client.GetEmojiMappingsAsync();
             _confirmedAssociationEnabled = res.AssociationEnabled;
-            SetAssociationEnabledSilently(res.AssociationEnabled);
+            if (_pendingAssociationTarget == null)
+            {
+                SetAssociationEnabledSilently(res.AssociationEnabled);
+            }
         }
         catch
         {

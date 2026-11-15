@@ -64,24 +64,18 @@ public:
                 } else {
                     ++m_count;
                 }
-                HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
-                if (wake != nullptr) {
-                    SetEvent(wake);
+                if (m_wakeEvent != nullptr) {
+                    SetEvent(m_wakeEvent);
                 }
             }
         }
         ReleaseSRWLockExclusive(&m_lock);
     }
 
-    void RequestShutdownAsync(bool processTerminating = false) noexcept {
+    void RequestShutdownAsync(bool = false) noexcept {
+        // Only flip the atomic flag; WriterLoop observes m_shuttingDown within its 200ms poll
+        // and closes m_wakeEvent itself, avoiding any SetEvent race on a closing handle.
         m_shuttingDown.store(true, std::memory_order_release);
-        if (processTerminating) {
-            return;
-        }
-        HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
-        if (wake != nullptr) {
-            SetEvent(wake);
-        }
     }
 
     bool IsHoldingDllRef() const noexcept {
@@ -100,13 +94,11 @@ private:
         if (m_workerRunning || m_shuttingDown.load(std::memory_order_relaxed)) {
             return;
         }
-        HANDLE wake = m_wakeEvent.load(std::memory_order_relaxed);
-        if (wake == nullptr) {
-            wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (wake == nullptr) {
+        if (m_wakeEvent == nullptr) {
+            m_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (m_wakeEvent == nullptr) {
                 return;
             }
-            m_wakeEvent.store(wake, std::memory_order_release);
         }
 
         HMODULE hKeepAlive = nullptr;
@@ -116,10 +108,8 @@ private:
                     reinterpret_cast<LPCWSTR>(&WriterThreadProc),
                     &hKeepAlive) ||
                 hKeepAlive == nullptr) {
-                HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
-                if (hClose != nullptr) {
-                    CloseHandle(hClose);
-                }
+                CloseHandle(m_wakeEvent);
+                m_wakeEvent = nullptr;
                 return;
             }
             DllAddRef();
@@ -132,9 +122,9 @@ private:
             CloseHandle(hThread);
         } else {
             m_workerRunning = false;
-            HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
-            if (hClose != nullptr) {
-                CloseHandle(hClose);
+            if (m_wakeEvent != nullptr) {
+                CloseHandle(m_wakeEvent);
+                m_wakeEvent = nullptr;
             }
             if (hKeepAlive != nullptr) {
                 m_holdingDllRef.store(false, std::memory_order_release);
@@ -177,7 +167,8 @@ private:
             }
             if (n == 0 && m_shuttingDown.load(std::memory_order_acquire)) {
                 m_workerRunning = false;
-                HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
+                HANDLE hClose = m_wakeEvent;
+                m_wakeEvent = nullptr;
                 ReleaseSRWLockExclusive(&m_lock);
                 if (hClose != nullptr) {
                     CloseHandle(hClose);
@@ -208,13 +199,13 @@ private:
                 continue;
             }
 
-            HANDLE wake = m_wakeEvent.load(std::memory_order_acquire);
-            DWORD waitRes = wake != nullptr ? WaitForSingleObject(wake, 200) : WAIT_TIMEOUT;
+            DWORD waitRes = WaitForSingleObject(m_wakeEvent, 200);
             if (waitRes == WAIT_TIMEOUT) {
                 AcquireSRWLockExclusive(&m_lock);
                 if (m_count == 0) {
                     m_workerRunning = false;
-                    HANDLE hClose = m_wakeEvent.exchange(nullptr, std::memory_order_acq_rel);
+                    HANDLE hClose = m_wakeEvent;
+                    m_wakeEvent = nullptr;
                     ReleaseSRWLockExclusive(&m_lock);
                     if (hClose != nullptr) {
                         CloseHandle(hClose);
@@ -227,7 +218,7 @@ private:
     }
 
     SRWLOCK m_lock = SRWLOCK_INIT;
-    std::atomic<HANDLE> m_wakeEvent{nullptr};
+    HANDLE m_wakeEvent = nullptr;
     char m_ring[kSlots][kSlotBytes]{};
     size_t m_head = 0;
     size_t m_tail = 0;

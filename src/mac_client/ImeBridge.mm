@@ -571,8 +571,9 @@
     }
     __block ImeStatistics *stats = nil;
     dispatch_sync(_queue, ^{
-        NSInteger wubi = (NSInteger)self->_engine->GetBuiltinDict().WubiEntryCount();
-        NSInteger pinyin = (NSInteger)self->_engine->GetBuiltinDict().PinyinEntryCount();
+        auto dictSnapshot = self->_engine->GetBuiltinDictSnapshot();
+        NSInteger wubi = dictSnapshot ? (NSInteger)dictSnapshot->WubiEntryCount() : 0;
+        NSInteger pinyin = dictSnapshot ? (NSInteger)dictSnapshot->PinyinEntryCount() : 0;
         NSInteger user = self->_engine->GetRepo() ? (NSInteger)self->_engine->GetRepo()->GetAllUserEntries().size() : 0;
         stats = [[ImeStatistics alloc] initWithWubiCount:wubi pinyinCount:pinyin userEntryCount:user];
     });
