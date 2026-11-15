@@ -129,20 +129,43 @@ int main(int argc, char* argv[]) {
     IpcClient client;
 
     if (waitReady) {
+        ULONGLONG waitBudgetMs = 15000;
+        if (const char* envWait = getenv("PERSONALIME_WAIT_READY_BUDGET_MS"); envWait && *envWait) {
+            long long parsed = _atoi64(envWait);
+            if (parsed > 0) waitBudgetMs = static_cast<ULONGLONG>(parsed);
+        }
+        ULONGLONG deadline = GetTickCount64() + waitBudgetMs;
+        ULONGLONG maxPerCallTimeout = GetTestTimeoutMs();
         bool ready = false;
-        for (int attempt = 0; attempt < 300; ++attempt) {
+        for (;;) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= deadline) {
+                break;
+            }
+            ULONGLONG remaining = deadline - now;
+            DWORD callTimeout = static_cast<DWORD>(remaining < maxPerCallTimeout ? remaining : maxPerCallTimeout);
+
             IpcKeyRequest wreq{};
             wreq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
             wreq.session_id = 1;
             wreq.context_id = 101;
             IpcKeyResponse wresp{};
-            if (client.SendRequest(wreq, wresp, GetTestTimeoutMs()) && wresp.handled == 1) {
+            if (client.SendRequest(wreq, wresp, callTimeout) && wresp.handled == 1) {
                 ready = true;
                 break;
             }
-            Sleep(50);
+
+            now = GetTickCount64();
+            if (now >= deadline) {
+                break;
+            }
+            remaining = deadline - now;
+            DWORD sleepMs = static_cast<DWORD>(remaining < 50 ? remaining : 50);
+            if (sleepMs > 0) {
+                Sleep(sleepMs);
+            }
         }
-        CHECK_TRUE(ready, L"Service did not become ready (Ping handled=1) within 15s");
+        CHECK_TRUE(ready, L"Service did not become ready (Ping handled=1) within budget");
     }
 
     // 1. Send Ping

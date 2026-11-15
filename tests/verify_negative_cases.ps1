@@ -249,6 +249,59 @@ function Test-PipeBusyBudget {
     }
 }
 
+function Test-WaitReadyStalledBudget {
+    Write-Host "`n=== TEST 8: --wait-ready Monotonic Deadline on Stalled Server ===" -ForegroundColor Yellow
+    $pipe = [IO.Pipes.NamedPipeServerStream]::new(
+        'PersonalIME_Service_Pipe',
+        [IO.Pipes.PipeDirection]::InOut,
+        1,
+        [IO.Pipes.PipeTransmissionMode]::Message,
+        [IO.Pipes.PipeOptions]::Asynchronous
+    )
+    $runner = $null
+    $prevBudget = $env:PERSONALIME_WAIT_READY_BUDGET_MS
+    try {
+        $conn = $pipe.BeginWaitForConnection($null, $null)
+        $psi = [Diagnostics.ProcessStartInfo]::new($runnerPath, "--wait-ready")
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.Environment["PERSONALIME_WAIT_READY_BUDGET_MS"] = "500"
+        $psi.Environment["PERSONALIME_TEST_TIMEOUT_MS"] = "800"
+
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $runner = [Diagnostics.Process]::Start($psi)
+        if (-not $conn.AsyncWaitHandle.WaitOne(2000)) { throw "Pipe connection timed out" }
+        $pipe.EndWaitForConnection($conn)
+
+        # Drain incoming Ping without replying so client must honor total 500ms deadline (not 800ms or 300*800ms)
+        $request = [byte[]]::new($reqSize)
+        $null = $pipe.ReadAsync($request, 0, $reqSize)
+
+        $exited = $runner.WaitForExit(1500)
+        $sw.Stop()
+        if (-not $exited) {
+            $runner.Kill()
+            $runner.WaitForExit(500)
+            throw "FAILED: --wait-ready exceeded total deadline budget on stalled server!"
+        }
+        $stderr = $runner.StandardError.ReadToEnd()
+        Write-Host "WAIT_READY_STALLED: Elapsed=$($sw.ElapsedMilliseconds)ms, ExitCode=$($runner.ExitCode)" -ForegroundColor Cyan
+        if ($runner.ExitCode -ne 1) {
+            throw "FAILED: Expected exit code 1 on --wait-ready timeout, got $($runner.ExitCode)!"
+        }
+        if (-not $stderr.Contains("Service did not become ready")) {
+            throw "FAILED: Expected ready-budget error message, got '$stderr'"
+        }
+        Write-Host "PASSED: --wait-ready strictly respected total monotonic deadline on stalled server!" -ForegroundColor Green
+    } finally {
+        $env:PERSONALIME_WAIT_READY_BUDGET_MS = $prevBudget
+        if ($runner -and -not $runner.HasExited) { $runner.Kill(); $runner.WaitForExit(500) }
+        $pipe.Dispose()
+    }
+}
+
 Write-Host "`n=== TEST 1: Raw 0x00 Frame Rejection ===" -ForegroundColor Yellow
 Run-Scenario 'raw-zero-bytes'
 
@@ -267,3 +320,5 @@ Run-Scenario 'stalled-server'
 Test-HarnessTimeoutSafety
 
 Test-PipeBusyBudget
+
+Test-WaitReadyStalledBudget
