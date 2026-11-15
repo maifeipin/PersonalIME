@@ -132,6 +132,28 @@ int main(int argc, char* argv[]) {
     CHECK_TRUE(resp.msg_type == static_cast<uint32_t>(IpcMsgType::Ping), L"Ping msg_type mismatch");
     std::wcout << L"[TEST PASS] Ping OK." << std::endl;
 
+    // 1b. Wait for async builtin dictionary warmup (unready warmup safely returns handled=0)
+    {
+        bool warmedUp = false;
+        for (int attempt = 0; attempt < 300; ++attempt) {
+            IpcKeyRequest probe{};
+            probe.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+            probe.session_id = 1;
+            probe.context_id = 9999;
+            probe.vk_code = 'A';
+            IpcKeyResponse probeResp{};
+            CHECK_TRUE(client.SendRequest(probe, probeResp, GetTestTimeoutMs()), L"Warmup probe SendRequest failed");
+            if (probeResp.handled == 1) {
+                probe.vk_code = VK_ESCAPE;
+                client.SendRequest(probe, probeResp, GetTestTimeoutMs());
+                warmedUp = true;
+                break;
+            }
+            Sleep(50);
+        }
+        CHECK_TRUE(warmedUp, L"Service dictionary warmup did not complete within 15s");
+    }
+
     // 2. Send KeyDown 'A' in Context 101
     req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
     req.session_id = 1;
