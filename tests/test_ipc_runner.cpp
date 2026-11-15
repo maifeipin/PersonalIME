@@ -114,12 +114,36 @@ int main(int argc, char* argv[]) {
         return ok ? 0 : 1;
     }
 
+    bool waitReady = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--wait-ready") == 0) {
+            waitReady = true;
+        }
+    }
+
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U8TEXT);
     _setmode(_fileno(stderr), _O_U8TEXT);
     std::wcout << L"[TEST] Connecting to PersonalIME IPC service..." << std::endl;
 
     IpcClient client;
+
+    if (waitReady) {
+        bool ready = false;
+        for (int attempt = 0; attempt < 300; ++attempt) {
+            IpcKeyRequest wreq{};
+            wreq.msg_type = static_cast<uint32_t>(IpcMsgType::Ping);
+            wreq.session_id = 1;
+            wreq.context_id = 101;
+            IpcKeyResponse wresp{};
+            if (client.SendRequest(wreq, wresp, GetTestTimeoutMs()) && wresp.handled == 1) {
+                ready = true;
+                break;
+            }
+            Sleep(50);
+        }
+        CHECK_TRUE(ready, L"Service did not become ready (Ping handled=1) within 15s");
+    }
 
     // 1. Send Ping
     IpcKeyRequest req{};

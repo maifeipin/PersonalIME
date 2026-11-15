@@ -158,8 +158,18 @@ try {
     }
     Write-Host " READY!" -ForegroundColor Green
 
-    # Execute test_ipc_runner
-    Run-NativeTest -ExeName "test_ipc_runner.exe"
+    # Execute test_ipc_runner (wait for async dictionary warmup before Ping assertion)
+    $runnerExe = Join-Path $BinDir "test_ipc_runner.exe"
+    if (-not (Test-Path $runnerExe)) {
+        throw "Test binary missing: $runnerExe. Ensure C++ project is built."
+    }
+    Write-Host "`n==> [RUN] test_ipc_runner.exe --wait-ready" -ForegroundColor Cyan
+    & $runnerExe --wait-ready
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        throw "CRITICAL FAILURE: test_ipc_runner.exe failed with exit code $code"
+    }
+    Write-Host "==> [PASS] test_ipc_runner.exe" -ForegroundColor Green
 
 } finally {
     # Strictly terminate ONLY our isolated service
