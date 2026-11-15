@@ -2846,8 +2846,164 @@ int main(int argc, char* argv[]) {
         std::wcout << L"[PASS] Delayed & Failed Dictionary Warmup, Mode Toggle & Pending Recovery verified!" << std::endl;
     }
 
+    // 23. In-Typing Trailing Emoji Slot, Pagination, Explicit Type & Snapshot Invalidation
+    {
+        std::wcout << L"\n[TEST 23] In-Typing Trailing Emoji Slot, Pagination, Explicit Type & Snapshot Invalidation..." << std::endl;
+        std::string eDb = (std::filesystem::temp_directory_path() / ("PersonalIME_emoji_" + std::to_string(GetCurrentProcessId()) + ".db")).string();
+        std::error_code ec;
+        std::filesystem::remove(eDb, ec);
+
+        std::string ePipe = "PersonalIME_Test_Emoji_" + std::to_string(GetCurrentProcessId());
+        std::string eAdminPipe = ePipe + "_Admin";
+        std::wstring ePipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(ePipe);
+        IpcClient::SetPipeNameForTest(ePipeW.c_str());
+
+        ServiceProcess eSvc;
+        CHECK_TRUE(eSvc.Start(eDb, dictDir, ePipe, eAdminPipe), L"Start service for Emoji Slot test");
+        IpcClient eClient;
+        const uint64_t sid = 8801, cid = 8802, ownerId = 0xCAFEBABE0001ULL;
+        const uint32_t epoch = 5;
+
+        CHECK_TRUE(eClient.SetMode(sid, cid, IPC_MODE_CHINESE | IPC_MODE_CHINESE_PUNCT, IPC_PROTOCOL_VERSION_STAGE7),
+                   L"SetMode Chinese");
+        CHECK_TRUE(eClient.SetScheme(sid, cid, ime::InputScheme::Pinyin), L"SetScheme Pinyin");
+
+        auto sendKey = [&](uint32_t vk, uint32_t candVer, IpcKeyResponse& outResp) -> bool {
+            IpcKeyRequest req{};
+            req.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+            req.session_id = sid;
+            req.context_id = cid;
+            req.context_epoch = epoch;
+            SetIpcRequestOwnerInstanceId(req, ownerId);
+            req.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+            req.vk_code = vk;
+            req.candidate_version = candVer;
+            return eClient.SendRequest(req, outResp, 200);
+        };
+
+        auto getCandType = [](const IpcKeyResponse& r, uint32_t idx) -> IpcCandidateType {
+            constexpr size_t kCap = sizeof(r.candidates[idx]) / sizeof(wchar_t);
+            size_t len = wcsnlen(r.candidates[idx], kCap);
+            if (len + 3 < kCap && r.candidates[idx][len + 2] >= 1) {
+                return static_cast<IpcCandidateType>(r.candidates[idx][len + 2] - 1);
+            }
+            return IpcCandidateType::Normal;
+        };
+
+        // 23.1: No emoji mapping for "zhongwen" -> all candidates Normal (up to 5)
+        IpcKeyResponse kr{};
+        for (char c : std::string("ZHONGWEN")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type zhongwen");
+        }
+        CHECK_TRUE(kr.candidate_count >= 1, L"'zhongwen' has candidates");
+        for (uint32_t i = 0; i < kr.candidate_count; ++i) {
+            CHECK_TRUE(getCandType(kr, i) == IpcCandidateType::Normal, L"Unmatched query has only Normal candidates");
+        }
+        CHECK_TRUE(sendKey(VK_ESCAPE, 0, kr), L"Escape clears zhongwen");
+
+        // 23.2: Matched code 'kaixin' -> trailing emoji at last slot; test multi-page carryover on 'wo' (>10 normal words)
+        for (char c : std::string("KAIXIN")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type kaixin");
+        }
+        CHECK_TRUE(kr.candidate_count >= 2 && kr.candidate_count <= 5, L"'kaixin' has normal words + trailing emoji");
+        uint32_t lastSlot = kr.candidate_count - 1;
+        for (uint32_t i = 0; i < lastSlot; ++i) {
+            CHECK_TRUE(getCandType(kr, i) == IpcCandidateType::Normal, L"Leading slots are Normal");
+        }
+        CHECK_TRUE(getCandType(kr, lastSlot) == IpcCandidateType::Emoji, L"Last slot is explicit Emoji type");
+        CHECK_TRUE(std::wstring(kr.candidates[lastSlot]).find(L"😊") != std::wstring::npos, L"Last slot contains 😊");
+        uint32_t p0Ver = kr.candidate_version;
+
+        // Select last slot ('1' + lastSlot) -> commits 😊, ConfirmWritten, no user entry created / no learning
+        IpcKeyResponse selResp{};
+        CHECK_TRUE(sendKey(static_cast<uint32_t>('1' + lastSlot), p0Ver, selResp) && selResp.handled == 1 && selResp.has_commit == 1,
+                   L"Pressing number key commits trailing emoji");
+        CHECK_TRUE(std::wstring(selResp.commit_text) == L"😊", L"Committed text is 😊");
+        IpcCommitDisposition disp = IpcCommitDisposition::None;
+        bool conflict = false;
+        CHECK_TRUE(eClient.NotifyCommitTerminal(sid, cid, selResp.commit_event_id,
+                                                IpcCommitDisposition::ConfirmedWritten,
+                                                epoch, selResp.candidate_version, ownerId, disp, conflict),
+                   L"CommitTerminal ConfirmedWritten succeeds for emoji");
+        CHECK_TRUE(!conflict, L"Emoji CommitTerminal has no conflict");
+
+        // 23.3: Admin IPC AddEmojiMapping + 4+1 pagination carryover + stale snapshot rejection
+        auto sendAdmin = [&](const std::string& jsonReq) -> std::string {
+            std::wstring adminPipeW = L"\\\\.\\pipe\\" + ime::Utf8ToWide(eAdminPipe);
+            HANDLE hAdmin = CreateFileW(adminPipeW.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hAdmin == INVALID_HANDLE_VALUE) return "";
+            ime::AdminHeader hdr{};
+            hdr.magic[0] = 'P'; hdr.magic[1] = 'I'; hdr.magic[2] = 'M'; hdr.magic[3] = 'A';
+            hdr.version = ime::ADMIN_PROTOCOL_VERSION_1;
+            hdr.payload_length = static_cast<uint32_t>(jsonReq.size());
+            hdr.request_id = 1;
+            std::vector<uint8_t> buf(sizeof(hdr) + jsonReq.size());
+            std::memcpy(buf.data(), &hdr, sizeof(hdr));
+            std::memcpy(buf.data() + sizeof(hdr), jsonReq.data(), jsonReq.size());
+            DWORD w = 0;
+            WriteFile(hAdmin, buf.data(), static_cast<DWORD>(buf.size()), &w, nullptr);
+            ime::AdminHeader rh{};
+            DWORD r = 0, tot = 0;
+            while (tot < sizeof(rh) && ReadFile(hAdmin, reinterpret_cast<BYTE*>(&rh) + tot, sizeof(rh) - tot, &r, nullptr) && r > 0) tot += r;
+            std::string respStr(rh.payload_length, '\0');
+            tot = 0;
+            while (tot < rh.payload_length && ReadFile(hAdmin, &respStr[tot], rh.payload_length - tot, &r, nullptr) && r > 0) tot += r;
+            CloseHandle(hAdmin);
+            return respStr;
+        };
+
+        // Add 'wo' -> 🙋 so Page 0 has 4 normal + 1 emoji (5 total) and Page 1 starts with 5th normal word
+        std::string addWoResp = sendAdmin(R"({"action":"AddEmojiMapping","protocol_version":1,"params":{"trigger_type":"code","trigger_key":"wo","emoji":"🙋","label":"me","priority":200,"enabled":true}})");
+        CHECK_TRUE(addWoResp.find("\"success\":true") != std::string::npos, L"Admin AddEmojiMapping for 'wo' succeeds");
+
+        for (char c : std::string("WO")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type wo");
+        }
+        CHECK_EQUAL(kr.candidate_count, 5u, L"'wo' page 0 has 5 items (4 normal + 1 emoji)");
+        for (uint32_t i = 0; i < 4; ++i) {
+            CHECK_TRUE(getCandType(kr, i) == IpcCandidateType::Normal, L"'wo' slots 0..3 are Normal");
+        }
+        CHECK_TRUE(getCandType(kr, 4) == IpcCandidateType::Emoji, L"'wo' slot 4 is Emoji");
+        CHECK_TRUE(std::wstring(kr.candidates[4]).find(L"🙋") != std::wstring::npos, L"'wo' slot 4 contains 🙋");
+
+        IpcKeyResponse p1{};
+        CHECK_TRUE(sendKey(VK_NEXT, 0, p1) && p1.handled == 1, L"PageDown from 'wo' page 0 succeeds");
+        CHECK_EQUAL(p1.page_index, 1u, L"'wo' page index is 1");
+        CHECK_TRUE(p1.candidate_count >= 1, L"'wo' page 1 has carried-over normal candidates");
+        CHECK_TRUE(getCandType(p1, 0) == IpcCandidateType::Normal, L"'wo' page 1 slot 0 is carried-over Normal candidate");
+        CHECK_TRUE(sendKey(VK_ESCAPE, 0, kr), L"Escape clears wo");
+
+        for (char c : std::string("KAIXIN")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Re-type kaixin");
+        }
+        uint32_t staleVer = kr.candidate_version;
+        uint32_t kaixinLastSlot = kr.candidate_count - 1;
+        std::string addResp = sendAdmin(R"({"action":"AddEmojiMapping","protocol_version":1,"params":{"trigger_type":"code","trigger_key":"kaixin","emoji":"🤩","label":"star","priority":300,"enabled":true}})");
+        CHECK_TRUE(addResp.find("\"success\":true") != std::string::npos, L"Admin AddEmojiMapping succeeds");
+
+        // Old snapshot version MUST be rejected after mapping change
+        IpcKeyResponse staleSel{};
+        CHECK_TRUE(sendKey(static_cast<uint32_t>('1' + kaixinLastSlot), staleVer, staleSel), L"Stale selection IPC returns");
+        CHECK_EQUAL(staleSel.handled, 0u, L"Selection with pre-mutation snapshot MUST be rejected (handled=0)");
+        CHECK_TRUE(sendKey(VK_ESCAPE, 0, kr), L"Escape clears kaixin");
+
+        // New query picks up higher-priority 🤩 at last slot
+        for (char c : std::string("KAIXIN")) {
+            CHECK_TRUE(sendKey(static_cast<uint32_t>(c), 0, kr) && kr.handled == 1, L"Type kaixin after AddEmojiMapping");
+        }
+        kaixinLastSlot = kr.candidate_count - 1;
+        CHECK_TRUE(getCandType(kr, kaixinLastSlot) == IpcCandidateType::Emoji, L"Last slot is Emoji after mapping update");
+        CHECK_TRUE(std::wstring(kr.candidates[kaixinLastSlot]).find(L"🤩") != std::wstring::npos, L"Higher priority 🤩 appears on Page 0");
+
+        eClient.Disconnect();
+        eSvc.Stop();
+        std::filesystem::remove(eDb, ec);
+        IpcClient::SetPipeNameForTest(nullptr);
+        std::wcout << L"[PASS] In-Typing Trailing Emoji Slot, Pagination, Explicit Type & Snapshot Invalidation verified!" << std::endl;
+    }
+
     std::wcout << L"\n=======================================================\n";
-    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (22/22)\n";
+    std::wcout << L"  ALL Stage 3 & 4C-2 & 7.1a End-to-End Tests PASSED! (23/23)\n";
     std::wcout << L"=======================================================\n";
     return 0;
 }

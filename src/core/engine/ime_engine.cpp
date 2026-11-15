@@ -39,6 +39,7 @@ bool ImeEngine::InitializeCore(const std::string& dbPath,
     m_repo = std::make_unique<EntryRepository>(m_db, m_clock);
     m_repo->SetBuiltinDictProvider([this]() { return GetBuiltinDictSnapshot(); });
     m_pluginRepo = std::make_unique<PluginRepository>(m_db);
+    m_emojiRepo = std::make_unique<EmojiRepository>(m_db);
     m_coordinator = std::make_unique<InputCoordinator>(*m_repo, *m_initialEmptyDict, m_clock);
     m_coordinator->SetBuiltinDictProvider([this]() { return GetBuiltinDictSnapshot(); });
 

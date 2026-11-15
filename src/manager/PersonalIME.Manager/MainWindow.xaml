@@ -240,6 +240,10 @@
                 <views:PluginsView DataContext="{Binding Plugins}"/>
             </TabItem>
 
+            <TabItem Header="表情联想">
+                <views:EmojiMappingsView DataContext="{Binding EmojiMappings}"/>
+            </TabItem>
+
             <TabItem Header="系统与诊断">
                 <views:MaintenanceView DataContext="{Binding Maintenance}"/>
             </TabItem>

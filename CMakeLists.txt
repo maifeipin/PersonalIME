@@ -45,6 +45,7 @@ add_library(ime-core STATIC
     src/core/storage/migration.cpp
     src/core/storage/entry_repository.cpp
     src/core/storage/plugin_repository.cpp
+    src/core/storage/emoji_repository.cpp
     src/core/storage/json_backup.cpp
     src/core/encoding/pinyin_segmenter.cpp
     src/core/encoding/shuangpin_decoder.cpp

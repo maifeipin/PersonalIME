@@ -40,6 +40,12 @@ enum class IpcCommitDisposition : uint32_t {
     ClosedUnknown        = 5  // No potential writer remains & outcome unknown; finalize without learning
 };
 
+// Explicit candidate source type encoded in candidate metadata (never guessed from text/ID)
+enum class IpcCandidateType : uint16_t {
+    Normal = 0,
+    Emoji  = 1
+};
+
 // Independent Scheme Identifier (Wire Protocol Values)
 enum class IpcSchemeId : uint32_t {
     Unchanged = 0,

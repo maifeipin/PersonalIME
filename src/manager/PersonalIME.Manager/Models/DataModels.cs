@@ -461,3 +461,29 @@ public class PluginLogModel
     public string ExecutedAt { get; set; } = string.Empty;
 }
 
+public class EmojiMappingModel
+{
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
+
+    [JsonPropertyName("trigger_type")]
+    public string TriggerType { get; set; } = "text";
+
+    [JsonPropertyName("trigger_key")]
+    public string TriggerKey { get; set; } = string.Empty;
+
+    [JsonPropertyName("emoji")]
+    public string Emoji { get; set; } = string.Empty;
+
+    [JsonPropertyName("label")]
+    public string Label { get; set; } = string.Empty;
+
+    [JsonPropertyName("priority")]
+    public int Priority { get; set; } = 100;
+
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = true;
+
+    public string TriggerTypeDisplay => TriggerType == "code" ? "编码" : "首选词";
+}
+

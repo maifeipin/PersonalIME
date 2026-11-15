@@ -12,6 +12,7 @@
 #include "../ranking/ranker.h"
 #include "../strategy/input_coordinator.h"
 #include "../storage/plugin_repository.h"
+#include "../storage/emoji_repository.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,6 +99,7 @@ public:
     std::shared_ptr<const BuiltinDictionary> GetBuiltinDictSnapshot() const;
     EntryRepository* GetRepo() { return m_repo.get(); }
     PluginRepository* GetPluginRepo() { return m_pluginRepo.get(); }
+    EmojiRepository* GetEmojiRepo() { return m_emojiRepo.get(); }
     InputCoordinator* GetCoordinator() { return m_coordinator.get(); }
     SqliteDb& GetDb() { return m_db; }
 
@@ -117,6 +119,7 @@ private:
     SqliteDb m_db;
     std::unique_ptr<EntryRepository> m_repo;
     std::unique_ptr<PluginRepository> m_pluginRepo;
+    std::unique_ptr<EmojiRepository> m_emojiRepo;
     PinyinSegmenter m_pinyinSegmenter;
     std::shared_ptr<const BuiltinDictionary> m_initialEmptyDict;
     std::shared_ptr<const BuiltinDictionary> m_builtinDictSnapshot;

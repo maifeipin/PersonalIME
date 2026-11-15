@@ -196,7 +196,23 @@ bool Migration::Migrate(SqliteDb& db) {
         }
     }
 
+    bool needsV8 = (currentVer < 8);
+    if (!needsV8) {
+        auto stmt = db.Prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='emoji_mappings';");
+        if (!stmt || !stmt->Step()) {
+            needsV8 = true;
+        }
+    }
+    if (needsV8) {
+        if (!ApplyVersion8(db)) {
+            return false;
+        }
+    }
+
     if (!EnsureDefaultPluginsSeeded(db)) {
+        return false;
+    }
+    if (!EnsureDefaultEmojiMappingsSeeded(db)) {
         return false;
     }
 
@@ -738,6 +754,133 @@ bool Migration::ApplyVersion7(SqliteDb& db) {
         return false;
     }
 
+    return tx.Commit();
+}
+
+bool Migration::ApplyVersion8(SqliteDb& db) {
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+
+    const char* sql = R"SQL(
+        CREATE TABLE IF NOT EXISTS emoji_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger_type TEXT NOT NULL CHECK(trigger_type IN ('code', 'text')),
+            trigger_key TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            priority INTEGER NOT NULL DEFAULT 100,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(trigger_type, trigger_key, emoji)
+        );
+        CREATE INDEX IF NOT EXISTS idx_emoji_mappings_lookup
+            ON emoji_mappings(enabled, trigger_type, trigger_key, priority DESC, id ASC);
+    )SQL";
+
+    if (!db.Execute(sql)) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('schema_version', '8');")) {
+        tx.Rollback();
+        return false;
+    }
+
+    if (!db.Execute("PRAGMA user_version = 8;")) {
+        tx.Rollback();
+        return false;
+    }
+
+    return tx.Commit();
+}
+
+bool Migration::SeedDefaultEmojiMappingsInTransaction(SqliteDb& db) {
+    auto checkStmt = db.Prepare("SELECT value FROM meta_settings WHERE key = 'default_emoji_mappings_seeded';");
+    if (!checkStmt) return false;
+    if (checkStmt->Step() && checkStmt->ColumnText(0) == "1") {
+        return true;
+    }
+    if (checkStmt->HasError()) return false;
+
+    struct DefaultEmojiSeed {
+        const char* type;
+        const char* key;
+        const char* emoji;
+        const char* label;
+        int priority;
+    };
+    static const DefaultEmojiSeed kSeeds[] = {
+        { "text", "\xe5\xbc\x80\xe5\xbf\x83", "\xf0\x9f\x98\x8a", "\xe5\xbe\xae\xe7\xac\x91", 200 }, // 开心 -> 😊
+        { "text", "\xe9\xab\x98\xe5\x85\xb4", "\xf0\x9f\x98\x84", "\xe5\xa4\xa7\xe7\xac\x91", 200 }, // 高兴 -> 😄
+        { "text", "\xe5\xa4\xa7\xe7\xac\x91", "\xf0\x9f\x98\x82", "\xe7\xac\x91\xe5\x93\xad", 200 }, // 大笑 -> 😂
+        { "text", "\xe5\x93\x88\xe5\x93\x88", "\xf0\x9f\x98\x82", "\xe7\xac\x91\xe5\x93\xad", 200 }, // 哈哈 -> 😂
+        { "text", "\xe8\xb5\x9e", "\xf0\x9f\x91\x8d", "\xe7\x82\xb9\xe8\xb5\x9e", 200 },         // 赞 -> 👍
+        { "text", "\xe7\x82\xb9\xe8\xb5\x9e", "\xf0\x9f\x91\x8d", "\xe7\x82\xb9\xe8\xb5\x9e", 200 }, // 点赞 -> 👍
+        { "text", "\xe5\x8a\xa0\xe6\xb2\xb9", "\xf0\x9f\x92\xaa", "\xe5\x8a\xa0\xe6\xb2\xb9", 200 }, // 加油 -> 💪
+        { "text", "\xe8\xb0\xa2\xe8\xb0\xa2", "\xf0\x9f\x99\x8f", "\xe6\x84\x9f\xe8\xb0\xa2", 200 }, // 谢谢 -> 🙏
+        { "text", "\xe6\x84\x9f\xe8\xb0\xa2", "\xf0\x9f\x99\x8f", "\xe6\x84\x9f\xe8\xb0\xa2", 200 }, // 感谢 -> 🙏
+        { "text", "\xe7\x88\xb1\xe5\xbf\x83", "\xe2\x9d\xa4\xef\xb8\x8f", "\xe7\x88\xb1\xe5\xbf\x83", 200 }, // 爱心 -> ❤️
+        { "text", "\xe5\x96\x9c\xe6\xac\xa2", "\xe2\x9d\xa4\xef\xb8\x8f", "\xe7\x88\xb1\xe5\xbf\x83", 200 }, // 喜欢 -> ❤️
+        { "text", "\xe5\xa5\xbd\xe7\x9a\x84", "\xf0\x9f\x91\x8c", "OK", 200 },                       // 好的 -> 👌
+        { "text", "\xe6\x94\xb6\xe5\x88\xb0", "\xf0\x9f\xab\xa1", "\xe6\x94\xb6\xe5\x88\xb0", 200 }, // 收到 -> 🫡
+        { "text", "\xe5\xba\x86\xe7\xa5\x9d", "\xf0\x9f\x8e\x89", "\xe5\xba\x86\xe7\xa5\x9d", 200 }, // 庆祝 -> 🎉
+        { "text", "\xe6\x81\xad\xe5\x96\x9c", "\xf0\x9f\x8e\x89", "\xe5\xba\x86\xe7\xa5\x9d", 200 }, // 恭喜 -> 🎉
+        { "text", "\xe7\x81\xab\xe7\xae\xad", "\xf0\x9f\x9a\x80", "\xe7\x81\xab\xe7\xae\xad", 200 }, // 火箭 -> 🚀
+        { "text", "\xe9\x9a\xbe\xe8\xbf\x87", "\xf0\x9f\x98\xa2", "\xe9\x9a\xbe\xe8\xbf\x87", 200 }, // 难过 -> 😢
+        { "text", "\xe7\x96\x91\xe6\x83\x91", "\xf0\x9f\xa4\x94", "\xe6\x80\x9d\xe8\x80\x83", 200 }, // 疑惑 -> 🤔
+        { "text", "\xe6\x80\x9d\xe8\x80\x83", "\xf0\x9f\xa4\x94", "\xe6\x80\x9d\xe8\x80\x83", 200 }, // 思考 -> 🤔
+        { "text", "\xe9\xbc\x93\xe6\x8e\x8c", "\xf0\x9f\x91\x8f", "\xe9\xbc\x93\xe6\x8e\x8c", 200 }, // 鼓掌 -> 👏
+        { "text", "\xe6\x8f\xa1\xe6\x89\x8b", "\xf0\x9f\xa4\x9d", "\xe6\x8f\xa1\xe6\x89\x8b", 200 }, // 握手 -> 🤝
+        { "text", "\xe5\x92\x96\xe5\x95\xa1", "\xe2\x98\x95", "\xe5\x92\x96\xe5\x95\xa1", 200 },     // 咖啡 -> ☕
+        { "text", "\xe5\x86\x8d\xe8\xa7\x81", "\xf0\x9f\x91\x8b", "\xe5\x86\x8d\xe8\xa7\x81", 200 }, // 再见 -> 👋
+        { "text", "\xe6\x99\x9a\xe5\xae\x89", "\xf0\x9f\x8c\x99", "\xe6\x99\x9a\xe5\xae\x89", 200 }, // 晚安 -> 🌙
+        { "code", "kaixin", "\xf0\x9f\x98\x8a", "\xe5\xbe\xae\xe7\xac\x91", 250 },                   // kaixin -> 😊
+        { "code", "haha", "\xf0\x9f\x98\x82", "\xe7\xac\x91\xe5\x93\xad", 250 },                     // haha -> 😂
+        { "code", "zan", "\xf0\x9f\x91\x8d", "\xe7\x82\xb9\xe8\xb5\x9e", 250 },                      // zan -> 👍
+        { "code", "jiayou", "\xf0\x9f\x92\xaa", "\xe5\x8a\xa0\xe6\xb2\xb9", 250 },                   // jiayou -> 💪
+        { "code", "xiexie", "\xf0\x9f\x99\x8f", "\xe6\x84\x9f\xe8\xb0\xa2", 250 },                   // xiexie -> 🙏
+        { "code", "bq", "\xf0\x9f\x98\x8a", "\xe8\xa1\xa8\xe6\x83\x85", 250 }                        // bq -> 😊
+    };
+
+    const char* insSql =
+        "INSERT OR IGNORE INTO emoji_mappings (trigger_type, trigger_key, emoji, label, priority, enabled, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, 1, strftime('%s','now'), strftime('%s','now'));";
+    for (const auto& s : kSeeds) {
+        auto stmt = db.Prepare(insSql);
+        if (!stmt) return false;
+        stmt->BindText(1, s.type);
+        stmt->BindText(2, s.key);
+        stmt->BindText(3, s.emoji);
+        stmt->BindText(4, s.label);
+        stmt->BindInt(5, s.priority);
+        if (!stmt->Execute()) return false;
+    }
+
+    return db.Execute("INSERT OR REPLACE INTO meta_settings (key, value) VALUES ('default_emoji_mappings_seeded', '1');");
+}
+
+bool Migration::EnsureDefaultEmojiMappingsSeeded(SqliteDb& db) {
+    auto seededStmt = db.Prepare("SELECT value FROM meta_settings WHERE key = 'default_emoji_mappings_seeded';");
+    if (!seededStmt) {
+        return false;
+    }
+    bool hasRow = seededStmt->Step();
+    if (seededStmt->HasError()) {
+        return false;
+    }
+    if (hasRow && seededStmt->ColumnText(0) == "1") {
+        return true;
+    }
+    seededStmt.reset();
+
+    SqliteDb::Transaction tx(db);
+    if (!tx.IsStarted()) return false;
+    if (!SeedDefaultEmojiMappingsInTransaction(db)) {
+        tx.Rollback();
+        return false;
+    }
     return tx.Commit();
 }
 

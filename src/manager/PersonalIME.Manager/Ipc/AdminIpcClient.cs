@@ -458,6 +458,56 @@ public class AdminIpcClient : IAdminClient
         await SendRequestAsync("ClearPluginLogs", p, ct);
     }
 
+    public async Task<List<EmojiMappingModel>> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+    {
+        var p = new JsonObject { ["only_enabled"] = onlyEnabled };
+        var data = await SendRequestAsync("GetEmojiMappings", p, ct);
+        if (data.TryGetProperty("mappings", out var prop))
+        {
+            return JsonSerializer.Deserialize<List<EmojiMappingModel>>(prop.GetRawText()) ?? [];
+        }
+        return [];
+    }
+
+    public async Task<long> AddEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default)
+    {
+        var p = new
+        {
+            trigger_type = mapping.TriggerType,
+            trigger_key = mapping.TriggerKey,
+            emoji = mapping.Emoji,
+            label = mapping.Label,
+            priority = mapping.Priority,
+            enabled = mapping.Enabled
+        };
+        var data = await SendRequestAsync("AddEmojiMapping", p, ct);
+        if (data.TryGetProperty("id", out var idProp))
+        {
+            return idProp.GetInt64();
+        }
+        throw new AdminException(AdminErrorCode.ValidationFailed, "服务端未返回映射 id");
+    }
+
+    public async Task UpdateEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default)
+    {
+        var p = new
+        {
+            id = mapping.Id,
+            trigger_type = mapping.TriggerType,
+            trigger_key = mapping.TriggerKey,
+            emoji = mapping.Emoji,
+            label = mapping.Label,
+            priority = mapping.Priority,
+            enabled = mapping.Enabled
+        };
+        await SendRequestAsync("UpdateEmojiMapping", p, ct);
+    }
+
+    public async Task DeleteEmojiMappingAsync(long id, CancellationToken ct = default)
+    {
+        await SendRequestAsync("DeleteEmojiMapping", new { id }, ct);
+    }
+
     public async Task ShutdownAsync(CancellationToken ct = default)
     {
         await SendRequestAsync("Shutdown", null, ct);

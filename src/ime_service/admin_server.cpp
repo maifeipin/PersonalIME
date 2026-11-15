@@ -1548,6 +1548,130 @@ std::string AdminServer::HandleRequest(const std::string& requestJson, uint32_t 
             return MakeSuccessResponse(action, requestId, data);
         }
 
+        // 17b. Emoji Mappings CRUD (In-typing trailing emoji slot)
+        if (action == "GetEmojiMappings" || action == "get_emoji_mappings") {
+            if (!m_engine.GetEmojiRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Emoji repository unavailable");
+            }
+            bool onlyEnabled = false;
+            std::string err;
+            if (params.contains("only_enabled")) {
+                CheckBoolField(params, "only_enabled", onlyEnabled, false, false, err);
+            }
+            std::vector<EmojiMappingRecord> list;
+            if (!m_engine.GetEmojiRepo()->GetAllMappings(list, onlyEnabled)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Failed to query emoji mappings");
+            }
+            nlohmann::json arr = nlohmann::json::array();
+            for (const auto& m : list) {
+                nlohmann::json item;
+                item["id"] = m.id;
+                item["trigger_type"] = m.trigger_type;
+                item["trigger_key"] = m.trigger_key;
+                item["emoji"] = m.emoji;
+                item["label"] = m.label;
+                item["priority"] = m.priority;
+                item["enabled"] = m.enabled;
+                item["created_at"] = m.created_at;
+                item["updated_at"] = m.updated_at;
+                arr.push_back(item);
+            }
+            nlohmann::json data;
+            data["mappings"] = arr;
+            data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        if (action == "AddEmojiMapping" || action == "add_emoji_mapping") {
+            if (!m_engine.GetEmojiRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Emoji repository unavailable");
+            }
+            std::string triggerType, triggerKey, emoji, label, err;
+            if (!CheckStringField(params, "trigger_type", triggerType, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            if (!CheckStringField(params, "trigger_key", triggerKey, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            if (!CheckStringField(params, "emoji", emoji, true, err)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, err);
+            }
+            CheckStringField(params, "label", label, false, err);
+            int priority = 100;
+            CheckIntField(params, "priority", priority, false, 100, err);
+            bool enabled = true;
+            CheckBoolField(params, "enabled", enabled, false, true, err);
+
+            EmojiMappingRecord rec;
+            rec.trigger_type = triggerType;
+            rec.trigger_key = triggerKey;
+            rec.emoji = emoji;
+            rec.label = label;
+            rec.priority = priority;
+            rec.enabled = enabled;
+
+            int64_t newId = 0;
+            std::string repoErr;
+            if (!m_engine.GetEmojiRepo()->AddMapping(rec, newId, &repoErr)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed,
+                                         repoErr.empty() ? "Failed to add emoji mapping" : repoErr);
+            }
+            nlohmann::json data;
+            data["success"] = true;
+            data["id"] = newId;
+            data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        if (action == "UpdateEmojiMapping" || action == "update_emoji_mapping") {
+            if (!m_engine.GetEmojiRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Emoji repository unavailable");
+            }
+            int id = 0;
+            std::string err;
+            if (!CheckIntField(params, "id", id, true, 0, err) || id <= 0) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Valid 'id' is required");
+            }
+            EmojiMappingRecord rec;
+            if (!m_engine.GetEmojiRepo()->GetMappingById(id, rec)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Emoji mapping not found");
+            }
+            if (params.contains("trigger_type")) CheckStringField(params, "trigger_type", rec.trigger_type, false, err);
+            if (params.contains("trigger_key")) CheckStringField(params, "trigger_key", rec.trigger_key, false, err);
+            if (params.contains("emoji")) CheckStringField(params, "emoji", rec.emoji, false, err);
+            if (params.contains("label")) CheckStringField(params, "label", rec.label, false, err);
+            if (params.contains("priority")) CheckIntField(params, "priority", rec.priority, false, rec.priority, err);
+            if (params.contains("enabled")) CheckBoolField(params, "enabled", rec.enabled, false, rec.enabled, err);
+
+            std::string repoErr;
+            if (!m_engine.GetEmojiRepo()->UpdateMapping(rec, &repoErr)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed,
+                                         repoErr.empty() ? "Failed to update emoji mapping" : repoErr);
+            }
+            nlohmann::json data;
+            data["success"] = true;
+            data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
+        if (action == "DeleteEmojiMapping" || action == "delete_emoji_mapping") {
+            if (!m_engine.GetEmojiRepo()) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::StorageError, "Emoji repository unavailable");
+            }
+            int id = 0;
+            std::string err;
+            if (!CheckIntField(params, "id", id, true, 0, err) || id <= 0) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Valid 'id' is required");
+            }
+            if (!m_engine.GetEmojiRepo()->DeleteMapping(id)) {
+                return MakeErrorResponse(action, requestId, AdminErrorCode::ValidationFailed, "Failed to delete emoji mapping");
+            }
+            nlohmann::json data;
+            data["success"] = true;
+            data["revision"] = m_engine.GetEmojiRepo()->GetRevision();
+            return MakeSuccessResponse(action, requestId, data);
+        }
+
         // 18. ExecutePlugin
         if (action == "ExecutePlugin" || action == "execute_plugin") {
             if (!m_engine.GetPluginRepo()) {

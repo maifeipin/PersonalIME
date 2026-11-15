@@ -219,6 +219,30 @@ public class MockAdminClient : IAdminClient
         return Task.CompletedTask;
     }
 
+    public List<EmojiMappingModel> MockEmojiMappings { get; } = [];
+    public Task<List<EmojiMappingModel>> GetEmojiMappingsAsync(bool onlyEnabled = false, CancellationToken ct = default)
+        => Task.FromResult(onlyEnabled ? MockEmojiMappings.Where(m => m.Enabled).ToList() : MockEmojiMappings.ToList());
+
+    public Task<long> AddEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default)
+    {
+        mapping.Id = MockEmojiMappings.Count > 0 ? MockEmojiMappings.Max(m => m.Id) + 1 : 1;
+        MockEmojiMappings.Add(mapping);
+        return Task.FromResult(mapping.Id);
+    }
+
+    public Task UpdateEmojiMappingAsync(EmojiMappingModel mapping, CancellationToken ct = default)
+    {
+        var idx = MockEmojiMappings.FindIndex(m => m.Id == mapping.Id);
+        if (idx >= 0) MockEmojiMappings[idx] = mapping;
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteEmojiMappingAsync(long id, CancellationToken ct = default)
+    {
+        MockEmojiMappings.RemoveAll(m => m.Id == id);
+        return Task.CompletedTask;
+    }
+
     public Func<CancellationToken, Task>? OnShutdown { get; set; }
     public Task ShutdownAsync(CancellationToken ct = default)
     {

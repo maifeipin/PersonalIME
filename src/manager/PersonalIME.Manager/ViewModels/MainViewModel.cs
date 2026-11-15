@@ -38,6 +38,7 @@ public class MainViewModel : ViewModelBase, IDisposable
     public SettingsViewModel Settings { get; }
     public MaintenanceViewModel Maintenance { get; }
     public PluginsViewModel Plugins { get; }
+    public EmojiMappingsViewModel EmojiMappings { get; }
 
     public ServiceConnectionState ServiceState
     {
@@ -169,6 +170,7 @@ public class MainViewModel : ViewModelBase, IDisposable
         Settings = new SettingsViewModel(_client, Banner);
         Maintenance = new MaintenanceViewModel(_client, Banner, RestartServiceAsync, () => CanPerformLifecycleAction);
         Plugins = new PluginsViewModel(_client, Banner);
+        EmojiMappings = new EmojiMappingsViewModel(_client, Banner);
 
         Settings.PolicySaved += OnPolicySaved;
 
@@ -817,6 +819,9 @@ public class MainViewModel : ViewModelBase, IDisposable
                 _ = Plugins.LoadDataAsync();
                 break;
             case 4:
+                _ = EmojiMappings.LoadDataAsync();
+                break;
+            case 5:
                 _ = Maintenance.RefreshStatusAsync();
                 break;
         }

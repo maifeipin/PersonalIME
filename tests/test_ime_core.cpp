@@ -1001,8 +1001,8 @@ int TestStage71aSchemaAndTerminalDisposition() {
     std::cout << "[TEST] Testing Stage 7.1a Schema v7 Migration & FinalizeTerminalCommitEvent..." << std::endl;
     SqliteDb db;
     TEST_ASSERT(db.Open(":memory:"), "Open in-memory DB for Stage 7.1a");
-    TEST_ASSERT(Migration::Migrate(db), "Migrate in-memory DB to v7");
-    TEST_ASSERT(Migration::GetSchemaVersion(db) == 7, "Schema version is 7");
+    TEST_ASSERT(Migration::Migrate(db), "Migrate in-memory DB to latest schema");
+    TEST_ASSERT(Migration::GetSchemaVersion(db) == Migration::CURRENT_SCHEMA_VERSION, "Schema version matches CURRENT_SCHEMA_VERSION");
 
     auto hasColumn = [&](const char* table, const std::string& col) {
         auto stmt = db.Prepare(std::string("PRAGMA table_info(") + table + ");");
