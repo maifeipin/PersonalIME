@@ -2456,7 +2456,26 @@ int main(int argc, char* argv[]) {
         CHECK_TRUE(s74Service.Start(s74Db, dictDir, s74Pipe, s74AdminPipe), L"Start isolated service for Test 21");
 
         IpcClient client;
-        // 21.1: Full 80-host whitelist pagination via GetStage7Settings
+        // 21.1: First trigger a truncated candidate query on context 1, then paginate 80-host whitelist to the last page
+        CHECK_TRUE(client.SetScheme(2100, 1, ime::InputScheme::Shuangpin), L"Select Shuangpin on context 1");
+        CHECK_TRUE(client.SetMode(2100, 1, IPC_MODE_CHINESE, IPC_PROTOCOL_VERSION_STAGE4, IPC_UPDATE_CHINESE),
+                   L"Set Chinese mode on context 1");
+        {
+            IpcKeyRequest qreq{};
+            qreq.msg_type = static_cast<uint32_t>(IpcMsgType::KeyDown);
+            qreq.session_id = 2100;
+            qreq.context_id = 1;
+            qreq.protocol_version = IPC_PROTOCOL_VERSION_STAGE7;
+            IpcKeyResponse qresp{};
+            for (int i = 0; i < 5; ++i) {
+                qreq.vk_code = 'N'; CHECK_TRUE(client.SendRequest(qreq, qresp, 200), L"Type ambiguous shuangpin initial");
+                qreq.vk_code = 'T'; CHECK_TRUE(client.SendRequest(qreq, qresp, 200), L"Type ambiguous shuangpin final");
+            }
+            CHECK_TRUE((qresp.status_flags & IPC_STATUS_TRUNCATED) != 0,
+                       L"Context 1 has active truncated candidate query before GetStage7Settings");
+        }
+
+        // Full 80-host whitelist pagination via GetStage7Settings on the same context 1
         std::vector<std::wstring> allDecodedHosts;
         size_t pageOffset = 0;
         int pageCount = 0;

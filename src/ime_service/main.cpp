@@ -1187,7 +1187,7 @@ void HandleClient(HANDLE hPipe) {
             }
         }
         else if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
-            resp.status_flags = ComputeModeFlags(state);
+            resp.status_flags = ComputeModeFlags(state) & ~IPC_STATUS_TRUNCATED;
             if (g_engine.GetCoordinator()) {
                 auto pol = g_engine.GetCoordinator()->GetPolicySnapshot();
                 if (pol) {
@@ -1867,10 +1867,12 @@ void HandleClient(HANDLE hPipe) {
             IPC_STATUS_HAS_QUERY_CODE |
             IPC_STATUS_HAS_CAND_CORES
         );
+        uint32_t baseModeFlags = ComputeModeFlags(state);
         if (req.msg_type == static_cast<uint32_t>(IpcMsgType::GetStage7Settings)) {
+            baseModeFlags &= ~IPC_STATUS_TRUNCATED;
             preservedStageFlags |= (resp.status_flags & IPC_STATUS_TRUNCATED);
         }
-        resp.status_flags = ComputeModeFlags(state) | preservedStageFlags;
+        resp.status_flags = baseModeFlags | preservedStageFlags;
         if (req.protocol_version >= IPC_PROTOCOL_VERSION_STAGE7 ||
             req.msg_type == static_cast<uint32_t>(IpcMsgType::Ping)) {
             resp.status_flags |= IPC_STATUS_STAGE7_CAPABLE;
