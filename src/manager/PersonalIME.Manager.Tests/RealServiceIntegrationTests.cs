@@ -317,11 +317,16 @@ public class RealServiceIntegrationTests
 
         try
         {
-            await Task.Delay(800);
+            await Task.Delay(500);
             var client = new AdminIpcClient(testPipe);
 
-            // 1. Fresh Builtin Pin under Wubi86 (Empty DB, not yet materialized into entries table)
+            // Wait for async builtin dictionary warmup before querying builtin candidates
             var wbCands = await client.GetScopeCandidatesAsync(InputSchemes.Wubi86, "gh");
+            for (int w = 0; w < 150 && !wbCands.Any(c => c.EntryId.StartsWith("b_")); w++)
+            {
+                await Task.Delay(100);
+                wbCands = await client.GetScopeCandidatesAsync(InputSchemes.Wubi86, "gh");
+            }
             var wbBuiltin = wbCands.FirstOrDefault(c => c.EntryId.StartsWith("b_"));
             Assert.IsNotNull(wbBuiltin, "Must find builtin candidate for wubi86 'gh'");
             Assert.IsFalse(string.IsNullOrEmpty(wbBuiltin.Text), "Builtin candidate text must not be empty");

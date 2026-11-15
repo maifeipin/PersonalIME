@@ -221,7 +221,7 @@ bool ImeEngine::CommitCandidate(const std::string& eventId,
                                 InputScheme scheme,
                                 const std::string& code,
                                 const std::string& entryId) {
-    if (!m_initialized || code.empty() || entryId.empty() || scheme == InputScheme::Unknown) return false;
+    if (!m_coreInitialized || code.empty() || entryId.empty() || scheme == InputScheme::Unknown) return false;
 
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -306,14 +306,14 @@ std::vector<EntryRepository::PendingCommitRecord> ImeEngine::LoadAllPendingCommi
 
 std::string ImeEngine::AddUserEntry(const std::wstring& text,
                                     const std::vector<std::pair<InputScheme, std::string>>& codes) {
-    if (!m_initialized) return "";
+    if (!m_coreInitialized || !m_repo) return "";
     return m_repo->AddEntry(text, codes);
 }
 
 bool ImeEngine::EditUserEntry(const std::string& entryId,
                               const std::wstring& newText,
                               const std::vector<std::pair<InputScheme, std::string>>& newCodes) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     if (!newCodes.empty()) {
         return m_repo->UpdateEntry(entryId, newText, newCodes);
     }
@@ -322,27 +322,27 @@ bool ImeEngine::EditUserEntry(const std::string& entryId,
 
 bool ImeEngine::SetUserEntryCodes(const std::string& entryId,
                                   const std::vector<std::pair<InputScheme, std::string>>& newCodes) {
-    if (!m_initialized || !m_repo) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->SetEntryCodes(entryId, newCodes);
 }
 
 bool ImeEngine::DeleteUserEntry(const std::string& entryId) {
-    if (!m_initialized) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->DeleteEntry(entryId);
 }
 
 std::optional<Entry> ImeEngine::GetUserEntry(const std::string& entryId) {
-    if (!m_initialized) return std::nullopt;
+    if (!m_coreInitialized || !m_repo) return std::nullopt;
     return m_repo->GetEntry(entryId);
 }
 
 std::vector<Entry> ImeEngine::GetAllUserEntries() {
-    if (!m_initialized) return {};
+    if (!m_coreInitialized || !m_repo) return {};
     return m_repo->GetAllUserEntries();
 }
 
 bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const std::string& entryId, int rank) {
-    if (!m_initialized || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
+    if (!m_coreInitialized || !m_repo || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
 
@@ -363,24 +363,24 @@ bool ImeEngine::PinCandidate(InputScheme scheme, const std::string& code, const 
 }
 
 bool ImeEngine::UnpinCandidate(InputScheme scheme, const std::string& code, const std::string& entryId) {
-    if (!m_initialized || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
+    if (!m_coreInitialized || !m_repo || scheme == InputScheme::Unknown || code.empty() || entryId.empty()) return false;
     std::string clean = code;
     std::transform(clean.begin(), clean.end(), clean.begin(), [](unsigned char c) { return std::tolower(c); });
     return m_repo->UnpinPreference(scheme, clean, entryId);
 }
 
 bool ImeEngine::ResetStats(const std::string& entryId) {
-    if (!m_initialized) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return m_repo->ResetStats(entryId);
 }
 
 bool ImeEngine::ExportData(const std::string& jsonFilePath, std::string* errorOut) {
-    if (!m_initialized) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     return JsonBackup::ExportToFile(*m_repo, m_db, jsonFilePath, errorOut);
 }
 
 bool ImeEngine::ImportData(const std::string& jsonFilePath, bool replaceMode, std::string* errorOut) {
-    if (!m_initialized) return false;
+    if (!m_coreInitialized || !m_repo) return false;
     auto dictSnap = GetBuiltinDictSnapshot();
     return JsonBackup::ImportFromFile(*m_repo, m_db, jsonFilePath, replaceMode, errorOut, dictSnap.get());
 }

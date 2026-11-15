@@ -85,7 +85,13 @@ public class RealWpfUiOperationTests
     public void TestRealWpfFourPagesOperationAndEvidenceCapture()
     {
         string repoRoot = FindRepoRoot();
-        string serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
+        string buildDir = Environment.GetEnvironmentVariable("PERSONALIME_BUILD_DIR") ?? "build";
+        string resolvedBuildDir = Path.IsPathRooted(buildDir) ? buildDir : Path.Combine(repoRoot, buildDir);
+        string serviceExe = Path.Combine(resolvedBuildDir, @"Release\ime-service.exe");
+        if (!File.Exists(serviceExe))
+        {
+            serviceExe = Path.Combine(repoRoot, @"build\Release\ime-service.exe");
+        }
         if (!File.Exists(serviceExe))
         {
             Assert.Inconclusive("ime-service.exe not found at " + serviceExe);
