@@ -4102,6 +4102,22 @@ static int TestShiftTapAndCapsLockDispatchChain() {
     CHECK_TRUE(isChinese, L"Chinese mode preserved after stale receipt drained");
     CHECK_EQUAL(tip.GetPendingV2ReceiptCountForTest(), static_cast<size_t>(0), L"Stale PendingV2Receipt retired cleanly");
 
+    // 13. Direct OnKeyDown -> OnKeyUp without OnTestKeyDown/OnTestKeyUp (Win11 Notepad WinUI 3 path)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        isChinese = true;
+    }
+    int togglesBeforeDirect = toggleCalls;
+    BOOL directDownEaten = FALSE;
+    BOOL directUpEaten = FALSE;
+    LPARAM leftShiftLp = static_cast<LPARAM>(0x2A) << 16;
+    tip.OnKeyDown(&ctx, VK_SHIFT, leftShiftLp, &directDownEaten);
+    CHECK_EQUAL(directDownEaten, FALSE, L"Direct OnKeyDown(VK_SHIFT) does not eat key");
+    tip.OnKeyUp(&ctx, VK_SHIFT, leftShiftLp, &directUpEaten);
+    CHECK_EQUAL(directUpEaten, FALSE, L"Direct OnKeyUp(VK_SHIFT) passes key up to host");
+    CHECK_EQUAL(toggleCalls, togglesBeforeDirect + 1, L"Direct OnKeyDown -> OnKeyUp toggles mode");
+    CHECK_TRUE(!isChinese, L"Direct OnKeyDown -> OnKeyUp switched to English");
+
     tip.Deactivate();
     stopServer.store(true);
     HANDLE hWake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);

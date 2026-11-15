@@ -12,6 +12,58 @@
 #include "receipt_journal.h"
 #include "receipt_journal_v2.h"
 #include "receipt_retry.h"
+#include <cstdarg>
+#include <cstdio>
+
+// [DEBUG-SHIFT-LOG] Set to 0 (or remove) to disable Shift-tap diagnostics
+#define PERSONALIME_DEBUG_SHIFT_LOG 0
+#if PERSONALIME_DEBUG_SHIFT_LOG
+static void ShiftDebugLog(const char* fmt, ...) {
+    char msg[512];
+    va_list args;
+    va_start(args, fmt);
+    int n = std::vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[640];
+    int len = std::snprintf(
+        line, sizeof(line),
+        "[%02u:%02u:%02u.%03u][pid=%lu tid=%lu] %s\r\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        msg);
+    if (len <= 0) return;
+
+    OutputDebugStringA(line);
+    char tempDir[MAX_PATH]{};
+    DWORD dirLen = GetTempPathA(MAX_PATH, tempDir);
+    if (dirLen > 0 && dirLen < MAX_PATH - 32) {
+        char logPath[MAX_PATH]{};
+        std::snprintf(logPath, sizeof(logPath), "%spersonalime_shift_debug.log", tempDir);
+        HANDLE hFile = CreateFileA(
+            logPath,
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(hFile, line, static_cast<DWORD>(len), &written, nullptr);
+            CloseHandle(hFile);
+        }
+    }
+}
+#define SHIFT_DBG(...) ShiftDebugLog(__VA_ARGS__)
+#else
+#define SHIFT_DBG(...) ((void)0)
+#endif
+// [/DEBUG-SHIFT-LOG]
 
 static LONG64 s_sessionCounter = 0;
 static std::mutex s_liveOwnersMutex;
@@ -2131,13 +2183,27 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyDown(ITfContext* pic, WPARAM wParam, 
     *pfEaten = FALSE;
 
     if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
+        if (IsShiftKeyCode(wParam) || m_shiftTapPending) {
+            SHIFT_DBG("OnTestKeyDown IGNORED vk=0x%X lp=0x%llX filtered=%d ro=%d pending=%d",
+                      static_cast<unsigned>(wParam), static_cast<unsigned long long>(lParam),
+                      ShouldFilterKeystroke(wParam) ? 1 : 0, IsContextReadOnly(pic) ? 1 : 0,
+                      m_shiftTapPending ? 1 : 0);
+        }
         ResetShiftTapState();
         return S_OK;
     }
 
     if (IsShiftKeyCode(wParam)) {
         UpdateShiftKeyState(wParam, lParam, true);
+        SHIFT_DBG("OnTestKeyDown SHIFT vk=0x%X sc=0x%X lp=0x%llX pending=%d L=%d R=%d G=%d",
+                  static_cast<unsigned>(wParam), static_cast<unsigned>((lParam >> 16) & 0xFF),
+                  static_cast<unsigned long long>(lParam),
+                  m_shiftTapPending ? 1 : 0, m_leftShiftDown ? 1 : 0,
+                  m_rightShiftDown ? 1 : 0, m_genericShiftDown ? 1 : 0);
         return S_OK;
+    }
+    if (m_shiftTapPending) {
+        SHIFT_DBG("OnTestKeyDown CANCELLED pending by vk=0x%X", static_cast<unsigned>(wParam));
     }
     m_shiftTapPending = false;
 
@@ -2502,9 +2568,26 @@ void CTextInputProcessor::DrainUnconfirmedCommits(bool forceNow) {
 STDMETHODIMP CTextInputProcessor::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
-    if (!IsShiftKeyCode(wParam)) {
-        m_shiftTapPending = false;
+    if (IsShiftKeyCode(wParam)) {
+        if (ShouldFilterKeystroke(wParam) || IsContextReadOnly(pic)) {
+            SHIFT_DBG("OnKeyDown SHIFT IGNORED vk=0x%X lp=0x%llX filtered=%d ro=%d",
+                      static_cast<unsigned>(wParam), static_cast<unsigned long long>(lParam),
+                      ShouldFilterKeystroke(wParam) ? 1 : 0, IsContextReadOnly(pic) ? 1 : 0);
+            ResetShiftTapState();
+            return S_OK;
+        }
+        UpdateShiftKeyState(wParam, lParam, true);
+        SHIFT_DBG("OnKeyDown SHIFT vk=0x%X sc=0x%X lp=0x%llX pending=%d L=%d R=%d G=%d",
+                  static_cast<unsigned>(wParam), static_cast<unsigned>((lParam >> 16) & 0xFF),
+                  static_cast<unsigned long long>(lParam),
+                  m_shiftTapPending ? 1 : 0, m_leftShiftDown ? 1 : 0,
+                  m_rightShiftDown ? 1 : 0, m_genericShiftDown ? 1 : 0);
+        return S_OK;
     }
+    if (m_shiftTapPending) {
+        SHIFT_DBG("OnKeyDown CANCELLED pending by vk=0x%X", static_cast<unsigned>(wParam));
+    }
+    m_shiftTapPending = false;
     ProcessKeyInternal(pic, wParam, lParam, pfEaten, false, 0);
     return S_OK;
 }
@@ -2684,6 +2767,10 @@ bool CTextInputProcessor::ProcessKeyInternal(
         req.protocol_version = IPC_PROTOCOL_VERSION_STAGE3;
         resp = {};
         sentOk = m_ipcClient.SendRequest(req, resp, 80);
+    }
+    if (isShiftTap) {
+        SHIFT_DBG("ProcessKeyInternal SHIFT_TAP sentOk=%d handled=%u flags=0x%X hasCommit=%u hasComp=%u",
+                  sentOk ? 1 : 0, resp.handled, resp.status_flags, resp.has_commit, resp.has_composition);
     }
     if (sentOk) {
         if (!resp.handled) {
@@ -3070,13 +3157,23 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyUp(ITfContext* pic, WPARAM wParam, LP
         bool otherMods = ((GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU) |
                            GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0;
         uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+        bool filtered = ShouldFilterKeystroke(wParam);
+        bool ro = IsContextReadOnly(pic);
+        bool queued = HasQueuedEditSession(contextId);
+        bool quarantined = IsContextQuarantined(contextId);
         if (m_shiftTapPending && allShiftsReleased && !otherMods &&
-            !ShouldFilterKeystroke(wParam) && !IsContextReadOnly(pic) &&
-            !HasQueuedEditSession(contextId) && !IsContextQuarantined(contextId)) {
+            !filtered && !ro && !queued && !quarantined) {
             *pfEaten = TRUE;
         } else if (allShiftsReleased) {
             m_shiftTapPending = false;
         }
+        SHIFT_DBG("OnTestKeyUp SHIFT vk=0x%X sc=0x%X lp=0x%llX eaten=%d pending=%d L=%d R=%d G=%d otherMods=%d filt=%d ro=%d q=%d quar=%d",
+                  static_cast<unsigned>(wParam), static_cast<unsigned>((lParam >> 16) & 0xFF),
+                  static_cast<unsigned long long>(lParam), *pfEaten ? 1 : 0,
+                  m_shiftTapPending ? 1 : 0, m_leftShiftDown ? 1 : 0,
+                  m_rightShiftDown ? 1 : 0, m_genericShiftDown ? 1 : 0,
+                  otherMods ? 1 : 0, filtered ? 1 : 0, ro ? 1 : 0,
+                  queued ? 1 : 0, quarantined ? 1 : 0);
     }
     return S_OK;
 }
@@ -3084,10 +3181,29 @@ STDMETHODIMP CTextInputProcessor::OnTestKeyUp(ITfContext* pic, WPARAM wParam, LP
 STDMETHODIMP CTextInputProcessor::OnKeyUp(ITfContext* pic, WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
     if (!pfEaten) return E_POINTER;
     *pfEaten = FALSE;
-    if (IsShiftKeyCode(wParam) && m_shiftTapPending) {
-        m_shiftTapPending = false;
-        BOOL dummyEaten = FALSE;
-        ProcessKeyInternal(pic, VK_SHIFT, lParam, &dummyEaten, false, 0, true);
+    if (IsShiftKeyCode(wParam)) {
+        UpdateShiftKeyState(wParam, lParam, false);
+        bool allShiftsReleased = !m_leftShiftDown && !m_rightShiftDown && !m_genericShiftDown;
+        bool otherMods = ((GetKeyState(VK_CONTROL) | GetKeyState(VK_MENU) |
+                           GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000) != 0;
+        uint64_t contextId = reinterpret_cast<uint64_t>(pic);
+        bool filtered = ShouldFilterKeystroke(wParam);
+        bool ro = IsContextReadOnly(pic);
+        bool queued = HasQueuedEditSession(contextId);
+        bool quarantined = IsContextQuarantined(contextId);
+        SHIFT_DBG("OnKeyUp SHIFT vk=0x%X sc=0x%X pending=%d allRel=%d otherMods=%d filt=%d ro=%d q=%d quar=%d",
+                  static_cast<unsigned>(wParam), static_cast<unsigned>((lParam >> 16) & 0xFF),
+                  m_shiftTapPending ? 1 : 0, allShiftsReleased ? 1 : 0,
+                  otherMods ? 1 : 0, filtered ? 1 : 0, ro ? 1 : 0,
+                  queued ? 1 : 0, quarantined ? 1 : 0);
+        if (m_shiftTapPending && allShiftsReleased && !otherMods &&
+            !filtered && !ro && !queued && !quarantined) {
+            m_shiftTapPending = false;
+            BOOL dummyEaten = FALSE;
+            ProcessKeyInternal(pic, VK_SHIFT, lParam, &dummyEaten, false, 0, true);
+        } else if (allShiftsReleased) {
+            m_shiftTapPending = false;
+        }
     }
     return S_OK;
 }
